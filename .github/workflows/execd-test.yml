@@ -161,6 +161,23 @@ jobs:
           sudo cp builddir/bwrap /usr/local/bin/bwrap
           bwrap --version
 
+      - name: Build native session workload gate
+        run: |
+          sudo install -d /usr/local/libexec
+          sudo cc -O2 -Wall -Wextra -Werror \
+            components/execd/native/session-gate.c \
+            -o /usr/local/libexec/opensandbox-session-gate
+          test -x /usr/local/bin/bwrap
+          test -x /usr/local/libexec/opensandbox-session-gate
+
+      - name: Run workload lifecycle integration test
+        working-directory: components/execd
+        run: |
+          sudo -E env "PATH=$PATH" go test \
+            -v -count=1 -timeout=2m \
+            -run '^TestBwrapLifecycleEndToEnd$' \
+            ./pkg/isolation
+
       - name: Run bwrap integration tests
         working-directory: components/execd
         run: sudo -E env "PATH=$PATH" go test -tags="linux,bwrap" -v -count=1 -timeout=5m ./pkg/runtime/bwrap_test/

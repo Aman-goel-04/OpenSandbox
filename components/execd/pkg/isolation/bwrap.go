@@ -26,8 +26,27 @@ import (
 	"strings"
 )
 
-// buildArgv constructs the bwrap command line from wrap options.
+type bwrapLifecycleArgv struct {
+	gateFD    string
+	controlFD string
+	blockFD   string
+	statusFD  string
+}
+
+// buildArgv constructs the legacy bwrap command line from wrap options.
 func buildArgv(opts WrapOptions, seccompFd string) ([]string, error) {
+	return buildArgvWithLifecycle(opts, seccompFd, nil)
+}
+
+// buildArgvWithLifecycle constructs the bwrap command line and, when lifecycle
+// is non-nil, installs the native fail-closed workload gate. The gate mount is
+// deliberately added after /run is replaced by tmpfs and before caller-
+// controlled mounts are applied.
+func buildArgvWithLifecycle(
+	opts WrapOptions,
+	seccompFd string,
+	lifecycle *bwrapLifecycleArgv,
+) ([]string, error) {
 	if err := validateWrapOptions(opts); err != nil {
 		return nil, err
 	}
@@ -74,6 +93,13 @@ func buildArgv(opts WrapOptions, seccompFd string) ([]string, error) {
 
 	// 4–6. Virtual filesystems.
 	argv = append(argv, "--tmpfs", "/run", "--dev", "/dev", "--proc", "/proc")
+	if lifecycle != nil {
+		argv = append(
+			argv,
+			"--dir", sessionGateSandboxDir,
+			"--ro-bind-fd", lifecycle.gateFD, sessionGateSandboxPath,
+		)
+	}
 
 	// 7. Workspace.
 	wsArgv, err := bwrapWorkspaceSegment(opts)
@@ -120,6 +146,13 @@ func buildArgv(opts WrapOptions, seccompFd string) ([]string, error) {
 	// setsid(2) returns EPERM for a group leader — it would fail every
 	// session start. Process-group isolation from Setpgid is sufficient.
 	argv = append(argv, "--die-with-parent")
+	if lifecycle != nil {
+		argv = append(
+			argv,
+			"--block-fd", lifecycle.blockFD,
+			"--json-status-fd", lifecycle.statusFD,
+		)
+	}
 
 	// 12. Separator + identity switch.
 	argv = append(argv, "--")
@@ -144,6 +177,14 @@ func buildArgv(opts WrapOptions, seccompFd string) ([]string, error) {
 			}
 			argv = append(argv, setprivArgv...)
 		}
+	}
+	if lifecycle != nil {
+		argv = append(
+			argv,
+			sessionGateSandboxPath,
+			lifecycle.controlFD,
+			"--",
+		)
 	}
 
 	return argv, nil
