@@ -97,6 +97,7 @@ FROM alpine:latest
 
 COPY --from=bwrap-builder /build/bwrap/bwrap /usr/local/bin/bwrap
 COPY --from=bwrap-builder /build/opensandbox-session-gate /usr/local/libexec/opensandbox-session-gate
+COPY --from=bwrap-builder /build/opensandbox-session-gate /opt/opensandbox/opensandbox-session-gate
 COPY --from=builder /build/execd .
 COPY --from=builder /build/execd.exe ./execd.exe
 COPY --from=builder /build/opensandbox-supervisor ./opensandbox-supervisor

@@ -35,9 +35,7 @@ import (
 )
 
 const (
-	sessionGateHostPath    = "/usr/local/libexec/opensandbox-session-gate"
-	sessionGateSandboxDir  = "/run/opensandbox-session"
-	sessionGateSandboxPath = sessionGateSandboxDir + "/gate"
+	sessionGateRuntimeHostPath = "/opt/opensandbox/opensandbox-session-gate"
 
 	sessionGateWaitingFrame = "OPENSANDBOX_SESSION_WAITING_V1"
 	sessionGateReadyFrame   = "OPENSANDBOX_SESSION_READY_V1"
@@ -73,13 +71,14 @@ type bwrapSandboxStatus struct {
 type bwrapLifecycle struct {
 	statusReader *os.File
 
-	mu                 sync.Mutex
-	state              lifecycleState
-	setup              *os.File
-	control            *net.UnixConn
-	controlChildFD     int
-	controlSocketInode uint64
-	identity           WorkloadIdentity
+	mu                  sync.Mutex
+	state               lifecycleState
+	requireNetNamespace bool
+	setup               *os.File
+	control             *net.UnixConn
+	controlChildFD      int
+	controlSocketInode  uint64
+	identity            WorkloadIdentity
 
 	sandboxStatus chan bwrapSandboxStatus
 	drainDone     chan struct{}
@@ -95,16 +94,18 @@ func newBwrapLifecycle(
 	control *net.UnixConn,
 	controlChildFD int,
 	controlSocketInode uint64,
+	requireNetNamespace bool,
 ) *bwrapLifecycle {
 	lifecycle := &bwrapLifecycle{
-		statusReader:       statusReader,
-		state:              lifecycleWaitingForBwrap,
-		setup:              setupWriter,
-		control:            control,
-		controlChildFD:     controlChildFD,
-		controlSocketInode: controlSocketInode,
-		sandboxStatus:      make(chan bwrapSandboxStatus, 1),
-		drainDone:          make(chan struct{}),
+		statusReader:        statusReader,
+		state:               lifecycleWaitingForBwrap,
+		requireNetNamespace: requireNetNamespace,
+		setup:               setupWriter,
+		control:             control,
+		controlChildFD:      controlChildFD,
+		controlSocketInode:  controlSocketInode,
+		sandboxStatus:       make(chan bwrapSandboxStatus, 1),
+		drainDone:           make(chan struct{}),
 	}
 	go lifecycle.drainStatus()
 	return lifecycle
@@ -147,7 +148,8 @@ func (l *bwrapLifecycle) WaitForIdentity(ctx context.Context) (
 		return WorkloadIdentity{}, fmt.Errorf("wait for bwrap status: %w", ctx.Err())
 	}
 
-	if err := validateSandboxStatus(status); err != nil {
+	status, err = validateSandboxStatus(status, l.requireNetNamespace)
+	if err != nil {
 		return WorkloadIdentity{}, err
 	}
 	if err := l.releaseBwrapSetupGate(); err != nil {
@@ -283,25 +285,43 @@ func parseSingleUnixCredentials(oob []byte) (*unix.Ucred, error) {
 	return credentials, nil
 }
 
-func validateSandboxStatus(status bwrapSandboxStatus) error {
+func validateSandboxStatus(
+	status bwrapSandboxStatus,
+	requireNetNamespace bool,
+) (bwrapSandboxStatus, error) {
 	if status.pid <= 0 {
-		return fmt.Errorf("bwrap status reported invalid child-pid %d", status.pid)
-	}
-	if status.netNamespaceID == 0 {
-		return errors.New("bwrap status did not report a network namespace")
+		return bwrapSandboxStatus{}, fmt.Errorf(
+			"bwrap status reported invalid child-pid %d",
+			status.pid,
+		)
 	}
 	actualNamespaceID, err := readNetNamespaceID(status.pid)
 	if err != nil {
-		return fmt.Errorf("read bwrap child network namespace: %w", err)
+		return bwrapSandboxStatus{}, fmt.Errorf(
+			"read bwrap child network namespace: %w",
+			err,
+		)
+	}
+	if status.netNamespaceID == 0 {
+		if requireNetNamespace {
+			return bwrapSandboxStatus{}, errors.New(
+				"bwrap status did not report the requested private network namespace",
+			)
+		}
+		// Bubblewrap only reports namespace IDs that it created. In share-net
+		// mode the child is still blocked by --block-fd, so its PID cannot be
+		// reused while we derive the inherited namespace from /proc.
+		status.netNamespaceID = actualNamespaceID
+		return status, nil
 	}
 	if actualNamespaceID != status.netNamespaceID {
-		return fmt.Errorf(
+		return bwrapSandboxStatus{}, fmt.Errorf(
 			"bwrap child network namespace mismatch: status=%d proc=%d",
 			status.netNamespaceID,
 			actualNamespaceID,
 		)
 	}
-	return nil
+	return status, nil
 }
 
 func validateWorkloadIdentity(
@@ -561,23 +581,27 @@ func (l *bwrapLifecycle) drainStatus() {
 				l.finishStatusDrain(err, false)
 				return
 			}
+			var netNamespaceID uint64
 			netRaw, ok := object["net-namespace"]
 			if !ok {
-				l.finishStatusDrain(
-					errors.New("bwrap child status omitted net-namespace"),
+				if l.requireNetNamespace {
+					l.finishStatusDrain(
+						errors.New("bwrap child status omitted net-namespace"),
+						false,
+					)
+					return
+				}
+			} else {
+				netNamespaceID, err = parseStatusUint(
+					netRaw,
+					"net-namespace",
+					^uint64(0),
 					false,
 				)
-				return
-			}
-			netNamespaceID, err := parseStatusUint(
-				netRaw,
-				"net-namespace",
-				^uint64(0),
-				false,
-			)
-			if err != nil {
-				l.finishStatusDrain(err, false)
-				return
+				if err != nil {
+					l.finishStatusDrain(err, false)
+					return
+				}
 			}
 			sawChild = true
 			l.sandboxStatus <- bwrapSandboxStatus{
@@ -682,63 +706,18 @@ func parseStatusUint(
 	return value, nil
 }
 
-// validateLifecycleMountSafety prevents caller-controlled mounts from
-// replacing the native gate after it has been installed.
-func validateLifecycleMountSafety(opts WrapOptions) error {
-	check := func(kind, destination string) error {
-		if mountCoversPath(destination, sessionGateSandboxPath) {
-			return fmt.Errorf(
-				"isolation: %s mount %q covers reserved lifecycle gate %q",
-				kind,
-				destination,
-				sessionGateSandboxPath,
-			)
-		}
-		return nil
-	}
-	if err := check("workspace", opts.Workspace.Path); err != nil {
-		return err
-	}
-	for _, destination := range opts.ExtraWritable {
-		if err := check("extra writable", destination); err != nil {
-			return err
-		}
-	}
-	for _, bind := range opts.Binds {
-		destination := bind.Dest
-		if destination == "" {
-			destination = bind.Source
-		}
-		if err := check("bind", destination); err != nil {
-			return err
-		}
-	}
-	if opts.UpperDir != "" {
-		upperRoot := filepath.Dir(filepath.Dir(opts.UpperDir))
-		if err := check("upper root", upperRoot); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func mountCoversPath(destination, target string) bool {
-	destination = filepath.Clean(destination)
-	target = filepath.Clean(target)
-	if destination == target || destination == string(filepath.Separator) {
-		return true
-	}
-	return strings.HasPrefix(target, destination+string(filepath.Separator))
-}
-
 func openSessionGate() (*os.File, error) {
+	return openSessionGatePath(sessionGateRuntimeHostPath)
+}
+
+func openSessionGatePath(path string) (*os.File, error) {
 	fd, err := unix.Open(
-		sessionGateHostPath,
+		path,
 		unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW,
 		0,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("open native workload gate: %w", err)
+		return nil, fmt.Errorf("open native workload gate %q: %w", path, err)
 	}
 	file := os.NewFile(uintptr(fd), "opensandbox-session-gate")
 	if file == nil {

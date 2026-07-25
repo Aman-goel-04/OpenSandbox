@@ -42,46 +42,67 @@
 static const char waiting_frame[] = "OPENSANDBOX_SESSION_WAITING_V1";
 static const char ready_frame[] = "OPENSANDBOX_SESSION_READY_V1";
 
-static void fail_closed(int control_fd)
+static int parse_fd(const char *value)
+{
+    char *end = NULL;
+    long parsed;
+
+    errno = 0;
+    parsed = strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' ||
+        parsed < 3 || parsed > INT_MAX)
+        return -1;
+    return (int)parsed;
+}
+
+static void fail_closed(int control_fd, int exec_fd)
 {
     if (control_fd >= 0)
         (void)close(control_fd);
+    if (exec_fd >= 0 && exec_fd != control_fd)
+        (void)close(exec_fd);
     _exit(GATE_FAILURE);
 }
 
 int main(int argc, char **argv)
 {
-    char *end = NULL;
-    long parsed_fd;
     int control_fd;
+    int exec_fd;
     int socket_type = 0;
     socklen_t socket_type_len = sizeof(socket_type);
     char incoming[sizeof(ready_frame)];
     ssize_t received;
     ssize_t sent;
 
-    if (argc < 4 || strcmp(argv[2], "--") != 0)
-        fail_closed(-1);
+    if (argc < 5 || strcmp(argv[3], "--") != 0)
+        fail_closed(-1, -1);
 
-    errno = 0;
-    parsed_fd = strtol(argv[1], &end, 10);
-    if (errno != 0 || end == argv[1] || *end != '\0' ||
-        parsed_fd < 3 || parsed_fd > INT_MAX)
-        fail_closed(-1);
-    control_fd = (int)parsed_fd;
+    control_fd = parse_fd(argv[1]);
+    exec_fd = parse_fd(argv[2]);
+    if (control_fd < 0 || exec_fd < 0 || control_fd == exec_fd)
+        fail_closed(control_fd, exec_fd);
 
     if (fcntl(control_fd, F_GETFD) < 0)
-        fail_closed(control_fd);
+        fail_closed(control_fd, exec_fd);
+    if (fcntl(exec_fd, F_GETFD) < 0)
+        fail_closed(control_fd, exec_fd);
+    /*
+     * bubblewrap starts this helper through /proc/self/fd/<exec_fd>. Once
+     * main is running the executable is already mapped, so close that
+     * descriptor before the workload handshake to avoid leaking it onward.
+     */
+    if (close(exec_fd) != 0)
+        fail_closed(control_fd, -1);
     if (getsockopt(control_fd, SOL_SOCKET, SO_TYPE,
                    &socket_type, &socket_type_len) < 0 ||
         socket_type != SOCK_SEQPACKET)
-        fail_closed(control_fd);
+        fail_closed(control_fd, -1);
 
     (void)signal(SIGPIPE, SIG_IGN);
     sent = send(control_fd, waiting_frame, sizeof(waiting_frame) - 1,
                 MSG_NOSIGNAL);
     if (sent != (ssize_t)(sizeof(waiting_frame) - 1))
-        fail_closed(control_fd);
+        fail_closed(control_fd, -1);
 
     /*
      * The buffer has room for one byte beyond the expected payload. This
@@ -90,11 +111,11 @@ int main(int argc, char **argv)
     received = recv(control_fd, incoming, sizeof(incoming), 0);
     if (received != (ssize_t)(sizeof(ready_frame) - 1) ||
         memcmp(incoming, ready_frame, sizeof(ready_frame) - 1) != 0)
-        fail_closed(control_fd);
+        fail_closed(control_fd, -1);
 
     if (close(control_fd) != 0)
         _exit(GATE_FAILURE);
 
-    execvp(argv[3], &argv[3]);
+    execvp(argv[4], &argv[4]);
     _exit(EXEC_FAILURE);
 }

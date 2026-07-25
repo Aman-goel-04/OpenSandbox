@@ -64,6 +64,7 @@ func newStatusTestLifecycle(
 		controlParent,
 		controlChildFD,
 		controlSocketInode,
+		true,
 	)
 	t.Cleanup(func() {
 		_ = lifecycle.Close()
@@ -233,6 +234,7 @@ func TestLifecycleUsesCredentialsAndProcIdentityBeforeReady(t *testing.T) {
 		controlParent,
 		int(controlChild.Fd()),
 		controlSocketInode,
+		true,
 	)
 	t.Cleanup(func() {
 		_ = lifecycle.Close()
@@ -314,6 +316,95 @@ func TestLifecycleUsesCredentialsAndProcIdentityBeforeReady(t *testing.T) {
 	}
 }
 
+func TestLifecycleDerivesSharedNetworkIdentityWhenStatusOmitsNamespace(t *testing.T) {
+	statusReader, statusWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	setupReader, setupWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlParent, controlChild, controlSocketInode, err := newGateSocketpair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lifecycle := newBwrapLifecycle(
+		statusReader,
+		setupWriter,
+		controlParent,
+		int(controlChild.Fd()),
+		controlSocketInode,
+		false,
+	)
+	t.Cleanup(func() {
+		_ = lifecycle.Close()
+		_ = statusWriter.Close()
+		_ = setupReader.Close()
+		_ = controlChild.Close()
+	})
+
+	sandboxPID := os.Getppid()
+	expectedNamespaceID, err := readNetNamespaceID(sandboxPID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fmt.Fprintf(
+		statusWriter,
+		"{\"child-pid\":%d}\n",
+		sandboxPID,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	setupReleased := make(chan struct{})
+	go func() {
+		var release [1]byte
+		if n, _ := setupReader.Read(release[:]); n == 1 {
+			close(setupReleased)
+			_, _ = controlChild.Write([]byte(sessionGateWaitingFrame))
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	identity, err := lifecycle.WaitForIdentity(ctx)
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-setupReleased
+	if identity.NetNamespaceID != expectedNamespaceID {
+		t.Fatalf(
+			"shared network namespace = %d, want %d",
+			identity.NetNamespaceID,
+			expectedNamespaceID,
+		)
+	}
+
+	readyRead := make(chan string, 1)
+	go func() {
+		buffer := make([]byte, len(sessionGateReadyFrame)+1)
+		n, _ := controlChild.Read(buffer)
+		readyRead <- string(buffer[:n])
+	}()
+	if err := lifecycle.MarkReady(); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-readyRead; got != sessionGateReadyFrame {
+		t.Fatalf("ready frame = %q, want %q", got, sessionGateReadyFrame)
+	}
+	if _, err := statusWriter.Write([]byte("{\"exit-code\":0}\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := statusWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitForDrain(t, lifecycle)
+	if err := lifecycle.DrainError(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLifecycleNamespaceMismatchFailsBeforeNativeReady(t *testing.T) {
 	statusReader, statusWriter, err := os.Pipe()
 	if err != nil {
@@ -333,6 +424,7 @@ func TestLifecycleNamespaceMismatchFailsBeforeNativeReady(t *testing.T) {
 		controlParent,
 		int(controlChild.Fd()),
 		controlSocketInode,
+		true,
 	)
 	t.Cleanup(func() {
 		_ = lifecycle.Close()
@@ -392,6 +484,7 @@ func TestLifecycleStatusFailureAfterIdentityDeniesReadyWithoutDeadlock(t *testin
 		controlParent,
 		int(controlChild.Fd()),
 		controlSocketInode,
+		true,
 	)
 	t.Cleanup(func() {
 		_ = lifecycle.Close()
@@ -471,6 +564,7 @@ func TestLifecycleContextCancellationClosesAllGates(t *testing.T) {
 		controlParent,
 		int(controlChild.Fd()),
 		controlSocketInode,
+		true,
 	)
 	t.Cleanup(func() {
 		_ = lifecycle.Close()
@@ -519,6 +613,7 @@ func TestLifecycleAbortAndCloseAreConcurrentAndDoNotLeakFDs(t *testing.T) {
 			controlParent,
 			int(controlChild.Fd()),
 			controlSocketInode,
+			true,
 		)
 
 		var waitGroup sync.WaitGroup
@@ -547,6 +642,62 @@ func TestLifecycleAbortAndCloseAreConcurrentAndDoNotLeakFDs(t *testing.T) {
 			baseline,
 			after,
 		)
+	}
+}
+
+func TestOpenSessionGateAcceptsManagedRuntimePath(t *testing.T) {
+	root := t.TempDir()
+	managed := filepath.Join(root, "managed-gate")
+	if err := os.WriteFile(managed, []byte("managed"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := openSessionGatePath(managed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	buffer := make([]byte, 16)
+	n, err := file.Read(buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(buffer[:n]); got != "managed" {
+		t.Fatalf("opened gate contents = %q, want managed path", got)
+	}
+}
+
+func TestOpenSessionGateRejectsMissingManagedRuntimePath(t *testing.T) {
+	root := t.TempDir()
+	managed := filepath.Join(root, "missing-managed-gate")
+
+	file, err := openSessionGatePath(managed)
+	if file != nil {
+		file.Close()
+		t.Fatal("missing managed gate unexpectedly opened")
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing managed gate error = %v", err)
+	}
+}
+
+func TestOpenSessionGateRejectsUnsafeManagedRuntimePath(t *testing.T) {
+	root := t.TempDir()
+	managed := filepath.Join(root, "managed-gate")
+	if err := os.WriteFile(managed, []byte("unsafe"), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(managed, 0o777); err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := openSessionGatePath(managed)
+	if file != nil {
+		file.Close()
+		t.Fatal("unsafe managed gate unexpectedly opened")
+	}
+	if err == nil || !strings.Contains(err.Error(), "group- or world-writable") {
+		t.Fatalf("open unsafe managed gate error = %v", err)
 	}
 }
 
@@ -599,21 +750,29 @@ func TestSessionGateHelperFailsClosedAndExecutesOnlyAfterReady(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer controlParent.Close()
+			gateExecutable, err := os.Open(binary)
+			if err != nil {
+				controlChild.Close()
+				t.Fatal(err)
+			}
 			marker := filepath.Join(t.TempDir(), "executed")
 			command := exec.Command(
 				binary,
 				"3",
+				"4",
 				"--",
 				"/bin/sh",
 				"-c",
 				"printf executed > "+marker,
 			)
-			command.ExtraFiles = []*os.File{controlChild}
+			command.ExtraFiles = []*os.File{controlChild, gateExecutable}
 			if err := command.Start(); err != nil {
 				controlChild.Close()
+				gateExecutable.Close()
 				t.Fatal(err)
 			}
 			controlChild.Close()
+			gateExecutable.Close()
 
 			payload := make([]byte, len(sessionGateWaitingFrame)+1)
 			oob := make([]byte, 256)
@@ -670,64 +829,26 @@ func TestSessionGateHelperFailsClosedAndExecutesOnlyAfterReady(t *testing.T) {
 	}
 }
 
-func TestLifecycleMountSafetyRejectsGateReplacement(t *testing.T) {
-	base := WrapOptions{
-		Profile:   ProfileStrict,
-		Workspace: WorkspaceSpec{Path: "/workspace", Mode: WorkspaceRW},
-	}
-	tests := []struct {
-		name   string
-		mutate func(*WrapOptions)
-	}{
-		{
-			name: "workspace ancestor",
-			mutate: func(opts *WrapOptions) {
-				opts.Workspace.Path = "/run"
-			},
-		},
-		{
-			name: "extra writable exact",
-			mutate: func(opts *WrapOptions) {
-				opts.ExtraWritable = []string{sessionGateSandboxPath}
-			},
-		},
-		{
-			name: "bind ancestor",
-			mutate: func(opts *WrapOptions) {
-				opts.Binds = []BindMount{{
-					Source: "/tmp/source",
-					Dest:   sessionGateSandboxDir,
-				}}
-			},
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			opts := base
-			test.mutate(&opts)
-			if err := validateLifecycleMountSafety(opts); err == nil {
-				t.Fatal("unsafe lifecycle mount was accepted")
-			}
-		})
-	}
-	if err := validateLifecycleMountSafety(base); err != nil {
-		t.Fatalf("safe mounts rejected: %v", err)
-	}
-}
-
-func TestLifecycleArgvInstallsGateAfterRunTmpfs(t *testing.T) {
+func TestLifecycleArgvExecutesGateDescriptorAfterRestoringProc(t *testing.T) {
 	opts := WrapOptions{
-		Profile:   ProfileStrict,
-		Workspace: WorkspaceSpec{Path: "/workspace", Mode: WorkspaceRW},
+		Profile:       ProfileStrict,
+		Workspace:     WorkspaceSpec{Path: "/workspace", Mode: WorkspaceRW},
+		UpperDir:      "/var/lib/opensandbox/upper/session/upper",
+		ExtraWritable: []string{"/data"},
+		Binds: []BindMount{{
+			Source:   "/source",
+			Dest:     "/mounted",
+			ReadOnly: true,
+		}},
 	}
 	argv, err := buildArgvWithLifecycle(
 		opts,
 		"3",
 		&bwrapLifecycleArgv{
-			gateFD:    "4",
-			statusFD:  "5",
-			blockFD:   "6",
-			controlFD: "7",
+			gateExecFD: "4",
+			statusFD:   "5",
+			blockFD:    "6",
+			controlFD:  "7",
 		},
 	)
 	if err != nil {
@@ -735,27 +856,46 @@ func TestLifecycleArgvInstallsGateAfterRunTmpfs(t *testing.T) {
 	}
 	joined := strings.Join(argv, " ")
 	for _, required := range []string{
-		"--ro-bind-fd 4 " + sessionGateSandboxPath,
+		"--proc /proc",
 		"--block-fd 6",
 		"--json-status-fd 5",
-		sessionGateSandboxPath + " 7 --",
+		"/proc/self/fd/4 7 4 --",
 	} {
 		if !strings.Contains(joined, required) {
 			t.Errorf("argv missing %q: %s", required, joined)
 		}
 	}
-	tmpfsIndex := indexArgvSequence(argv, "--tmpfs", "/run")
-	gateIndex := indexArgvSequence(argv, "--ro-bind-fd", "4", sessionGateSandboxPath)
-	if tmpfsIndex < 0 || gateIndex < 0 || gateIndex < tmpfsIndex {
-		t.Fatalf("gate mount must follow /run tmpfs: %v", argv)
+	if strings.Contains(joined, "--ro-bind-fd") {
+		t.Fatalf("lifecycle gate must execute by descriptor, not mount path: %v", argv)
+	}
+	procIndex := indexArgvSequence(argv, "--proc", "/proc")
+	if procIndex < 0 {
+		t.Fatalf("trusted proc mount missing: %v", argv)
+	}
+	for name, sequence := range map[string][]string{
+		"workspace":      {"--bind", "/workspace", "/workspace"},
+		"upper root":     {"--tmpfs", "/var/lib/opensandbox/upper"},
+		"extra writable": {"--bind", "/data", "/data"},
+		"explicit bind":  {"--ro-bind", "/source", "/mounted"},
+	} {
+		index := indexArgvSequence(argv, sequence...)
+		if index < 0 {
+			t.Fatalf("%s mount missing: %v", name, argv)
+		}
+		if procIndex < index {
+			t.Fatalf("trusted proc mount must follow %s mount: %v", name, argv)
+		}
 	}
 }
 
 func TestBwrapLifecycleEndToEnd(t *testing.T) {
 	originalBwrapPath := bwrapPath
 	bwrapPath = findBwrap()
+	originalSeccompBPF := seccompBPF
+	seccompBPF = nil
 	t.Cleanup(func() {
 		bwrapPath = originalBwrapPath
+		seccompBPF = originalSeccompBPF
 	})
 	if bwrapPath == "" {
 		t.Skip("bubblewrap is unavailable")
@@ -769,15 +909,63 @@ func TestBwrapLifecycleEndToEnd(t *testing.T) {
 	tests := []struct {
 		name       string
 		markReady  bool
+		shareNet   bool
+		gateAlias  bool
 		wantMarker bool
 	}{
-		{name: "ready executes workload", markReady: true, wantMarker: true},
-		{name: "control eof denies workload", markReady: false, wantMarker: false},
+		{
+			name:       "private network ready executes workload",
+			markReady:  true,
+			wantMarker: true,
+		},
+		{
+			name:       "shared network ready executes workload",
+			markReady:  true,
+			shareNet:   true,
+			wantMarker: true,
+		},
+		{
+			name:       "caller symlink alias cannot replace gate",
+			markReady:  true,
+			gateAlias:  true,
+			wantMarker: true,
+		},
+		{
+			name:       "control eof denies workload",
+			markReady:  false,
+			wantMarker: false,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			workspace := t.TempDir()
 			marker := filepath.Join(workspace, "executed")
+			fakeGateMarker := filepath.Join(workspace, "fake-gate-executed")
+			var binds []BindMount
+			if test.gateAlias {
+				fakeProc := filepath.Join(workspace, "fake-proc")
+				fakeFDDir := filepath.Join(fakeProc, "self", "fd")
+				if err := os.MkdirAll(fakeFDDir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				fakeGate := filepath.Join(fakeFDDir, "3")
+				fakeGateScript := fmt.Sprintf(
+					"#!/bin/sh\nprintf fake > %q\nexit 125\n",
+					fakeGateMarker,
+				)
+				if err := os.WriteFile(fakeGate, []byte(fakeGateScript), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				procAlias := filepath.Join(workspace, "proc-alias")
+				if err := os.Symlink("/proc", procAlias); err != nil {
+					t.Fatal(err)
+				}
+				binds = []BindMount{{
+					Source:   fakeProc,
+					Dest:     procAlias,
+					ReadOnly: true,
+				}}
+			}
 			command := exec.Command(
 				"/bin/sh",
 				"-c",
@@ -795,7 +983,8 @@ func TestBwrapLifecycleEndToEnd(t *testing.T) {
 						Path: workspace,
 						Mode: WorkspaceRW,
 					},
-					ShareNet:       false,
+					ShareNet:       test.shareNet,
+					Binds:          binds,
 					EnvPassthrough: EnvSpec{Mode: EnvModeDeny},
 				},
 			)
@@ -826,6 +1015,24 @@ func TestBwrapLifecycleEndToEnd(t *testing.T) {
 			identity, err := lifecycle.WaitForIdentity(ctx)
 			cancel()
 			if err != nil {
+				if test.gateAlias {
+					_ = command.Wait()
+					if _, markerErr := os.Stat(fakeGateMarker); !os.IsNotExist(markerErr) {
+						t.Fatalf(
+							"caller-controlled proc alias executed fake gate: %v",
+							markerErr,
+						)
+					}
+					if _, markerErr := os.Stat(marker); !os.IsNotExist(markerErr) {
+						t.Fatalf(
+							"caller-controlled proc alias executed workload: %v",
+							markerErr,
+						)
+					}
+					// Rejecting an aliased proc mount before the gate starts is
+					// an acceptable fail-closed outcome.
+					return
+				}
 				t.Fatal(err)
 			}
 			if identity.PID <= 0 || identity.SandboxPID <= 0 ||
@@ -857,6 +1064,9 @@ func TestBwrapLifecycleEndToEnd(t *testing.T) {
 			}
 			if !test.wantMarker && !os.IsNotExist(markerErr) {
 				t.Fatalf("denied workload executed: %v", markerErr)
+			}
+			if _, err := os.Stat(fakeGateMarker); !os.IsNotExist(err) {
+				t.Fatalf("caller-controlled gate alias executed: %v", err)
 			}
 			if test.markReady {
 				if drainErr := lifecycle.DrainError(); drainErr != nil {

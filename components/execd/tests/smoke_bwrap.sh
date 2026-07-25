@@ -65,11 +65,18 @@ docker run --rm \
   -v "${SMOKE_DIR}:/out" \
   "${IMAGE}" \
   sh -c 'cp /execd /usr/local/bin/bwrap /out/ && \
-    cp /usr/local/libexec/opensandbox-session-gate /out/session-gate && \
-    chmod +x /out/execd /out/bwrap /out/session-gate'
+    cp /usr/local/libexec/opensandbox-session-gate /out/session-gate-source && \
+    cp /opt/opensandbox/opensandbox-session-gate /out/session-gate-runtime && \
+    chmod +x /out/execd /out/bwrap \
+      /out/session-gate-source /out/session-gate-runtime'
 
 echo ">> Extracted:"
-ls -lh "${SMOKE_DIR}/execd" "${SMOKE_DIR}/bwrap" "${SMOKE_DIR}/session-gate"
+ls -lh \
+  "${SMOKE_DIR}/execd" \
+  "${SMOKE_DIR}/bwrap" \
+  "${SMOKE_DIR}/session-gate-source" \
+  "${SMOKE_DIR}/session-gate-runtime"
+cmp "${SMOKE_DIR}/session-gate-source" "${SMOKE_DIR}/session-gate-runtime"
 
 # -------------------------------------------------------------------
 # Step 3: Verify bwrap is static

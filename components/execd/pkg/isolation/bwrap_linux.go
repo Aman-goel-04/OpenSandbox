@@ -176,9 +176,6 @@ func (b *bwrapImpl) WrapWithLifecycle(
 	if err := validateWrapOptions(opts); err != nil {
 		return nil, fmt.Errorf("bwrap: %w", err)
 	}
-	if err := validateLifecycleMountSafety(opts); err != nil {
-		return nil, fmt.Errorf("bwrap: %w", err)
-	}
 
 	firstAddedFile := len(cmd.ExtraFiles)
 	cleanupExtraFiles := true
@@ -197,7 +194,7 @@ func (b *bwrapImpl) WrapWithLifecycle(
 	if err != nil {
 		return nil, fmt.Errorf("bwrap: %w", err)
 	}
-	gateFD := appendExtraFile(cmd, gateFile)
+	gateExecFD := appendExtraFile(cmd, gateFile)
 
 	statusReader, statusWriter, err := os.Pipe()
 	if err != nil {
@@ -240,10 +237,10 @@ func (b *bwrapImpl) WrapWithLifecycle(
 		opts,
 		seccompFD,
 		&bwrapLifecycleArgv{
-			gateFD:    gateFD,
-			controlFD: controlFD,
-			blockFD:   setupFD,
-			statusFD:  statusFD,
+			gateExecFD: gateExecFD,
+			controlFD:  controlFD,
+			blockFD:    setupFD,
+			statusFD:   statusFD,
 		},
 	)
 	if err != nil {
@@ -257,6 +254,7 @@ func (b *bwrapImpl) WrapWithLifecycle(
 		controlParent,
 		controlChildFD,
 		controlSocketInode,
+		!opts.ShareNet,
 	)
 	cleanupExtraFiles = false
 	closeControlParent = false

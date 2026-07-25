@@ -27,10 +27,10 @@ import (
 )
 
 type bwrapLifecycleArgv struct {
-	gateFD    string
-	controlFD string
-	blockFD   string
-	statusFD  string
+	gateExecFD string
+	controlFD  string
+	blockFD    string
+	statusFD   string
 }
 
 // buildArgv constructs the legacy bwrap command line from wrap options.
@@ -39,9 +39,8 @@ func buildArgv(opts WrapOptions, seccompFd string) ([]string, error) {
 }
 
 // buildArgvWithLifecycle constructs the bwrap command line and, when lifecycle
-// is non-nil, installs the native fail-closed workload gate. The gate mount is
-// deliberately added after /run is replaced by tmpfs and before caller-
-// controlled mounts are applied.
+// is non-nil, executes the native fail-closed workload gate directly through
+// its inherited descriptor.
 func buildArgvWithLifecycle(
 	opts WrapOptions,
 	seccompFd string,
@@ -91,14 +90,12 @@ func buildArgvWithLifecycle(
 		argv = append(argv, bwrapTmpSegment(opts.Profile)...)
 	}
 
-	// 4–6. Virtual filesystems.
-	argv = append(argv, "--tmpfs", "/run", "--dev", "/dev", "--proc", "/proc")
-	if lifecycle != nil {
-		argv = append(
-			argv,
-			"--dir", sessionGateSandboxDir,
-			"--ro-bind-fd", lifecycle.gateFD, sessionGateSandboxPath,
-		)
+	// 4–6. Virtual filesystems. Lifecycle mode installs procfs after all
+	// caller-controlled mounts so /proc/self/fd remains the trusted execution
+	// path for the native gate descriptor.
+	argv = append(argv, "--tmpfs", "/run", "--dev", "/dev")
+	if lifecycle == nil {
+		argv = append(argv, "--proc", "/proc")
 	}
 
 	// 7. Workspace.
@@ -130,6 +127,18 @@ func buildArgvWithLifecycle(
 			flag = "--ro-bind"
 		}
 		argv = append(argv, flag, b.Source, dest)
+	}
+
+	// Restore trusted procfs after every caller-controlled mount, then execute
+	// the verified gate through its inherited descriptor. Static mount aliases
+	// therefore cannot replace the gate between validation and execution.
+	//
+	// The isolated-session MVP treats processes sharing the parent sandbox
+	// mount namespace as one trusted owner. Defending against that owner
+	// concurrently replacing the proc mount ancestor still requires a future
+	// execveat-based launcher.
+	if lifecycle != nil {
+		argv = append(argv, "--proc", "/proc")
 	}
 
 	// 9. Environment.
@@ -181,8 +190,9 @@ func buildArgvWithLifecycle(
 	if lifecycle != nil {
 		argv = append(
 			argv,
-			sessionGateSandboxPath,
+			"/proc/self/fd/"+lifecycle.gateExecFD,
 			lifecycle.controlFD,
+			lifecycle.gateExecFD,
 			"--",
 		)
 	}
