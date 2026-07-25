@@ -55,32 +55,7 @@ func buildArgvWithLifecycle(
 	var argv []string
 
 	// 1. Namespace flags.
-	if useUserns {
-		argv = append(argv, "--unshare-user")
-		// --disable-userns is unsupported by the setuid build of bwrap;
-		// only add it for the non-setuid binary.
-		if !bwrapIsSetuid {
-			argv = append(argv, "--disable-userns")
-		}
-	}
-	argv = append(argv, "--unshare-pid", "--unshare-uts", "--hostname", "sandbox", "--unshare-ipc", "--unshare-cgroup")
-	if !opts.ShareNet {
-		argv = append(argv, "--unshare-net")
-	}
-	if useUserns {
-		uid := uint32(os.Getuid())
-		gid := uint32(os.Getgid())
-		if opts.Uid != nil {
-			uid = *opts.Uid
-		}
-		if opts.Gid != nil {
-			gid = *opts.Gid
-		}
-		argv = append(argv,
-			"--uid", strconv.FormatUint(uint64(uid), 10),
-			"--gid", strconv.FormatUint(uint64(gid), 10),
-		)
-	}
+	argv = append(argv, bwrapNamespaceSegment(opts, useUserns)...)
 
 	// 2. Root filesystem (read-only).
 	argv = append(argv, "--ro-bind", "/", "/")
@@ -198,6 +173,37 @@ func buildArgvWithLifecycle(
 	}
 
 	return argv, nil
+}
+
+func bwrapNamespaceSegment(opts WrapOptions, useUserns bool) []string {
+	var argv []string
+	if useUserns {
+		argv = append(argv, "--unshare-user")
+		// --disable-userns is unsupported by the setuid build of bwrap;
+		// only add it for the non-setuid binary.
+		if !bwrapIsSetuid {
+			argv = append(argv, "--disable-userns")
+		}
+	}
+	argv = append(argv, "--unshare-pid", "--unshare-uts", "--hostname", "sandbox", "--unshare-ipc", "--unshare-cgroup")
+	if !opts.ShareNet {
+		argv = append(argv, "--unshare-net")
+	}
+	if useUserns {
+		uid := uint32(os.Getuid())
+		gid := uint32(os.Getgid())
+		if opts.Uid != nil {
+			uid = *opts.Uid
+		}
+		if opts.Gid != nil {
+			gid = *opts.Gid
+		}
+		argv = append(argv,
+			"--uid", strconv.FormatUint(uint64(uid), 10),
+			"--gid", strconv.FormatUint(uint64(gid), 10),
+		)
+	}
+	return argv
 }
 
 // validateWrapOptions checks for invalid or conflicting options.

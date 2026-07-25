@@ -570,61 +570,22 @@ func (l *bwrapLifecycle) drainStatus() {
 			return
 		}
 
-		childRaw, hasChild := object["child-pid"]
+		childStatus, hasChild, err := l.parseChildStatus(object, sawChild)
+		if err != nil {
+			l.finishStatusDrain(err, sawChild)
+			return
+		}
 		if hasChild {
-			if sawChild {
-				l.finishStatusDrain(errors.New("bwrap status repeated child-pid"), true)
-				return
-			}
-			childPID, err := parseStatusUint(childRaw, "child-pid", 1<<31-1, false)
-			if err != nil {
-				l.finishStatusDrain(err, false)
-				return
-			}
-			var netNamespaceID uint64
-			netRaw, ok := object["net-namespace"]
-			if !ok {
-				if l.requireNetNamespace {
-					l.finishStatusDrain(
-						errors.New("bwrap child status omitted net-namespace"),
-						false,
-					)
-					return
-				}
-			} else {
-				netNamespaceID, err = parseStatusUint(
-					netRaw,
-					"net-namespace",
-					^uint64(0),
-					false,
-				)
-				if err != nil {
-					l.finishStatusDrain(err, false)
-					return
-				}
-			}
 			sawChild = true
-			l.sandboxStatus <- bwrapSandboxStatus{
-				pid:            int(childPID),
-				netNamespaceID: netNamespaceID,
-			}
+			l.sandboxStatus <- childStatus
 		}
 
-		exitRaw, hasExit := object["exit-code"]
+		exitCode, hasExit, err := parseExitStatus(object, sawChild, sawExit)
+		if err != nil {
+			l.finishStatusDrain(err, sawChild)
+			return
+		}
 		if hasExit {
-			if !sawChild {
-				l.finishStatusDrain(errors.New("bwrap status reported exit-code before child-pid"), false)
-				return
-			}
-			if sawExit {
-				l.finishStatusDrain(errors.New("bwrap status repeated exit-code"), sawChild)
-				return
-			}
-			exitCode, err := parseStatusUint(exitRaw, "exit-code", 255, true)
-			if err != nil {
-				l.finishStatusDrain(err, sawChild)
-				return
-			}
 			sawExit = true
 			l.mu.Lock()
 			l.exitCode = int(exitCode)
@@ -657,6 +618,69 @@ func (l *bwrapLifecycle) drainStatus() {
 		return
 	}
 	l.finishStatusDrain(nil, true)
+}
+
+func (l *bwrapLifecycle) parseChildStatus(
+	object map[string]json.RawMessage,
+	sawChild bool,
+) (bwrapSandboxStatus, bool, error) {
+	childRaw, hasChild := object["child-pid"]
+	if !hasChild {
+		return bwrapSandboxStatus{}, false, nil
+	}
+	if sawChild {
+		return bwrapSandboxStatus{}, false, errors.New("bwrap status repeated child-pid")
+	}
+	childPID, err := parseStatusUint(childRaw, "child-pid", 1<<31-1, false)
+	if err != nil {
+		return bwrapSandboxStatus{}, false, err
+	}
+
+	var netNamespaceID uint64
+	netRaw, hasNetNamespace := object["net-namespace"]
+	if !hasNetNamespace {
+		if l.requireNetNamespace {
+			return bwrapSandboxStatus{}, false, errors.New(
+				"bwrap child status omitted net-namespace",
+			)
+		}
+	} else {
+		netNamespaceID, err = parseStatusUint(
+			netRaw,
+			"net-namespace",
+			^uint64(0),
+			false,
+		)
+		if err != nil {
+			return bwrapSandboxStatus{}, false, err
+		}
+	}
+	return bwrapSandboxStatus{
+		pid:            int(childPID),
+		netNamespaceID: netNamespaceID,
+	}, true, nil
+}
+
+func parseExitStatus(
+	object map[string]json.RawMessage,
+	sawChild bool,
+	sawExit bool,
+) (uint64, bool, error) {
+	exitRaw, hasExit := object["exit-code"]
+	if !hasExit {
+		return 0, false, nil
+	}
+	if !sawChild {
+		return 0, false, errors.New("bwrap status reported exit-code before child-pid")
+	}
+	if sawExit {
+		return 0, false, errors.New("bwrap status repeated exit-code")
+	}
+	exitCode, err := parseStatusUint(exitRaw, "exit-code", 255, true)
+	if err != nil {
+		return 0, false, err
+	}
+	return exitCode, true, nil
 }
 
 func (l *bwrapLifecycle) finishStatusDrain(err error, sawChild bool) {
