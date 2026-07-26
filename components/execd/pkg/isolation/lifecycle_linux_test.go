@@ -725,7 +725,9 @@ func TestSessionGateHelperFailsClosedAndExecutesOnlyAfterReady(t *testing.T) {
 	tests := []struct {
 		name       string
 		reply      *string
+		script     string
 		wantExit   int
+		wantSignal syscall.Signal
 		wantMarker bool
 	}{
 		{name: "control eof", wantExit: 125},
@@ -735,6 +737,12 @@ func TestSessionGateHelperFailsClosedAndExecutesOnlyAfterReady(t *testing.T) {
 			reply:      stringPointer(sessionGateReadyFrame),
 			wantExit:   0,
 			wantMarker: true,
+		},
+		{
+			name:       "exact ready preserves default sigpipe",
+			reply:      stringPointer(sessionGateReadyFrame),
+			script:     "kill -s PIPE $$; exit 42",
+			wantSignal: syscall.SIGPIPE,
 		},
 		{
 			name:     "ready with trailing byte",
@@ -756,6 +764,10 @@ func TestSessionGateHelperFailsClosedAndExecutesOnlyAfterReady(t *testing.T) {
 				t.Fatal(err)
 			}
 			marker := filepath.Join(t.TempDir(), "executed")
+			script := "printf executed > " + marker
+			if test.script != "" {
+				script = test.script
+			}
 			command := exec.Command(
 				binary,
 				"3",
@@ -763,7 +775,7 @@ func TestSessionGateHelperFailsClosedAndExecutesOnlyAfterReady(t *testing.T) {
 				"--",
 				"/bin/sh",
 				"-c",
-				"printf executed > "+marker,
+				script,
 			)
 			command.ExtraFiles = []*os.File{controlChild, gateExecutable}
 			if err := command.Start(); err != nil {
@@ -807,16 +819,31 @@ func TestSessionGateHelperFailsClosedAndExecutesOnlyAfterReady(t *testing.T) {
 				t.Fatal(err)
 			}
 			waitErr := command.Wait()
-			exitCode := 0
-			if waitErr != nil {
+			if test.wantSignal != 0 {
 				var exitErr *exec.ExitError
 				if !errors.As(waitErr, &exitErr) {
-					t.Fatal(waitErr)
+					t.Fatalf("workload was not terminated by %s: %v", test.wantSignal, waitErr)
 				}
-				exitCode = exitErr.ExitCode()
-			}
-			if exitCode != test.wantExit {
-				t.Fatalf("exit code = %d, want %d", exitCode, test.wantExit)
+				waitStatus, ok := exitErr.Sys().(syscall.WaitStatus)
+				if !ok || !waitStatus.Signaled() || waitStatus.Signal() != test.wantSignal {
+					t.Fatalf(
+						"workload status = %v, want signal %s",
+						waitStatus,
+						test.wantSignal,
+					)
+				}
+			} else {
+				exitCode := 0
+				if waitErr != nil {
+					var exitErr *exec.ExitError
+					if !errors.As(waitErr, &exitErr) {
+						t.Fatal(waitErr)
+					}
+					exitCode = exitErr.ExitCode()
+				}
+				if exitCode != test.wantExit {
+					t.Fatalf("exit code = %d, want %d", exitCode, test.wantExit)
+				}
 			}
 			_, markerErr := os.Stat(marker)
 			if test.wantMarker && markerErr != nil {

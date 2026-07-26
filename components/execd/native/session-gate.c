@@ -29,7 +29,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <signal.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -98,7 +97,6 @@ int main(int argc, char **argv)
         socket_type != SOCK_SEQPACKET)
         fail_closed(control_fd, -1);
 
-    (void)signal(SIGPIPE, SIG_IGN);
     sent = send(control_fd, waiting_frame, sizeof(waiting_frame) - 1,
                 MSG_NOSIGNAL);
     if (sent != (ssize_t)(sizeof(waiting_frame) - 1))

@@ -471,12 +471,12 @@ func (l *bwrapLifecycle) MarkReady() error {
 			len(sessionGateReadyFrame),
 		)
 	}
-	closeErr := l.control.Close()
+	// A complete SOCK_SEQPACKET write is the irreversible release point.
+	// Cleanup failures cannot make an already-released workload fail closed,
+	// so they must not turn a successful release into a MarkReady error.
+	_ = l.control.Close()
 	l.control = nil
 	l.state = lifecycleWorkloadReady
-	if closeErr != nil {
-		return fmt.Errorf("close native workload gate: %w", closeErr)
-	}
 	return nil
 }
 
