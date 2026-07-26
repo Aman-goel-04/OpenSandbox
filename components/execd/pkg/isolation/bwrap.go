@@ -138,8 +138,23 @@ func buildArgvWithLifecycle(
 		)
 	}
 
-	// 12. Separator + identity switch.
+	// 12. Separator + fail-closed gate + identity switch.
 	argv = append(argv, "--")
+
+	// In setpriv mode the trusted gate must run before credentials are dropped.
+	// Execd authenticates and inspects the blocked gate through /proc; moving
+	// setpriv after the gate keeps those checks available without granting
+	// CAP_SYS_PTRACE. Once READY arrives, the gate execs setpriv and the caller's
+	// command in the same PID and namespaces.
+	if lifecycle != nil {
+		argv = append(
+			argv,
+			"/proc/self/fd/"+lifecycle.gateExecFD,
+			lifecycle.controlFD,
+			lifecycle.gateExecFD,
+			"--",
+		)
+	}
 
 	// In userns mode, uid/gid are set via --uid/--gid in segment 1.
 	if !useUserns {
@@ -161,15 +176,6 @@ func buildArgvWithLifecycle(
 			}
 			argv = append(argv, setprivArgv...)
 		}
-	}
-	if lifecycle != nil {
-		argv = append(
-			argv,
-			"/proc/self/fd/"+lifecycle.gateExecFD,
-			lifecycle.controlFD,
-			lifecycle.gateExecFD,
-			"--",
-		)
 	}
 
 	return argv, nil
@@ -383,8 +389,8 @@ func matchEnvPattern(name, pattern string) bool {
 // Wrap rewrites cmd to execute under bwrap.
 func wrapWithArgv(cmd *exec.Cmd, bwrapPath string, argv []string) {
 	// Prepend bwrap argv before the original command.
-	// argv already ends with ["--", "setpriv", ...] and the original
-	// cmd.Args[0] is the user command after setpriv.
+	// argv already contains the bwrap separator and any lifecycle gate or
+	// identity-switch prefix. The original cmd.Args[0] follows that prefix.
 	userArgs := cmd.Args
 	cmd.Args = make([]string, 0, len(argv)+len(userArgs))
 	cmd.Args = append(cmd.Args, bwrapPath)

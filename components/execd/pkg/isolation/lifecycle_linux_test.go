@@ -17,6 +17,7 @@
 package isolation
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -857,11 +858,16 @@ func TestSessionGateHelperFailsClosedAndExecutesOnlyAfterReady(t *testing.T) {
 }
 
 func TestLifecycleArgvExecutesGateDescriptorAfterRestoringProc(t *testing.T) {
+	uid := uint32(65534)
+	gid := uint32(65534)
 	opts := WrapOptions{
 		Profile:       ProfileStrict,
 		Workspace:     WorkspaceSpec{Path: "/workspace", Mode: WorkspaceRW},
 		UpperDir:      "/var/lib/opensandbox/upper/session/upper",
 		ExtraWritable: []string{"/data"},
+		UidMode:       UidModeSetpriv,
+		Uid:           &uid,
+		Gid:           &gid,
 		Binds: []BindMount{{
 			Source:   "/source",
 			Dest:     "/mounted",
@@ -894,6 +900,17 @@ func TestLifecycleArgvExecutesGateDescriptorAfterRestoringProc(t *testing.T) {
 	}
 	if strings.Contains(joined, "--ro-bind-fd") {
 		t.Fatalf("lifecycle gate must execute by descriptor, not mount path: %v", argv)
+	}
+	gateIndex := indexArgvSequence(argv, "/proc/self/fd/4", "7", "4", "--")
+	setprivIndex := indexArgvSequence(
+		argv,
+		"setpriv",
+		"--reuid=65534",
+		"--regid=65534",
+		"--clear-groups",
+	)
+	if gateIndex < 0 || setprivIndex < 0 || gateIndex >= setprivIndex {
+		t.Fatalf("lifecycle gate must run before setpriv: %v", argv)
 	}
 	procIndex := indexArgvSequence(argv, "--proc", "/proc")
 	if procIndex < 0 {
@@ -933,11 +950,14 @@ func TestBwrapLifecycleEndToEnd(t *testing.T) {
 	}
 	_ = gate.Close()
 
+	unprivilegedID := uint32(65534)
 	tests := []struct {
 		name       string
 		markReady  bool
 		shareNet   bool
 		gateAlias  bool
+		uid        *uint32
+		gid        *uint32
 		wantMarker bool
 	}{
 		{
@@ -950,6 +970,13 @@ func TestBwrapLifecycleEndToEnd(t *testing.T) {
 			markReady:  true,
 			shareNet:   true,
 			wantMarker: true,
+		},
+		{
+			name:      "non-root setpriv ready executes workload",
+			markReady: true,
+			shareNet:  true,
+			uid:       &unprivilegedID,
+			gid:       &unprivilegedID,
 		},
 		{
 			name:       "caller symlink alias cannot replace gate",
@@ -993,11 +1020,22 @@ func TestBwrapLifecycleEndToEnd(t *testing.T) {
 					ReadOnly: true,
 				}}
 			}
+			script := "printf executed > " + marker + "; exit 7"
+			if test.uid != nil {
+				script = fmt.Sprintf(
+					"test \"$(id -u)\" = %d; printf %%s \"$(id -u)\"; exit 7",
+					*test.uid,
+				)
+			}
 			command := exec.Command(
 				"/bin/sh",
 				"-c",
-				"printf executed > "+marker+"; exit 7",
+				script,
 			)
+			var stdout bytes.Buffer
+			var stderr bytes.Buffer
+			command.Stdout = &stdout
+			command.Stderr = &stderr
 			command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 			implementation := &bwrapImpl{
 				probe: ProbeResult{Available: true},
@@ -1011,6 +1049,9 @@ func TestBwrapLifecycleEndToEnd(t *testing.T) {
 						Mode: WorkspaceRW,
 					},
 					ShareNet:       test.shareNet,
+					UidMode:        UidModeSetpriv,
+					Uid:            test.uid,
+					Gid:            test.gid,
 					Binds:          binds,
 					EnvPassthrough: EnvSpec{Mode: EnvModeDeny},
 				},
@@ -1060,7 +1101,8 @@ func TestBwrapLifecycleEndToEnd(t *testing.T) {
 					// an acceptable fail-closed outcome.
 					return
 				}
-				t.Fatal(err)
+				waitErr := command.Wait()
+				t.Fatalf("%v (wait: %v, stderr: %q)", err, waitErr, stderr.String())
 			}
 			if identity.PID <= 0 || identity.SandboxPID <= 0 ||
 				identity.NetNamespaceID == 0 ||
@@ -1078,7 +1120,7 @@ func TestBwrapLifecycleEndToEnd(t *testing.T) {
 			} else {
 				lifecycle.Abort()
 			}
-			_ = command.Wait()
+			waitErr := command.Wait()
 			select {
 			case <-lifecycle.DrainDone():
 			case <-time.After(5 * time.Second):
@@ -1087,10 +1129,20 @@ func TestBwrapLifecycleEndToEnd(t *testing.T) {
 
 			_, markerErr := os.Stat(marker)
 			if test.wantMarker && markerErr != nil {
-				t.Fatalf("ready workload did not execute: %v", markerErr)
+				t.Fatalf(
+					"ready workload did not execute: %v (wait: %v, stderr: %q)",
+					markerErr,
+					waitErr,
+					stderr.String(),
+				)
 			}
 			if !test.wantMarker && !os.IsNotExist(markerErr) {
 				t.Fatalf("denied workload executed: %v", markerErr)
+			}
+			if test.uid != nil {
+				if got, want := stdout.String(), strconv.FormatUint(uint64(*test.uid), 10); got != want {
+					t.Fatalf("workload uid output = %q, want %q", got, want)
+				}
 			}
 			if _, err := os.Stat(fakeGateMarker); !os.IsNotExist(err) {
 				t.Fatalf("caller-controlled gate alias executed: %v", err)

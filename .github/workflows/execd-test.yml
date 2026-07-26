@@ -177,7 +177,8 @@ jobs:
       - name: Run workload lifecycle integration test
         working-directory: components/execd
         run: |
-          sudo -E env "PATH=$PATH" go test \
+          # Execd must authenticate a non-root workload without CAP_SYS_PTRACE.
+          sudo -E setpriv --bounding-set=-sys_ptrace env "PATH=$PATH" go test \
             -v -count=1 -timeout=2m \
             -run '^TestBwrapLifecycleEndToEnd$' \
             ./pkg/isolation
