@@ -115,6 +115,12 @@ def compute_backoff(
     return timedelta(seconds=max(0.0, sleep_s))
 
 
+# Upper bound for server-supplied ``Retry-After`` waits. Fixed at 60s to
+# prevent an over-long header from stalling the client while still giving
+# operators a chance to shape recovery.
+_RETRY_AFTER_CAP: timedelta = timedelta(seconds=60)
+
+
 def parse_retry_after(
     header_value: str | None, *, now: datetime | None = None
 ) -> timedelta | None:
@@ -128,9 +134,17 @@ def parse_retry_after(
     # delta-seconds (integer)
     try:
         seconds = int(raw)
-        return timedelta(seconds=max(0, seconds))
     except ValueError:
-        pass
+        seconds = None
+    if seconds is not None:
+        # A pathologically large numeric value overflows ``timedelta``
+        # (and later ``int`` conversions). Clamp to the Retry-After cap
+        # up front so parsing never raises; the caller applies the same
+        # ceiling again via ``apply_retry_after_cap``.
+        if seconds < 0:
+            return timedelta(0)
+        cap_s = int(_RETRY_AFTER_CAP.total_seconds())
+        return timedelta(seconds=min(seconds, cap_s))
 
     # HTTP-date
     try:
@@ -146,12 +160,6 @@ def parse_retry_after(
     if delta.total_seconds() < 0:
         return timedelta(0)
     return delta
-
-
-# Upper bound for server-supplied ``Retry-After`` waits. Fixed at 60s to
-# prevent an over-long header from stalling the client while still giving
-# operators a chance to shape recovery.
-_RETRY_AFTER_CAP: timedelta = timedelta(seconds=60)
 
 
 def apply_retry_after_cap(retry_after: timedelta | None) -> timedelta | None:

@@ -173,6 +173,20 @@ class RetryPolicy:
             raise ValueError(
                 f"backoff_multiplier must be >= 1.0, got {self.backoff_multiplier!r}"
             )
+        if (
+            self.per_attempt_timeout is not None
+            and self.per_attempt_timeout.total_seconds() <= 0
+        ):
+            raise ValueError(
+                f"per_attempt_timeout must be > 0 when set, got {self.per_attempt_timeout!r}"
+            )
+        if (
+            self.overall_deadline is not None
+            and self.overall_deadline.total_seconds() <= 0
+        ):
+            raise ValueError(
+                f"overall_deadline must be > 0 when set, got {self.overall_deadline!r}"
+            )
         # Normalize so callers can pass a plain ``set`` or ``tuple``.
         object.__setattr__(
             self,

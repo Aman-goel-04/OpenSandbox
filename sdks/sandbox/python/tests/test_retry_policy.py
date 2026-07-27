@@ -75,6 +75,18 @@ class TestRetryPolicyValidation:
         with pytest.raises(ValueError):
             RetryPolicy(backoff_multiplier=0.5)
 
+    def test_non_positive_per_attempt_timeout_rejected(self) -> None:
+        with pytest.raises(ValueError):
+            RetryPolicy(per_attempt_timeout=timedelta(seconds=-1))
+        with pytest.raises(ValueError):
+            RetryPolicy(per_attempt_timeout=timedelta(0))
+
+    def test_non_positive_overall_deadline_rejected(self) -> None:
+        with pytest.raises(ValueError):
+            RetryPolicy(overall_deadline=timedelta(seconds=-1))
+        with pytest.raises(ValueError):
+            RetryPolicy(overall_deadline=timedelta(0))
+
 
 class TestRetryCause:
     @pytest.mark.parametrize(
