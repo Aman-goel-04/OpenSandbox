@@ -117,8 +117,41 @@ def test_handle_api_error_raises_rate_limit_on_429() -> None:
     assert ei.value.status_code == 429
     assert ei.value.retry_after == timedelta(seconds=12)
     assert ei.value.request_id == "req-abc"
+    # 429 is a transient class; is_retryable is machine-checkable.
+    assert ei.value.is_retryable is True
     # Backward-compatible: still catchable as SandboxApiException.
     assert isinstance(ei.value, SandboxApiException)
+
+
+def test_handle_api_error_sets_is_retryable_by_status() -> None:
+    from opensandbox.exceptions import SandboxApiException
+
+    # 502/503 are transient -> is_retryable True; 500/4xx -> False.
+    for code, expected in [(502, True), (503, True), (500, False), (404, False)]:
+
+        class Resp:
+            status_code = code
+            parsed = None
+            headers: dict[str, str] = {}
+
+        with pytest.raises(SandboxApiException) as ei:
+            handle_api_error(Resp(), "Op")
+        assert ei.value.is_retryable is expected, f"status {code}"
+
+
+def test_to_sandbox_exception_connection_is_retryable() -> None:
+    import httpx
+
+    from opensandbox.adapters.converter.exception_converter import (
+        ExceptionConverter,
+    )
+    from opensandbox.exceptions import SandboxConnectionException
+
+    mapped = ExceptionConverter.to_sandbox_exception(
+        httpx.ConnectError("dns down")
+    )
+    assert isinstance(mapped, SandboxConnectionException)
+    assert mapped.is_retryable is True
 
 
 def test_handle_api_error_rate_limit_without_retry_after_header() -> None:

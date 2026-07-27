@@ -62,3 +62,18 @@ def outcome_for_response(response: httpx.Response) -> Outcome:
         status_code=response.status_code,
         cause=RetryCause.for_status(response.status_code),
     )
+
+
+def is_body_replayable(request: httpx.Request) -> bool:
+    """
+    Whether ``request`` can be re-dispatched with the same body.
+
+    httpx materializes in-memory bodies (``bytes``/``str``/``json=``)
+    into a ``ByteStream``, which can be iterated repeatedly. Streaming
+    bodies — async/sync generators, file-like uploads, and multipart
+    ``files=`` bodies — can only be consumed once; resending raises
+    ``StreamConsumed`` or emits a truncated body.
+    """
+    # ``httpx.ByteStream`` is the public marker (listed in
+    # ``httpx.__all__``) for a materialized, replayable in-memory body.
+    return isinstance(request.stream, httpx.ByteStream)

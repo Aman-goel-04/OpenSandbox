@@ -136,6 +136,48 @@ class TestAsyncTransport:
         assert inner.calls == 1
 
     @pytest.mark.asyncio
+    async def test_non_replayable_body_not_retried_on_status(self) -> None:
+        # POST opted into 503 retry, but a multipart (files=) body is
+        # not replayable: the wrapper must not attempt a resend, which
+        # would raise httpx.StreamConsumed / send a truncated body.
+        inner = _CountingAsyncTransport(
+            [httpx.Response(503), httpx.Response(200)]
+        )
+        policy = _fast_policy(
+            retryable_status_codes_non_idempotent=frozenset(
+                {HTTPStatus.SERVICE_UNAVAILABLE}
+            )
+        )
+        rt = RetryAsyncTransport(inner, policy)
+        async with httpx.AsyncClient(
+            transport=rt, base_url="http://x"
+        ) as client:
+            resp = await client.post("/", files={"f": ("n.txt", b"data")})
+        # Single attempt, no StreamConsumed.
+        assert resp.status_code == 503
+        assert inner.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_replayable_bytes_body_still_retried_on_status(self) -> None:
+        # A plain bytes body is replayable, so the opt-in status retry
+        # proceeds normally.
+        inner = _CountingAsyncTransport(
+            [httpx.Response(503), httpx.Response(200)]
+        )
+        policy = _fast_policy(
+            retryable_status_codes_non_idempotent=frozenset(
+                {HTTPStatus.SERVICE_UNAVAILABLE}
+            )
+        )
+        rt = RetryAsyncTransport(inner, policy)
+        async with httpx.AsyncClient(
+            transport=rt, base_url="http://x"
+        ) as client:
+            resp = await client.post("/", content=b"payload")
+        assert resp.status_code == 200
+        assert inner.calls == 2
+
+    @pytest.mark.asyncio
     async def test_do_not_retry_get_on_500_504_and_4xx(self) -> None:
         # 500 and 504 are outside the default retry set; 4xx are not
         # retryable by design.

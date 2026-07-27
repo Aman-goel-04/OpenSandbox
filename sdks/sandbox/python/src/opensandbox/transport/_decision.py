@@ -50,6 +50,7 @@ def should_retry(
     policy: RetryPolicy,
     elapsed: timedelta,
     cancelled: bool = False,
+    body_replayable: bool = True,
 ) -> bool:
     """
     Decide whether to retry.
@@ -57,6 +58,16 @@ def should_retry(
     Checks budget/deadline/cancellation first, then the transport-vs-status
     branch. Pre-send transport failures retry on any method; post-send
     and opaque transport failures retry on idempotent methods only.
+
+    ``body_replayable`` guards non-idempotent uploads: when the request
+    body cannot be re-sent (async/sync generators, file-like streams,
+    multipart ``files=`` bodies), re-dispatching the same
+    ``httpx.Request`` would raise ``StreamConsumed`` or send a truncated
+    body. A status-code retry always consumes the body first, so it is
+    suppressed for non-replayable bodies. A pre-send failure writes no
+    bytes on the *first* attempt, so it may still be retried once; but a
+    stream may already be partially consumed after that, so pre-send
+    retries beyond the first attempt are also suppressed.
     """
     if retries_used >= policy.max_retries:
         return False
@@ -72,10 +83,19 @@ def should_retry(
 
     if outcome.is_transport_error:
         if outcome.is_pre_send:
+            # First attempt wrote no bytes, so a non-replayable body is
+            # still intact and safe to resend once. After that, assume
+            # the stream may be partially consumed and stop.
+            if not body_replayable and retries_used >= 1:
+                return False
             return True
         return idempotent
 
     if outcome.status_code is None:
+        return False
+    # A status-code retry means the body was already sent (and consumed);
+    # never replay a non-replayable body.
+    if not body_replayable:
         return False
     return outcome.status_code in policy.retryable_statuses_for(method)
 

@@ -30,6 +30,7 @@ from opensandbox.transport._async_retry import (
 )
 from opensandbox.transport._classify import (
     classify_transport_exception,
+    is_body_replayable,
     outcome_for_response,
 )
 from opensandbox.transport._decision import (
@@ -72,6 +73,7 @@ class RetrySyncTransport(httpx.BaseTransport):
         previous_sleep = timedelta(0)
         retries_used = 0
         last_exc: BaseException | None = None
+        body_replayable = is_body_replayable(request)
 
         baseline_timeout = _capture_baseline_timeout(request)
 
@@ -113,7 +115,14 @@ class RetrySyncTransport(httpx.BaseTransport):
                 outcome = classify_transport_exception(e)
 
             elapsed = timedelta(seconds=time.monotonic() - start)
-            if not should_retry(method, outcome, retries_used, policy, elapsed):
+            if not should_retry(
+                method,
+                outcome,
+                retries_used,
+                policy,
+                elapsed,
+                body_replayable=body_replayable,
+            ):
                 if exc is not None:
                     raise exc
                 assert response is not None

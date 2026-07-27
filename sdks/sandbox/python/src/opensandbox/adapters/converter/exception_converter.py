@@ -111,6 +111,7 @@ class ExceptionConverter:
             return SandboxConnectionException(
                 message=f"Network connectivity error: {e}",
                 cause=e,
+                is_retryable=True,
             )
 
         # httpx timeout family (read, write, pool, or the synthetic
@@ -191,6 +192,21 @@ def _retry_after_from_headers(headers: Any) -> timedelta | None:
     return parse_retry_after(raw if isinstance(raw, str) else None)
 
 
+# Status codes the SDK treats as transient (the default idempotent
+# retryable set from RetryPolicy). Surfaced via ``is_retryable`` so
+# callers get a machine-checkable retry decision even after the SDK has
+# exhausted its own retries. Budget/deadline/cancellation are the only
+# things that would force this to False; those paths raise a timeout
+# rather than an API exception.
+_RETRYABLE_STATUS_CODES = frozenset(
+    {
+        HTTPStatus.TOO_MANY_REQUESTS,   # 429
+        HTTPStatus.BAD_GATEWAY,         # 502
+        HTTPStatus.SERVICE_UNAVAILABLE, # 503
+    }
+)
+
+
 def _build_api_exception(
     *,
     status_code: int,
@@ -201,6 +217,7 @@ def _build_api_exception(
 ) -> SandboxApiException:
     """Build a Sandbox(ApiException|RateLimitException) from raw fields."""
     sandbox_error = _parse_error_body(content) if content else None
+    is_retryable = status_code in _RETRYABLE_STATUS_CODES
     if status_code == HTTPStatus.TOO_MANY_REQUESTS:
         return SandboxRateLimitException(
             message=f"API error: HTTP {status_code}",
@@ -210,6 +227,7 @@ def _build_api_exception(
             request_id=request_id,
             retry_after=retry_after,
             response_body=content if isinstance(content, bytes) else None,
+            is_retryable=is_retryable,
         )
     return SandboxApiException(
         message=f"API error: HTTP {status_code}",
@@ -218,6 +236,7 @@ def _build_api_exception(
         error=sandbox_error,
         request_id=request_id,
         response_body=content if isinstance(content, bytes) else None,
+        is_retryable=is_retryable,
     )
 
 

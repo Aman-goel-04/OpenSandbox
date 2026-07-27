@@ -158,6 +158,45 @@ class TestDecisionTransportBranch:
         assert should_retry("GET", opaque, 0, p, timedelta(0))
         assert not should_retry("POST", opaque, 0, p, timedelta(0))
 
+
+class TestDecisionNonReplayableBody:
+    def test_status_retry_suppressed_for_non_replayable_body(self) -> None:
+        # POST opted into 503 status retry, but a non-replayable body
+        # must never be resent.
+        p = RetryPolicy(
+            retryable_status_codes_non_idempotent=frozenset(
+                {HTTPStatus.SERVICE_UNAVAILABLE}
+            )
+        )
+        out = _status_outcome(503)
+        assert should_retry(
+            "POST", out, 0, p, timedelta(0), body_replayable=True
+        )
+        assert not should_retry(
+            "POST", out, 0, p, timedelta(0), body_replayable=False
+        )
+
+    def test_pre_send_first_attempt_allowed_then_suppressed(self) -> None:
+        # A non-replayable body may still be retried once on a pre-send
+        # failure (no bytes written yet), but not after that.
+        p = RetryPolicy()
+        pre_send = Outcome(is_transport_error=True, is_pre_send=True)
+        assert should_retry(
+            "POST", pre_send, 0, p, timedelta(0), body_replayable=False
+        )
+        assert not should_retry(
+            "POST", pre_send, 1, p, timedelta(0), body_replayable=False
+        )
+
+    def test_replayable_body_unaffected(self) -> None:
+        # Replayable bodies keep the normal pre-send behavior even past
+        # the first attempt.
+        p = RetryPolicy(max_retries=10)
+        pre_send = Outcome(is_transport_error=True, is_pre_send=True)
+        assert should_retry(
+            "POST", pre_send, 3, p, timedelta(0), body_replayable=True
+        )
+
     def test_post_send_never_lifted_by_status_opt_in(self) -> None:
         """Status-code opt-in must not lift the post-send transport rule."""
         p = RetryPolicy(

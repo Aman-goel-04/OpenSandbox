@@ -41,6 +41,18 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
+# Status codes the SDK treats as transient (the default idempotent
+# retryable set from RetryPolicy). Surfaced via ``is_retryable`` so
+# callers get a machine-checkable retry decision even after the SDK has
+# exhausted its own retries.
+_RETRYABLE_STATUS_CODES = frozenset(
+    {
+        HTTPStatus.TOO_MANY_REQUESTS,   # 429
+        HTTPStatus.BAD_GATEWAY,         # 502
+        HTTPStatus.SERVICE_UNAVAILABLE, # 503
+    }
+)
+
 
 def extract_request_id(headers: Any) -> str | None:
     """
@@ -179,6 +191,7 @@ def build_api_exception_from_httpx(
         if raw_fragment:
             error_message = f"{error_message}: {raw_fragment}"
 
+    is_retryable = status_code in _RETRYABLE_STATUS_CODES
     if status_code == HTTPStatus.TOO_MANY_REQUESTS:
         return SandboxRateLimitException(
             message=error_message,
@@ -187,6 +200,7 @@ def build_api_exception_from_httpx(
             retry_after=_retry_after(headers),
             error=sandbox_error,
             response_body=body_bytes,
+            is_retryable=is_retryable,
         )
     return SandboxApiException(
         message=error_message,
@@ -194,6 +208,7 @@ def build_api_exception_from_httpx(
         request_id=request_id,
         error=sandbox_error,
         response_body=body_bytes,
+        is_retryable=is_retryable,
     )
 
 
@@ -246,6 +261,7 @@ def handle_api_error(response_obj: Any, operation_name: str = "API call") -> Non
             if raw_fragment:
                 error_message = f"{error_message}: {raw_fragment}"
 
+        is_retryable = status_code in _RETRYABLE_STATUS_CODES
         if status_code == HTTPStatus.TOO_MANY_REQUESTS:
             raise SandboxRateLimitException(
                 message=error_message,
@@ -254,6 +270,7 @@ def handle_api_error(response_obj: Any, operation_name: str = "API call") -> Non
                 retry_after=_retry_after(headers),
                 error=sandbox_error,
                 response_body=raw_body,
+                is_retryable=is_retryable,
             )
 
         raise SandboxApiException(
@@ -262,4 +279,5 @@ def handle_api_error(response_obj: Any, operation_name: str = "API call") -> Non
             request_id=request_id,
             error=sandbox_error,
             response_body=raw_body,
+            is_retryable=is_retryable,
         )
