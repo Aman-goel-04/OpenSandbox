@@ -16,9 +16,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/alibaba/opensandbox/internal/version"
@@ -37,6 +41,10 @@ import (
 )
 
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	clone3Compat := clone3compat.MaybeApply()
 
 	version.EchoVersion("OpenSandbox Execd")
@@ -47,7 +55,7 @@ func main() {
 	isoCfg, err := isolation.LoadConfig(flag.IsolationConfigPath)
 	if err != nil {
 		log.Error("isolation: config: %v", err)
-		os.Exit(1)
+		return 1
 	}
 
 	// Probe isolation runtime capabilities.
@@ -73,6 +81,11 @@ func main() {
 			log.Error("isolation: runner init failed (continuing without isolation): %v", err)
 		} else {
 			controller.InitIsolatedRunner(runner)
+			defer func() {
+				if err := runner.Close(); err != nil {
+					log.Error("isolation: runner shutdown failed: %v", err)
+				}
+			}()
 			log.Info("isolation: runner ready, upper_root=%s", isoCfg.UpperRoot)
 		}
 	}
@@ -97,11 +110,58 @@ func main() {
 	listener, err := net.Listen("tcp4", addr)
 	if err != nil {
 		log.Error("failed to listen on %s: %v", addr, err)
-		os.Exit(1)
+		return 1
 	}
 	log.Info("execd listening on %s (IPv4)", addr)
-	if err := engine.RunListener(listener); err != nil {
-		log.Error("failed to start execd server: %v", err)
-		os.Exit(1)
+	serverCtx, stopSignals := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+	defer stopSignals()
+	if err := serveHTTPUntilShutdown(serverCtx, listener, engine); err != nil {
+		log.Error("execd server stopped with error: %v", err)
+		return 1
 	}
+	return 0
+}
+
+func serveHTTPUntilShutdown(
+	ctx context.Context,
+	listener net.Listener,
+	handler http.Handler,
+) error {
+	server := &http.Server{Handler: handler}
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server.Serve(listener)
+	}()
+
+	select {
+	case err := <-serveDone:
+		if err == nil || errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(
+		context.Background(),
+		5*time.Second,
+	)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		closeErr := server.Close()
+		serveErr := <-serveDone
+		return errors.Join(
+			fmt.Errorf("gracefully shut down execd server: %w", err),
+			closeErr,
+			serveErr,
+		)
+	}
+	if err := <-serveDone; err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
 }
