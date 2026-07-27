@@ -140,12 +140,17 @@ class RetryAsyncTransport(httpx.AsyncBaseTransport):
             # zero per-phase timeout and possibly trigger a spurious
             # retry. Any previously retried response has already been
             # aclose()d below, so we can only surface an exception here.
+            # The terminating condition is the deadline, so always raise
+            # a timeout (mapped to SandboxTimeoutException by the
+            # converter) even when the last attempt failed for another
+            # reason; that failure is preserved as the cause for context.
             if remaining is not None and remaining.total_seconds() <= 0:
-                if last_exc is not None:
-                    raise last_exc
-                raise httpx.ReadTimeout(
+                timeout_exc = httpx.ReadTimeout(
                     "retry overall_deadline exceeded before next attempt"
                 )
+                if last_exc is not None:
+                    timeout_exc.__cause__ = last_exc
+                raise timeout_exc
             _clamp_attempt_timeout(request, policy, baseline_timeout, remaining)
 
             outcome: Outcome

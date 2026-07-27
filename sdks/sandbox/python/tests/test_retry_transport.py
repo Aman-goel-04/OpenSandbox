@@ -26,6 +26,7 @@ import httpx
 import pytest
 
 from opensandbox.transport import (
+    JitterMode,
     RetryAsyncTransport,
     RetryEvent,
     RetryPolicy,
@@ -375,6 +376,51 @@ class TestAsyncTransport:
         assert inner.calls == 1
 
     @pytest.mark.asyncio
+    async def test_overall_deadline_after_connect_error_raises_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A pre-send ConnectError is retryable, but if the deadline is
+        # consumed during backoff the operation terminated *because of
+        # the deadline*: surface a ReadTimeout (-> SandboxTimeoutException)
+        # rather than re-raising the ConnectError, preserving the
+        # ConnectError as the cause.
+        connect_error = httpx.ConnectError("dns down")
+        inner = _CountingAsyncTransport([_raise(connect_error)])
+        policy = RetryPolicy(
+            max_retries=3,
+            initial_backoff=timedelta(seconds=5),
+            max_backoff=timedelta(seconds=5),
+            jitter=JitterMode.NONE,
+            overall_deadline=timedelta(seconds=1),
+        )
+
+        import opensandbox.transport._async_retry as async_retry_mod
+
+        real_monotonic = async_retry_mod.time.monotonic
+        base = real_monotonic()
+        clock = {"advance": 0.0}
+
+        def _fake_monotonic() -> float:
+            return base + clock["advance"]
+
+        async def _sleep_that_advances(seconds: float) -> None:
+            clock["advance"] += seconds
+
+        monkeypatch.setattr(async_retry_mod.time, "monotonic", _fake_monotonic)
+        monkeypatch.setattr(
+            async_retry_mod.asyncio, "sleep", _sleep_that_advances
+        )
+
+        rt = RetryAsyncTransport(inner, policy)
+        async with httpx.AsyncClient(
+            transport=rt, base_url="http://x", timeout=30.0
+        ) as client:
+            with pytest.raises(httpx.ReadTimeout) as excinfo:
+                await client.get("/")
+        assert excinfo.value.__cause__ is connect_error
+        assert inner.calls == 1
+
+    @pytest.mark.asyncio
     async def test_per_attempt_timeout_wraps_hung_attempt_in_wait_for(self) -> None:
         # A misbehaving inner transport that hangs forever must be
         # aborted by the wrapper's wall-clock per-attempt deadline
@@ -506,6 +552,44 @@ class TestSyncTransport:
             resp = client.post("/", json={})
         assert resp.status_code == 200
         assert inner.calls == 2
+
+    def test_overall_deadline_after_connect_error_raises_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Sync counterpart: deadline consumed during backoff after a
+        # retryable ConnectError must surface a ReadTimeout with the
+        # ConnectError preserved as the cause.
+        connect_error = httpx.ConnectError("dns down")
+        inner = _CountingSyncTransport([_raise(connect_error)])
+        policy = RetryPolicy(
+            max_retries=3,
+            initial_backoff=timedelta(seconds=5),
+            max_backoff=timedelta(seconds=5),
+            jitter=JitterMode.NONE,
+            overall_deadline=timedelta(seconds=1),
+        )
+
+        import opensandbox.transport._sync_retry as sync_retry_mod
+
+        real_monotonic = sync_retry_mod.time.monotonic
+        base = real_monotonic()
+        clock = {"advance": 0.0}
+
+        def _fake_monotonic() -> float:
+            return base + clock["advance"]
+
+        def _sleep_that_advances(seconds: float) -> None:
+            clock["advance"] += seconds
+
+        monkeypatch.setattr(sync_retry_mod.time, "monotonic", _fake_monotonic)
+        monkeypatch.setattr(sync_retry_mod.time, "sleep", _sleep_that_advances)
+
+        rt = RetrySyncTransport(inner, policy)
+        with httpx.Client(transport=rt, base_url="http://x", timeout=30.0) as client:
+            with pytest.raises(httpx.ReadTimeout) as excinfo:
+                client.get("/")
+        assert excinfo.value.__cause__ is connect_error
+        assert inner.calls == 1
 
 
 class TestUnwrapRetryTransport:

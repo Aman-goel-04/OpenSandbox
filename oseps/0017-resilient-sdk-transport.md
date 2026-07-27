@@ -401,19 +401,28 @@ Go-idiomatic accessor.
 
 ### Observability
 
-Every SDK emits, at minimum:
+Baseline (this OSEP). Every SDK emits, at minimum:
 
 - Log at `WARN` on each retry with attempt number, method, cause,
   computed backoff, and `X-Request-ID` if available.
+- The `RetryPolicy.on_retry` callback, which carries the full
+  `RetryEvent` (attempt, cause, status, backoff, request_id, …) so
+  integrators can bridge retry activity to any telemetry stack
+  without the SDK depending on a specific one.
+
+Structured metrics (follow-up). The following OpenTelemetry
+instruments are specified but deferred to a follow-up that lands
+alongside OSEP-0010 (SDK telemetry) so the retry engine does not
+pull in an OTel dependency ahead of the shared telemetry surface.
+Until then, the `on_retry` callback is the supported bridge:
+
 - Counter `opensandbox.sdk.retry.attempts` with dimensions
   `{sdk_language, method, endpoint, cause, idempotent}`.
 - Counter `opensandbox.sdk.retry.exhausted` when `max_retries` is
   reached without success.
 - Histogram `opensandbox.sdk.retry.backoff_ms`.
 
-Metrics route through OpenTelemetry (OSEP-0010) where available.
-The `RetryPolicy.on_retry` callback lets integrators bridge to
-custom telemetry without depending on any specific stack.
+These route through OpenTelemetry (OSEP-0010) where available.
 
 ### Per-Language Landing
 
@@ -633,8 +642,9 @@ parity.
   `Retry-After` wait.
 - **Behavior drift between languages.** Mitigated by the shared
   decision function and shared test-vector matrix.
-- **Retry masks real bugs.** Mitigated by `WARN` log and metric
-  on every retry so operators see the transient rate.
+- **Retry masks real bugs.** Mitigated by the `WARN` log (and the
+  `on_retry` callback) on every retry so operators see the transient
+  rate; structured metrics follow with OSEP-0010.
 - **Increased latency on unrecoverable failures.** Mitigated by
   bounded `max_retries` (default 3) and `max_backoff` (default
   30s), both configurable.
