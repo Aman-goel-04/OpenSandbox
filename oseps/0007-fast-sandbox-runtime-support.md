@@ -44,7 +44,7 @@ Introduce a new OpenSandbox backend type, **`sandbox fleets`** (runtime `type = 
 
 `fleets` is **additive and parallel** to the existing `docker` and `kubernetes` backends; it does **not** replace the pod-per-sandbox `kubernetes` backend. The integration is deliberately scoped:
 
-- **Create** is a *simplified* subset of `CreateSandboxRequest`. Pod-identity-dependent fields (`volumes`, `platform` node-selectors, `secure_access`, `snapshot_id`, pause/resume) are explicitly rejected.
+- **Create** is a *simplified* subset of `CreateSandboxRequest`. Pod-identity-dependent fields (`volumes`, `platform` node-selectors, `resource_requests`, `credential_proxy`, `snapshot_id`, pause/resume) are explicitly rejected; `network_policy` and `secure_access` are staged (contract kept, enforced in phase 1b).
 - **Lifecycle** (get / delete / renew-expiration / list / metadata), **execd** (exec / file), and **egress** (`network_policy`) reuse the *existing public API contracts* unchanged, so upstream SDKs are unaffected.
 
 **Performance Characteristics** (with cached images on Fastlet nodes):
@@ -196,7 +196,7 @@ The key insight: **use K8s for what it's good at** (resource accounting, cluster
 ### Non-Goals
 
 - Replacing or removing the existing Docker or Kubernetes runtimes
-- Supporting `volumes` (PVC / host / ossfs), `platform` node-selectors, `secure_access` signed endpoints, or `snapshot_id` on `fleets`
+- Supporting `volumes` (PVC / host / ossfs), `platform` node-selectors, `resource_requests`, `credential_proxy`, or `snapshot_id` on `fleets`
 - Supporting `pause` / `resume` / snapshot on `fleets` (fast-sandbox states these as explicit non-goals)
 - Implementing `fleets` as a Kubernetes `WorkloadProvider`
 - Implementing a full Kubernetes operator for fast-sandbox (it has its own controller)
@@ -284,7 +284,26 @@ The three "reused" API areas reuse *different* things. Being precise here avoids
 | egress `network_policy` | `NetworkPolicy` schema + `egress-api.yaml` `/policy` (client → egress proxy:18080) | Deliver + enforce policy per sandbox netns; implement `get_endpoint(id, 18080)` with auth header |
 | Endpoint resolution | `SandboxService.get_endpoint` → `Endpoint`; ingress-gateway routing is backend-neutral | Route fleets ports through the ingress gateway |
 
-**Simplified Create** accepts this subset of `CreateSandboxRequest`: `image`, `entrypoint`, `env`, `timeout` (→ `expireTime`), `resource_limits` (advisory; enforced by the target `SandboxPool` profile), `network_policy`, `metadata`, `extensions.pool_ref`. It **rejects** (HTTP 400, clear message): `volumes`, `platform`, `secure_access`, `snapshot_id`, and any pause/resume/snapshot call.
+**Simplified Create.** The `fleets` Create is a subset of the full `CreateSandboxRequest`. The table below classifies every field as **kept** (mapped through), **downgraded** (accepted but semantics change), **staged** (contract kept, enforced in a later phase), or **rejected** (HTTP 400 with a clear message). The common thread among rejected fields is that they assume *1 sandbox = 1 dedicated K8s Pod* (own rootfs, node, volume set, netns), which does not hold in the shared-Fastlet model.
+
+| `CreateSandboxRequest` field | fleets | Mapping / reason |
+| --- | --- | --- |
+| `image` | **kept** | → `CreateRequest.image` |
+| `entrypoint` | **kept** | → `command` (+ `args`) |
+| `env` | **kept** | → `envs` |
+| `timeout` | **kept** | → `UpdateSandbox.expire_time_seconds` |
+| `metadata` | **kept** | → CRD `labels` |
+| `extensions.pool_ref` | **kept** | → `pool_ref` (else config default) |
+| `resource_limits` | **downgraded** | fast-sandbox enforces the pool's immutable `sandboxResources`; the request value is validated for pool compatibility, not applied per-sandbox |
+| `network_policy` | **staged (1b)** | Contract kept; rejected in phase 1a, enforced per-slot netns in phase 1b (see [Egress / Network Policy](#egress--network-policy)) |
+| `secure_access` | **staged (1b)** | Naturally aligned: fast-sandbox already returns `required_headers` with a short-lived Ed25519 bearer per `ResolveEndpoint`. Server-issued access headers can be layered on the gateway route; deferred to 1b to co-land with the ingress-gateway signing path |
+| `snapshot_id` | **rejected** | No snapshot capability in fast-sandbox (explicit non-goal) |
+| `platform` | **rejected** | No per-sandbox node scheduling; scheduling is per Fastlet pool |
+| `resource_requests` | **rejected** | No K8s requests / Burstable QoS; resources are fixed by the pool profile |
+| `credential_proxy` | **rejected** | Rides the per-pod egress mitmproxy sidecar, which has no place in the shared-Fastlet model |
+| `volumes` | **rejected** | Fastlet child containers cannot receive dynamic PVC/CSI mounts |
+
+In short, `fleets` Create keeps the "**what to run**" fields (image / entrypoint / env) plus "**which pool, how long, what tags**" (pool_ref / timeout / metadata), and drops or stages the pod-level isolation / storage / snapshot / signed-network fields.
 
 ### Notes/Constraints/Caveats
 
@@ -655,7 +674,8 @@ server/opensandbox_server/services/fleets/
     "extensions": {"pool_ref": "default-pool"},    # → pool_ref (else config default)
     # request_id (idempotency key + Sandbox CRD name) = OpenSandbox sandbox_id
 }
-# Rejected (HTTP 400): volumes, platform, secure_access, snapshot_id
+# Rejected (HTTP 400): volumes, platform, resource_requests, credential_proxy, snapshot_id
+# Staged (contract kept, enforced in phase 1b): network_policy, secure_access
 ```
 
 ### Status Mapping
@@ -758,13 +778,13 @@ Both phases are part of the first release. The split exists so the cross-repo ne
 
 - Add `FleetSandboxService` + register `"fleets"` in `factory.py`; add `FleetsRuntimeConfig`.
 - Implement `fastpath_client` (Create / Get / Delete / Update / List / Diagnostics / ResolveEndpoint).
-- Simplified Create mapping + rejection of `volumes` / `platform` / `secure_access` / `snapshot_id`; **reject `network_policy`** ("coming in fleets egress phase").
+- Simplified Create mapping + rejection of `volumes` / `platform` / `resource_requests` / `credential_proxy` / `snapshot_id`; **reject `network_policy` and `secure_access`** ("coming in fleets phase 1b").
 - Implement `get_endpoint` via `ResolveEndpoint`, wired through the ingress gateway; persist `sandbox_id → uid`; treat credentials as ephemeral.
 - execd via `opensandbox-execd-quickstart` Infra profile; verify exec/file end-to-end through the SDK.
 - Lifecycle get/delete/renew/list/metadata working (delete/expiry async); pause/resume/snapshot return clear unsupported errors.
 - **Exit criteria**: full SDK flow (create → exec → file → delete) passes on a Kind cluster with fast-sandbox, no SDK changes.
 
-### Phase 1b — Per-sandbox egress enforcement (cross-repo, higher risk)
+### Phase 1b — Per-sandbox egress enforcement + secure access (cross-repo, higher risk)
 
 - Additive `network_policy` field on fast-sandbox `CreateRequest` (proto), `Sandbox` CRD, Fastlet protocol `SandboxSpec`, and `Slot` (ask-first review with fast-sandbox maintainers).
 - New "apply on bind" driver step invoked from `Acquire` (resolves the pre-warm timing blocker); port `components/egress` nft + DNS logic into the per-slot netns.
@@ -772,7 +792,8 @@ Both phases are part of the first release. The split exists so the cross-repo ne
 - Restrict `network_policy` to the `container` (runc) runtime; reject egress on gVisor/Kata.
 - Extend NodeJanitor for any out-of-netns state (DNS proxy / ipset).
 - Flip Create to **accept and enforce** `network_policy`.
-- **Exit criteria**: a fleets sandbox with a deny-by-default FQDN allowlist blocks non-allowed egress and permits allowed FQDNs, end-to-end; co-located sandboxes with different policies do not interfere.
+- **Secure access**: accept `secure_access`; layer server-issued access headers onto the ingress-gateway route, reusing fast-sandbox's `required_headers` / short-lived Ed25519 credential model (OSEP-0011 semantics).
+- **Exit criteria**: a fleets sandbox with a deny-by-default FQDN allowlist blocks non-allowed egress and permits allowed FQDNs, end-to-end; co-located sandboxes with different policies do not interfere; a `secure_access` sandbox returns access headers and rejects unauthenticated endpoint access.
 
 ## Test Plan
 
@@ -786,7 +807,7 @@ Both phases are part of the first release. The split exists so the cross-repo ne
 
 1. Basic lifecycle: create → status query → delete (delete is async; poll for NotFound)
 2. Expiration renewal (eventual; poll status)
-3. Simplified Create: `volumes` / `platform` / `secure_access` / `snapshot_id` rejected with clear errors
+3. Simplified Create: `volumes` / `platform` / `resource_requests` / `credential_proxy` / `snapshot_id` rejected with clear errors; `network_policy` / `secure_access` rejected in 1a, accepted in 1b
 4. Pool selection via `extensions.pool_ref`; `resource_limits` incompatible with pool profile rejected
 5. Image affinity: second sandbox on same Fastlet (should be faster)
 6. Failure: Fast-Path unavailable, invalid pool ref
