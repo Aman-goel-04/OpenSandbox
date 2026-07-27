@@ -126,7 +126,8 @@ implementation details (`502`, `503`, `504`, `429`) is opt-in for
   `RetryPolicy.disabled()`, and fully overridable at the client
   level.
 - Retry must respect `Retry-After` (delta-seconds and HTTP-date),
-  capped by a configurable ceiling.
+  capped at a fixed 60-second ceiling. This is not configurable (see
+  "Retry-After handling is fixed, not configurable" below).
 - The retry loop must be bounded by both attempt count and
   wall-clock budget.
 - Caller cancellation (`context.Context`, `CancellationToken`,

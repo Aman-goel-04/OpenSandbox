@@ -115,7 +115,7 @@ def test_handle_api_error_raises_rate_limit_on_429() -> None:
     with pytest.raises(SandboxRateLimitException) as ei:
         handle_api_error(Resp(), "Op")
     assert ei.value.status_code == 429
-    assert ei.value.retry_after == 12.0
+    assert ei.value.retry_after == timedelta(seconds=12)
     assert ei.value.request_id == "req-abc"
     # Backward-compatible: still catchable as SandboxApiException.
     assert isinstance(ei.value, SandboxApiException)
@@ -165,7 +165,7 @@ def test_handle_api_error_rate_limit_preserves_raw_body_when_unparsed() -> None:
     with pytest.raises(SandboxRateLimitException) as ei:
         handle_api_error(Resp(), "Acquire")
     assert ei.value.response_body == body
-    assert ei.value.retry_after == 5.0
+    assert ei.value.retry_after == timedelta(seconds=5)
     assert "quota exhausted for tenant foo" in str(ei.value)
 
 
@@ -221,7 +221,7 @@ def test_build_api_exception_from_httpx_maps_429_to_rate_limit() -> None:
     exc = build_api_exception_from_httpx(Resp(), "Isolated create")
     assert isinstance(exc, SandboxRateLimitException)
     assert exc.status_code == 429
-    assert exc.retry_after == 3.0
+    assert exc.retry_after == timedelta(seconds=3)
     assert exc.request_id == "req-xyz"
     assert exc.response_body == b'{"code":"QUOTA","message":"too many"}'
     assert "too many" in str(exc)
@@ -314,7 +314,7 @@ def test_exception_converter_maps_httpx_status_error_429_to_rate_limit() -> None
     err = httpx.HTTPStatusError("429", request=response.request, response=response)
     exc = ExceptionConverter.to_sandbox_exception(err)
     assert isinstance(exc, SandboxRateLimitException)
-    assert exc.retry_after == 7.0
+    assert exc.retry_after == timedelta(seconds=7)
     assert exc.request_id == "req-1"
 
 

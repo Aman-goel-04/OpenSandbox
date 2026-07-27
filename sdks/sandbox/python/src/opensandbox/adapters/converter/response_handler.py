@@ -25,6 +25,7 @@ This eliminates the need to repeat response handling logic in each adapter metho
 """
 
 import logging
+from datetime import timedelta
 from http import HTTPStatus
 from typing import Any, TypeVar
 
@@ -103,16 +104,15 @@ def require_parsed(response_obj: Any, expected_type: type[T], operation_name: st
     return parsed
 
 
-def _retry_after_seconds(headers: Any) -> float | None:
-    """Return Retry-After (seconds) from response headers, or None."""
+def _retry_after(headers: Any) -> timedelta | None:
+    """Return Retry-After as a timedelta from response headers, or None."""
     if not headers:
         return None
     try:
         raw = headers.get("Retry-After") or headers.get("retry-after")
     except Exception:
         return None
-    parsed = parse_retry_after(raw if isinstance(raw, str) else None)
-    return parsed.total_seconds() if parsed is not None else None
+    return parse_retry_after(raw if isinstance(raw, str) else None)
 
 
 # Upper bound on the raw response body slice we splice into an
@@ -184,7 +184,7 @@ def build_api_exception_from_httpx(
             message=error_message,
             status_code=status_code,
             request_id=request_id,
-            retry_after=_retry_after_seconds(headers),
+            retry_after=_retry_after(headers),
             error=sandbox_error,
             response_body=body_bytes,
         )
@@ -251,7 +251,7 @@ def handle_api_error(response_obj: Any, operation_name: str = "API call") -> Non
                 message=error_message,
                 status_code=status_code,
                 request_id=request_id,
-                retry_after=_retry_after_seconds(headers),
+                retry_after=_retry_after(headers),
                 error=sandbox_error,
                 response_body=raw_body,
             )

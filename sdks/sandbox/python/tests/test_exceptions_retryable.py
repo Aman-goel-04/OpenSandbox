@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 from opensandbox.exceptions import (
     SandboxApiException,
     SandboxConnectionException,
@@ -29,10 +31,12 @@ from opensandbox.exceptions import (
 
 class TestHierarchy:
     def test_rate_limit_inherits_api(self) -> None:
-        exc = SandboxRateLimitException(message="throttled", retry_after=2.5)
+        exc = SandboxRateLimitException(
+            message="throttled", retry_after=timedelta(seconds=2.5)
+        )
         assert isinstance(exc, SandboxApiException)
         assert isinstance(exc, SandboxException)
-        assert exc.retry_after == 2.5
+        assert exc.retry_after == timedelta(seconds=2.5)
         assert exc.status_code == 429
 
     def test_timeout_inherits_internal(self) -> None:

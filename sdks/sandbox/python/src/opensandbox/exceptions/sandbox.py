@@ -17,6 +17,8 @@
 Sandbox-related exception definitions.
 """
 
+from datetime import timedelta
+
 
 class SandboxError:
     """
@@ -119,8 +121,8 @@ class SandboxRateLimitException(SandboxApiException):
     """
     Thrown when the API returns HTTP 429.
 
-    ``retry_after`` carries the server-supplied header value (seconds)
-    when present, so fast-fail callers can still act on it.
+    ``retry_after`` carries the server-supplied header value as a
+    ``timedelta`` when present, so fast-fail callers can still act on it.
     """
 
     def __init__(
@@ -130,7 +132,7 @@ class SandboxRateLimitException(SandboxApiException):
         status_code: int | None = 429,
         error: SandboxError | None = None,
         request_id: str | None = None,
-        retry_after: float | None = None,
+        retry_after: timedelta | None = None,
         response_body: bytes | None = None,
         is_retryable: bool = False,
     ) -> None:

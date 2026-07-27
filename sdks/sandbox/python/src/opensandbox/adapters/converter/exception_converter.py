@@ -28,6 +28,7 @@ This module handles:
 
 import json
 import logging
+from datetime import timedelta
 from http import HTTPStatus
 from typing import Any
 
@@ -180,15 +181,14 @@ def _is_httpx_status_error(e: Exception) -> bool:
     return isinstance(e, HTTPStatusError)
 
 
-def _retry_after_from_headers(headers: Any) -> float | None:
+def _retry_after_from_headers(headers: Any) -> timedelta | None:
     if not headers:
         return None
     try:
         raw = headers.get("Retry-After") or headers.get("retry-after")
     except Exception:
         return None
-    parsed = parse_retry_after(raw if isinstance(raw, str) else None)
-    return parsed.total_seconds() if parsed is not None else None
+    return parse_retry_after(raw if isinstance(raw, str) else None)
 
 
 def _build_api_exception(
@@ -197,7 +197,7 @@ def _build_api_exception(
     content: bytes | None,
     cause: Exception,
     request_id: str | None = None,
-    retry_after: float | None = None,
+    retry_after: timedelta | None = None,
 ) -> SandboxApiException:
     """Build a Sandbox(ApiException|RateLimitException) from raw fields."""
     sandbox_error = _parse_error_body(content) if content else None
