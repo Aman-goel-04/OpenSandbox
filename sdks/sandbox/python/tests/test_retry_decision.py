@@ -265,9 +265,21 @@ class TestRetryAfter:
     def test_parse_huge_numeric_does_not_overflow(self) -> None:
         # A pathologically large numeric Retry-After must not raise
         # OverflowError from timedelta construction; it is clamped up
-        # front to the 60s ceiling.
+        # front to a safe upper bound. The operational cap is applied
+        # separately by apply_retry_after_cap.
         huge = "999999999999999999999999"
-        assert parse_retry_after(huge) == timedelta(seconds=60)
+        parsed = parse_retry_after(huge)
+        assert parsed is not None
+        assert parsed.total_seconds() > 0
+        assert apply_retry_after_cap(parsed) == timedelta(seconds=60)
+
+    def test_cap_respects_custom_value(self) -> None:
+        assert apply_retry_after_cap(
+            timedelta(seconds=3600), timedelta(seconds=120)
+        ) == timedelta(seconds=120)
+        assert apply_retry_after_cap(
+            timedelta(seconds=90), timedelta(seconds=120)
+        ) == timedelta(seconds=90)
 
     def test_cap_applied(self) -> None:
         # Values above the fixed 60s ceiling are clamped; smaller values

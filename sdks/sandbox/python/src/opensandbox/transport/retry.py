@@ -49,9 +49,13 @@ class RetryCause(str, Enum):
     READ_TIMEOUT = "read_timeout"
     WRITE_TIMEOUT = "write_timeout"
     UNEXPECTED_EOF = "unexpected_eof"
+    STATUS_408 = "status_408"
+    STATUS_425 = "status_425"
     STATUS_429 = "status_429"
+    STATUS_500 = "status_500"
     STATUS_502 = "status_502"
     STATUS_503 = "status_503"
+    STATUS_504 = "status_504"
     STATUS_OTHER = "status_other"
 
     @classmethod
@@ -61,9 +65,13 @@ class RetryCause(str, Enum):
         except ValueError:
             return cls.STATUS_OTHER
         return {
+            HTTPStatus.REQUEST_TIMEOUT: cls.STATUS_408,
+            HTTPStatus.TOO_EARLY: cls.STATUS_425,
             HTTPStatus.TOO_MANY_REQUESTS: cls.STATUS_429,
+            HTTPStatus.INTERNAL_SERVER_ERROR: cls.STATUS_500,
             HTTPStatus.BAD_GATEWAY: cls.STATUS_502,
             HTTPStatus.SERVICE_UNAVAILABLE: cls.STATUS_503,
+            HTTPStatus.GATEWAY_TIMEOUT: cls.STATUS_504,
         }.get(status, cls.STATUS_OTHER)
 
 
@@ -123,6 +131,15 @@ class RetryPolicy:
         default_factory=frozenset
     )
     """Statuses that trigger retry for ``POST/PATCH``. Empty by default."""
+
+    respect_retry_after: bool = True
+    """Honor a server ``Retry-After`` header for the next wait. When
+    ``False``, the header is ignored and computed backoff is used."""
+
+    retry_after_cap: timedelta = timedelta(seconds=60)
+    """Upper bound applied to any ``Retry-After`` wait, so a pathological
+    header cannot stall the client. Ignored when
+    ``respect_retry_after`` is ``False``."""
 
     per_attempt_timeout: timedelta | None = None
     overall_deadline: timedelta | None = None
@@ -186,6 +203,10 @@ class RetryPolicy:
         ):
             raise ValueError(
                 f"overall_deadline must be > 0 when set, got {self.overall_deadline!r}"
+            )
+        if self.retry_after_cap.total_seconds() < 0:
+            raise ValueError(
+                f"retry_after_cap must be >= 0, got {self.retry_after_cap!r}"
             )
         # Normalize so callers can pass a plain ``set`` or ``tuple``.
         object.__setattr__(

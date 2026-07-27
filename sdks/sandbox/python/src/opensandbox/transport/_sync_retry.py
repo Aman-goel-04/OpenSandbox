@@ -117,11 +117,13 @@ class RetrySyncTransport(httpx.BaseTransport):
             last_exc = exc
 
             retry_after = None
-            if response is not None:
+            if response is not None and policy.respect_retry_after:
                 retry_after = parse_retry_after(
                     response.headers.get("Retry-After")
                 )
-                retry_after = apply_retry_after_cap(retry_after)
+                retry_after = apply_retry_after_cap(
+                    retry_after, policy.retry_after_cap
+                )
 
             if retry_after is not None:
                 sleep_for = retry_after

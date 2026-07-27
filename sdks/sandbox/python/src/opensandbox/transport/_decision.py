@@ -115,10 +115,16 @@ def compute_backoff(
     return timedelta(seconds=max(0.0, sleep_s))
 
 
-# Upper bound for server-supplied ``Retry-After`` waits. Fixed at 60s to
-# prevent an over-long header from stalling the client while still giving
-# operators a chance to shape recovery.
-_RETRY_AFTER_CAP: timedelta = timedelta(seconds=60)
+# Default operational ceiling for server-supplied ``Retry-After`` waits.
+# Callers can override via ``RetryPolicy.retry_after_cap``.
+_DEFAULT_RETRY_AFTER_CAP: timedelta = timedelta(seconds=60)
+
+# Overflow guard for numeric ``Retry-After`` values, independent of the
+# policy cap. ``timedelta`` cannot represent more than ~999999999 days,
+# so a huge header would raise ``OverflowError`` during construction.
+# We clamp the raw seconds to a safe upper bound here; the operational
+# cap is applied later by ``apply_retry_after_cap``.
+_MAX_RETRY_AFTER_SECONDS: int = 100 * 365 * 24 * 3600  # ~100 years
 
 
 def parse_retry_after(
@@ -137,14 +143,13 @@ def parse_retry_after(
     except ValueError:
         seconds = None
     if seconds is not None:
-        # A pathologically large numeric value overflows ``timedelta``
-        # (and later ``int`` conversions). Clamp to the Retry-After cap
-        # up front so parsing never raises; the caller applies the same
-        # ceiling again via ``apply_retry_after_cap``.
+        # A pathologically large numeric value overflows ``timedelta``.
+        # Clamp to a safe upper bound so parsing never raises; the
+        # operational ceiling is applied later via
+        # ``apply_retry_after_cap``.
         if seconds < 0:
             return timedelta(0)
-        cap_s = int(_RETRY_AFTER_CAP.total_seconds())
-        return timedelta(seconds=min(seconds, cap_s))
+        return timedelta(seconds=min(seconds, _MAX_RETRY_AFTER_SECONDS))
 
     # HTTP-date
     try:
@@ -162,10 +167,13 @@ def parse_retry_after(
     return delta
 
 
-def apply_retry_after_cap(retry_after: timedelta | None) -> timedelta | None:
-    """Cap ``retry_after`` at 60 seconds."""
+def apply_retry_after_cap(
+    retry_after: timedelta | None,
+    cap: timedelta = _DEFAULT_RETRY_AFTER_CAP,
+) -> timedelta | None:
+    """Cap ``retry_after`` at ``cap`` (default 60s)."""
     if retry_after is None:
         return None
-    if retry_after > _RETRY_AFTER_CAP:
-        return _RETRY_AFTER_CAP
+    if retry_after > cap:
+        return cap
     return retry_after

@@ -49,6 +49,11 @@ class TestRetryPolicyDefaults:
     def test_default_jitter_is_decorrelated(self) -> None:
         assert RetryPolicy().jitter is JitterMode.DECORRELATED
 
+    def test_default_retry_after_fields(self) -> None:
+        p = RetryPolicy()
+        assert p.respect_retry_after is True
+        assert p.retry_after_cap == timedelta(seconds=60)
+
     def test_opt_in_post_status_set(self) -> None:
         p = RetryPolicy(
             retryable_status_codes_non_idempotent=frozenset(
@@ -87,19 +92,25 @@ class TestRetryPolicyValidation:
         with pytest.raises(ValueError):
             RetryPolicy(overall_deadline=timedelta(0))
 
+    def test_negative_retry_after_cap_rejected(self) -> None:
+        with pytest.raises(ValueError):
+            RetryPolicy(retry_after_cap=timedelta(seconds=-1))
+
 
 class TestRetryCause:
     @pytest.mark.parametrize(
         "code,expected",
         [
+            (408, RetryCause.STATUS_408),
+            (425, RetryCause.STATUS_425),
             (429, RetryCause.STATUS_429),
+            (500, RetryCause.STATUS_500),
             (502, RetryCause.STATUS_502),
             (503, RetryCause.STATUS_503),
+            (504, RetryCause.STATUS_504),
             (200, RetryCause.STATUS_OTHER),
-            (408, RetryCause.STATUS_OTHER),
             (418, RetryCause.STATUS_OTHER),
-            (500, RetryCause.STATUS_OTHER),
-            (504, RetryCause.STATUS_OTHER),
+            (501, RetryCause.STATUS_OTHER),
         ],
     )
     def test_for_status(self, code: int, expected: RetryCause) -> None:
