@@ -92,8 +92,6 @@ def _fast_policy(
     retryable_status_codes_non_idempotent: frozenset[HTTPStatus] = frozenset(),
     on_retry: Callable[[RetryEvent], None] | None = None,
     overall_deadline: timedelta | None = None,
-    respect_retry_after: bool = True,
-    retry_after_cap: timedelta = timedelta(seconds=60),
 ) -> RetryPolicy:
     """Tests need near-zero sleeps; use a tiny backoff to keep runs fast."""
     return RetryPolicy(
@@ -104,8 +102,6 @@ def _fast_policy(
         retryable_status_codes_non_idempotent=retryable_status_codes_non_idempotent,
         on_retry=on_retry,
         overall_deadline=overall_deadline,
-        respect_retry_after=respect_retry_after,
-        retry_after_cap=retry_after_cap,
     )
 
 
@@ -185,63 +181,6 @@ class TestAsyncTransport:
         assert inner.calls == 2
         assert len(events) == 1
         assert events[0].backoff == timedelta(seconds=60)
-
-    @pytest.mark.asyncio
-    async def test_retry_after_custom_cap(self) -> None:
-        # retry_after_cap=10 clamps a Retry-After: 3600 to 10s.
-        events: list[RetryEvent] = []
-        inner = _CountingAsyncTransport(
-            [
-                httpx.Response(429, headers={"Retry-After": "3600"}),
-                httpx.Response(200),
-            ]
-        )
-        policy = _fast_policy(
-            on_retry=lambda e: events.append(e),
-            retry_after_cap=timedelta(seconds=10),
-        )
-        import opensandbox.transport._async_retry as async_retry_mod
-
-        original_sleep = async_retry_mod.asyncio.sleep
-
-        async def _no_sleep(_: float) -> None:
-            return None
-
-        async_retry_mod.asyncio.sleep = _no_sleep  # type: ignore[assignment]
-        try:
-            rt = RetryAsyncTransport(inner, policy)
-            async with httpx.AsyncClient(
-                transport=rt, base_url="http://x"
-            ) as client:
-                resp = await client.get("/")
-        finally:
-            async_retry_mod.asyncio.sleep = original_sleep  # type: ignore[assignment]
-        assert resp.status_code == 200
-        assert events[0].backoff == timedelta(seconds=10)
-
-    @pytest.mark.asyncio
-    async def test_respect_retry_after_false_ignores_header(self) -> None:
-        # With respect_retry_after=False the server header is ignored and
-        # the (zero) computed backoff is used instead of a 3600s wait.
-        events: list[RetryEvent] = []
-        inner = _CountingAsyncTransport(
-            [
-                httpx.Response(429, headers={"Retry-After": "3600"}),
-                httpx.Response(200),
-            ]
-        )
-        policy = _fast_policy(
-            on_retry=lambda e: events.append(e),
-            respect_retry_after=False,
-        )
-        rt = RetryAsyncTransport(inner, policy, rng=random.Random(0))
-        async with httpx.AsyncClient(
-            transport=rt, base_url="http://x"
-        ) as client:
-            resp = await client.get("/")
-        assert resp.status_code == 200
-        assert inner.calls == 2
-        assert events[0].backoff == timedelta(0)
 
     @pytest.mark.asyncio
     async def test_budget_exhaustion_returns_last_response(self) -> None:

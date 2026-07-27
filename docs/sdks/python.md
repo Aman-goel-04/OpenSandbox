@@ -505,9 +505,6 @@ config = ConnectionConfig(
     retry_policy=RetryPolicy(
         max_retries=5,
         overall_deadline=timedelta(seconds=20),
-        # Ignore server Retry-After, or cap it lower than the 60s default:
-        respect_retry_after=True,
-        retry_after_cap=timedelta(seconds=10),
         retryable_status_codes_non_idempotent=frozenset(
             {HTTPStatus.SERVICE_UNAVAILABLE}
         ),

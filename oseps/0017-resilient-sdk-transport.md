@@ -196,13 +196,21 @@ RetryPolicy {
                                                       // { NONE, FULL, DECORRELATED }
   retryable_status_codes_idempotent      : Set<int> = { 408, 425, 429, 500, 502, 503, 504 }
   retryable_status_codes_non_idempotent  : Set<int> = { }        // empty; opt-in only
-  respect_retry_after                    : bool     = true
-  retry_after_cap                        : Duration = 60s
   per_attempt_timeout                    : Duration?= null   // if null, use request_timeout
   overall_deadline                       : Duration?= null   // if null, use caller cancellation
   on_retry                               : Callback?= null   // observability hook
 }
 ```
+
+**`Retry-After` handling is fixed, not configurable.** The SDK always
+honors a server-supplied `Retry-After` header and always clamps the
+resulting wait to a fixed 60-second ceiling. This is intentionally not
+exposed as policy fields: ignoring a server's explicit back-pressure
+signal is never a safe default to offer, and the 60s ceiling is only a
+guard against a pathological header — a knob almost no caller would
+tune. Keeping it out of the public surface keeps `RetryPolicy` minimal
+and avoids a permanent compatibility burden. See "Retry-After
+handling" below for the exact algorithm.
 
 **Why `retryable_status_codes_non_idempotent` defaults to empty.**
 A `502` cannot prove upstream business logic did not run — upstream
@@ -332,10 +340,11 @@ accurately and use the `PreSendFailure` branch. Only environments
 that cannot classify (browser `fetch`, custom `fetch`) fall back to
 `OpaqueTransportError`.
 
-`Retry-After` handling (when `respect_retry_after=true`): if the
-response carries `Retry-After` (delta-seconds or HTTP-date), the
-next wait is `min(retry_after_value, retry_after_cap)`. Unparseable
-values are ignored and the computed backoff is used.
+`Retry-After` handling: if the response carries `Retry-After`
+(delta-seconds or HTTP-date), the next wait is
+`min(retry_after_value, 60s)` — the header is always honored and always
+clamped to a fixed 60-second ceiling. Unparseable values are ignored
+and the computed backoff is used.
 
 ### Backoff and Jitter
 
@@ -383,7 +392,7 @@ Consequences: under `disabled()` (`max_retries=0`), every exception
 has `is_retryable=false`. On budget-exhausted exceptions,
 `is_retryable=false`. Under the default policy, `POST/PATCH` API
 exceptions and post-send timeouts produce `is_retryable=false`
-regardless of status. Independent of `retry_after_cap`:
+regardless of status. Independent of the 60s `Retry-After` ceiling:
 `Retry-After: 3600` on a `429` still produces `is_retryable=true`
 because the SDK will retry (after the capped delay).
 
@@ -476,7 +485,7 @@ is corrected against the shared contract:
 - Add `408`, `425`, `500` to the idempotent status set.
 - Switch jitter to decorrelated.
 - `Retry-After` semantics change from `max(computed, header)` to
-  strictly honoring the header, capped by `retry_after_cap`.
+  strictly honoring the header, capped at a fixed 60s ceiling.
 - Enable retry by default (currently opt-in). Add
   `per_attempt_timeout` and `overall_deadline`.
 - Remove `withRetry` from `doStreamRequest`
@@ -540,7 +549,7 @@ parity.
 - **Do not** retry on read timeout for `POST`: attempt count = 1.
 - **Do not** retry on 4xx (400/401/404/409) for any method:
   attempt count = 1.
-- `Retry-After: 3600` on `GET` capped to `retry_after_cap=60`:
+- `Retry-After: 3600` on `GET` capped to the fixed 60s ceiling:
   backoff = 60s. `SandboxRateLimitException.is_retryable = true`
   even though the raw header exceeds the cap.
 - Overall deadline: 10 attempts scheduled, deadline fires before
@@ -620,8 +629,8 @@ parity.
 - **Retry storm under correlated failure.** Mitigated by
   decorrelated jitter, bounded max backoff, bounded overall retry
   budget.
-- **`Retry-After` abuse.** Mitigated by `retry_after_cap`
-  (default 60s).
+- **`Retry-After` abuse.** Mitigated by the fixed 60s ceiling on any
+  `Retry-After` wait.
 - **Behavior drift between languages.** Mitigated by the shared
   decision function and shared test-vector matrix.
 - **Retry masks real bugs.** Mitigated by `WARN` log and metric

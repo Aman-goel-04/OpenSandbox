@@ -49,11 +49,6 @@ class TestRetryPolicyDefaults:
     def test_default_jitter_is_decorrelated(self) -> None:
         assert RetryPolicy().jitter is JitterMode.DECORRELATED
 
-    def test_default_retry_after_fields(self) -> None:
-        p = RetryPolicy()
-        assert p.respect_retry_after is True
-        assert p.retry_after_cap == timedelta(seconds=60)
-
     def test_opt_in_post_status_set(self) -> None:
         p = RetryPolicy(
             retryable_status_codes_non_idempotent=frozenset(
@@ -91,10 +86,6 @@ class TestRetryPolicyValidation:
             RetryPolicy(overall_deadline=timedelta(seconds=-1))
         with pytest.raises(ValueError):
             RetryPolicy(overall_deadline=timedelta(0))
-
-    def test_negative_retry_after_cap_rejected(self) -> None:
-        with pytest.raises(ValueError):
-            RetryPolicy(retry_after_cap=timedelta(seconds=-1))
 
 
 class TestRetryCause:

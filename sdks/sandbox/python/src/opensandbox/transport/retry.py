@@ -132,15 +132,6 @@ class RetryPolicy:
     )
     """Statuses that trigger retry for ``POST/PATCH``. Empty by default."""
 
-    respect_retry_after: bool = True
-    """Honor a server ``Retry-After`` header for the next wait. When
-    ``False``, the header is ignored and computed backoff is used."""
-
-    retry_after_cap: timedelta = timedelta(seconds=60)
-    """Upper bound applied to any ``Retry-After`` wait, so a pathological
-    header cannot stall the client. Ignored when
-    ``respect_retry_after`` is ``False``."""
-
     per_attempt_timeout: timedelta | None = None
     overall_deadline: timedelta | None = None
     """Wall-clock cap across all attempts of one logical request."""
@@ -203,10 +194,6 @@ class RetryPolicy:
         ):
             raise ValueError(
                 f"overall_deadline must be > 0 when set, got {self.overall_deadline!r}"
-            )
-        if self.retry_after_cap.total_seconds() < 0:
-            raise ValueError(
-                f"retry_after_cap must be >= 0, got {self.retry_after_cap!r}"
             )
         # Normalize so callers can pass a plain ``set`` or ``tuple``.
         object.__setattr__(

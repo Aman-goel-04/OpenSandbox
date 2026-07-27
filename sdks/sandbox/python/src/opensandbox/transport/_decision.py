@@ -115,15 +115,17 @@ def compute_backoff(
     return timedelta(seconds=max(0.0, sleep_s))
 
 
-# Default operational ceiling for server-supplied ``Retry-After`` waits.
-# Callers can override via ``RetryPolicy.retry_after_cap``.
-_DEFAULT_RETRY_AFTER_CAP: timedelta = timedelta(seconds=60)
+# Fixed operational ceiling for server-supplied ``Retry-After`` waits.
+# Not configurable: ignoring a server's back-pressure signal is never a
+# safe default, and the 60s guard is only there to defend against a
+# pathological header.
+_RETRY_AFTER_CAP: timedelta = timedelta(seconds=60)
 
 # Overflow guard for numeric ``Retry-After`` values, independent of the
-# policy cap. ``timedelta`` cannot represent more than ~999999999 days,
-# so a huge header would raise ``OverflowError`` during construction.
-# We clamp the raw seconds to a safe upper bound here; the operational
-# cap is applied later by ``apply_retry_after_cap``.
+# operational cap. ``timedelta`` cannot represent more than ~999999999
+# days, so a huge header would raise ``OverflowError`` during
+# construction. We clamp the raw seconds to a safe upper bound here; the
+# operational ceiling is applied later by ``apply_retry_after_cap``.
 _MAX_RETRY_AFTER_SECONDS: int = 100 * 365 * 24 * 3600  # ~100 years
 
 
@@ -167,13 +169,10 @@ def parse_retry_after(
     return delta
 
 
-def apply_retry_after_cap(
-    retry_after: timedelta | None,
-    cap: timedelta = _DEFAULT_RETRY_AFTER_CAP,
-) -> timedelta | None:
-    """Cap ``retry_after`` at ``cap`` (default 60s)."""
+def apply_retry_after_cap(retry_after: timedelta | None) -> timedelta | None:
+    """Cap ``retry_after`` at the fixed 60-second ceiling."""
     if retry_after is None:
         return None
-    if retry_after > cap:
-        return cap
+    if retry_after > _RETRY_AFTER_CAP:
+        return _RETRY_AFTER_CAP
     return retry_after
