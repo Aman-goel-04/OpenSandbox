@@ -22,7 +22,7 @@ status: provisional
   - [Notes/Constraints/Caveats](#notesconstraintscaveats)
   - [Risks and Mitigations](#risks-and-mitigations)
 - [Design Details](#design-details)
-  - [How Fast-Sandbox Achieves Millisecond-Scale Latency](#how-fast-sandbox-achieves-millisecond-scale-latency)
+  - [How Fast-Sandbox Reduces Creation-Path Overhead](#how-fast-sandbox-reduces-creation-path-overhead)
   - [Kubernetes Ecosystem Integration](#kubernetes-ecosystem-integration)
 - [Integration Conditions & Feasibility](#integration-conditions--feasibility)
   - [Lifecycle](#lifecycle-integration)
@@ -40,29 +40,25 @@ status: provisional
 
 ## Summary
 
-Introduce a new OpenSandbox backend type, **`sandbox fleets`** (runtime `type = "fleets"`), whose sole implementation is backed by [fast-sandbox](https://github.com/fengcone/fast-sandbox). A fleet runs many sandboxes as isolated runtimes (container / gVisor / Kata) inside pre-warmed **Fastlet** pods, reached through fast-sandbox's gRPC Fast-Path control plane and its authenticated proxy data plane. By leveraging the Fast-Path API and warm Fastlet pools, OpenSandbox can achieve **millisecond-scale cold start latency** (compared to ~1 second with OpenSandbox's BatchSandbox pool, or 2-5 seconds with standard K8s runtime) for AI Agents, Serverless functions, and other latency-sensitive workloads.
+Introduce a new OpenSandbox backend type, **`sandbox fleets`** (runtime `type = "fleets"`), whose sole implementation is backed by [fast-sandbox](https://github.com/opensandbox-group/fast-sandbox). A fleet runs many sandboxes as isolated runtimes (container / gVisor / Kata) inside pre-warmed **Fastlet** pods, reached through fast-sandbox's gRPC Fast-Path control plane and its authenticated proxy data plane. The architecture removes the per-sandbox K8s scheduler, watch-propagation, and kubelet path for latency-sensitive workloads; any cross-backend latency claim still requires a reproducible OpenSandbox end-to-end benchmark.
 
 `fleets` is **additive and parallel** to the existing `docker` and `kubernetes` backends; it does **not** replace the pod-per-sandbox `kubernetes` backend. The integration is deliberately scoped:
 
 - **Create** is a *simplified* subset of `CreateSandboxRequest`. Pod-identity-dependent fields (`volumes`, `platform` node-selectors, `resource_requests`, `credential_proxy`, `snapshot_id`, pause/resume) are explicitly rejected; `network_policy` and `secure_access` are staged (contract kept, enforced in phase 1b).
 - **Lifecycle** (get / delete / renew-expiration / list / metadata), **execd** (exec / file), and **egress** (`network_policy`) reuse the *existing public API contracts* unchanged, so upstream SDKs are unaffected.
 
-**Performance Characteristics** (with cached images on Fastlet nodes):
+**Current performance evidence**:
 
-- Create returns at `RuntimeReady`: **~50-100ms base + K8s API write latency** (CRD-first, typically 20-50ms via etcd). Required Infra services (e.g. execd) and route publication continue asynchronously until `DataPlaneReady`.
+- At fast-sandbox [`3af0222`](https://github.com/opensandbox-group/fast-sandbox/tree/3af02227a85d3ae872e67ef718b63c60e777edac), the repository explicitly has **no release-grade Sandbox Create benchmark**. Its [dated engineering baseline](https://github.com/opensandbox-group/fast-sandbox/blob/3af02227a85d3ae872e67ef718b63c60e777edac/docs/guides/performance.md) measured 20 concurrency-1, warm-image runc creates through `RuntimeReady`: mean **76.02 ms**, p50 **75.95 ms**, and p95 **83.15 ms**.
+- That baseline excludes Infra readiness, route publication, `DataPlaneReady`, and the OpenSandbox server/gateway path. It is evidence about the current fast-sandbox implementation, not a `fleets` release target or a comparison with the BatchSandbox pool.
 
-> **Correction from earlier drafts**: fast-sandbox does **not** implement a "Fast Mode" (container-first / async-CRD / eventual-consistency <50ms) path. Every create is **CRD-first** (one synchronous etcd write, then one atomic Fastlet admission). The gRPC entry avoids the K8s *scheduler* and *watch propagation*, not the CRD/etcd write. This OSEP also uses the real fast-sandbox terminology (**Fastlet** / **SandboxPool**), not the "Agent" / "AgentPool" terms from earlier drafts.
+> **Correction from earlier drafts**: fast-sandbox does **not** implement a "Fast Mode" (container-first / async-CRD / eventual-consistency) path. Every create ranks in-memory candidates, persists one Sandbox CRD, and only then performs atomic Fastlet admission/runtime creation. Here, **CRD-first** means durable intent precedes runtime creation; it does not mean the CRD write precedes candidate ranking. The gRPC entry avoids the K8s *scheduler* and *watch propagation*, not the CRD/etcd write. This OSEP also uses the real fast-sandbox terminology (**Fastlet** / **SandboxPool**), not the "Agent" / "AgentPool" terms from earlier drafts.
 
-> **Note**: The millisecond-scale latency assumes the container image is already cached on the Fastlet's host node. Cold starts with uncached images incur additional image pull time.
+> **Note**: The observations above assume the container image and runtime artifacts are already cached on the Fastlet's host node. Cache misses add pull/unpack work and must be reported separately.
 
 ## Motivation
 
-OpenSandbox currently supports Docker and Kubernetes runtimes. While the Kubernetes runtime provides scalability, sandbox creation typically takes 2-5 seconds due to:
-
-- K8s scheduler latency (~100-500ms)
-- etcd write and watch propagation (~50-200ms)
-- Kubelet pod creation and container runtime startup (~1-3s)
-- Image pull when cache miss occurs (~1-10s)
+OpenSandbox currently supports Docker and Kubernetes runtimes. The Kubernetes runtime provides scalability, but its per-sandbox path can include an API write, scheduler and watch propagation, kubelet reconciliation, container runtime startup, and an image pull on a cache miss. Their costs vary materially by cluster and workload, so this OSEP does not assign them universal latency values.
 
 ### OpenSandbox's Existing Pool Optimization
 
@@ -88,52 +84,51 @@ spec:
 - Only `entrypoint` and `env` are customizable; image and resources are pre-defined
 - Controller and OpenSandbox Server watch K8s API for state changes
 
-**Performance with pool** (measured):
+**Performance with pool**:
 
-- Approximately **1 second** latency for pool-based allocation
 - Eliminates scheduler wait and pod startup time
 - Still requires K8s API write + watch propagation overhead
 - Image must be pre-pulled in pool pods
+- No reproducible report currently establishes a portable allocation-latency number; the comparison benchmark in this OSEP must measure both backends under the same environment and readiness boundary
 
 This is an effective optimization for many use cases. However, fast-sandbox aims to push latency even lower through additional innovations described below.
 
-For AI Agent and Serverless scenarios that require rapid sandbox provisioning, reducing even the K8s API overhead is valuable.
+For AI Agent and Serverless scenarios that require rapid sandbox provisioning, removing scheduler/watch/kubelet work from the per-sandbox hot path is valuable even though fast-sandbox retains a synchronous CRD write.
 
 ### Why Fast-Sandbox is Fast
 
-fast-sandbox achieves millisecond-scale cold start through three key design innovations:
+fast-sandbox reduces creation-path overhead through three key design choices:
 
 **Comparison: OpenSandbox Pool vs fast-sandbox**
 
 
 | Aspect                          | OpenSandbox BatchSandbox Pool                      | fast-sandbox (fleets)                       |
 | ------------------------------- |----------------------------------------------------|---------------------------------------------|
-| **Allocation mechanism**        | K8s API write → Controller watch → Task assignment | gRPC → CRD write → in-memory Top-K → Fastlet admission |
-| **Latency (with cached image)** | ~1 second (measured)                               | ~50-100ms + API write (CRD-first)           |
+| **Allocation mechanism**        | K8s API write → Controller watch → Task assignment | gRPC → in-memory Top-K → CRD write → Fastlet admission |
+| **Latency (with cached image)** | No comparable release-grade report                 | No comparable release-grade report          |
 | **Scheduling**                  | K8s Scheduler places pool pods (one-time)          | In-memory Top-K registry with image affinity |
 | **Image awareness**             | Pool pods have fixed image                         | Registry ranks by image cache availability  |
 | **Customization**               | entrypoint, env only                               | entrypoint, env, image per request          |
 | **Container creation**          | pre-warmed                                         | Direct containerd socket inside Fastlet     |
-| **Consistency**                 | Strong (K8s etcd)                                  | Strong (CRD-first, K8s etcd)                |
+| **Consistency**                 | Durable K8s state is the source of truth            | Sandbox CRD is persisted synchronously before runtime creation |
 | **Failure recovery**            | K8s Controller reconciliation                      | NodeJanitor + AutoRecreate policy           |
 
 Both approaches use pre-provisioned resource pools to eliminate cold start overhead. fast-sandbox's key advantage is bypassing the K8s **scheduler and watch propagation** for container placement while still committing durable intent through a CRD write.
 
 #### 1. gRPC Fast-Path Allocation, Bypassing the K8s Scheduler
 
-Traditional K8s sandbox creation follows the slow path:
+Traditional K8s sandbox creation follows this control flow:
 
 ```
 Client → K8s API Server → etcd → Scheduler → etcd → Kubelet → Container Runtime
- (~2-5 seconds total)
 ```
 
 fast-sandbox uses a gRPC Fast-Path that is **CRD-first for every create** — it does not bypass etcd, but it bypasses the scheduler queue and watch propagation:
 
 ```
-Client → gRPC Fast-Path → K8s API (Sandbox CRD write, IO 1)
-       → in-memory Top-K placement → atomic Fastlet admission/create (IO 2) → containerd
-       (~50-100ms base + 20-50ms API write, image cached)
+Client → gRPC Fast-Path → in-memory Top-K candidate ranking
+       → K8s API (Sandbox CRD write, IO 1)
+       → atomic Fastlet admission/create (IO 2) → containerd
 ```
 
 **With uncached image**: additional image pull time applies.
@@ -177,7 +172,7 @@ fast-sandbox achieves speed while maintaining K8s compatibility:
 | -------------------------- | -------------------------------------------------------------- | ----------------------------------------- |
 | **Resource Accounting**    | Fastlet Pods tracked in K8s                                    | Resource visibility via`kubectl get pods` |
 | **Scheduling Constraints** | Node selectors, taints, tolerations on the Fastlet Pod         | K8s scheduler places Fastlet Pods optimally |
-| **Container Creation**     | Direct containerd socket access (bypasses kubelet)             | <10ms container creation vs ~500ms        |
+| **Container Creation**     | Direct containerd socket access (bypasses kubelet)             | Removes kubelet from the per-sandbox path |
 | **Security Containers**    | Supports gVisor/Kata Containers via containerd runtime handler | Same workflow, different runtime class    |
 | **Network Namespace**      | Each sandbox gets its own netns + private IP inside the Fastlet Pod | K8s CNI plugins carry the Fastlet Pod's traffic |
 
@@ -190,7 +185,7 @@ The key insight: **use K8s for what it's good at** (resource accounting, cluster
 - Reuse the existing execd exec/file access pattern (`get_endpoint(id, 44772)` → in-sandbox execd HTTP) unchanged
 - Reuse the existing egress contract (`network_policy` at create; `egress-api.yaml` `/policy` at runtime), and **enforce per-sandbox egress** on fast-sandbox
 - Provide a simplified Create that maps a well-defined subset of `CreateSandboxRequest` to fast-sandbox's gRPC `CreateSandbox`, and cleanly rejects unsupported fields
-- Achieve sub-100ms create latency (CRD-first, with cached image), for latency-sensitive, stateless workloads
+- Demonstrate lower p50 and p95 user-visible creation latency than the `kubernetes` pool backend, measured from SDK create start until `Running` and the execd endpoint are usable under the same environment, cache state, workload, and concurrency; this OSEP sets no universal absolute-millisecond threshold
 - Provide flexible deployment: users can bring their own fast-sandbox or use OpenSandbox-provided charts
 
 ### Non-Goals
@@ -266,12 +261,11 @@ Introduce a new backend type **`sandbox fleets`**, implemented as a `FleetSandbo
 ```
 Standard K8s Runtime:
 OpenSandbox Server → K8s API → etcd → Scheduler → etcd → Kubelet → containerd
-      (2-5 seconds)
 
 Sandbox Fleets (fast-sandbox, CRD-first — the only path):
-OpenSandbox Server → gRPC Fast-Path → K8s API (CRD write) → in-memory Top-K
+OpenSandbox Server → gRPC Fast-Path → in-memory Top-K → K8s API (CRD write)
                    → atomic Fastlet admission → containerd
-      (~50-100ms base + 20-50ms API write; scheduler + watch propagation bypassed)
+      (scheduler + watch propagation bypassed; latency must be measured end-to-end)
 ```
 
 ### The `fleets` runtime type and API reuse model
@@ -280,7 +274,7 @@ The three "reused" API areas reuse *different* things. Being precise here avoids
 
 | Area | What is reused | What must be built for `fleets` |
 | --- | --- | --- |
-| Lifecycle (get/delete/renew/list/metadata) | Routes + `SandboxService` ABC — free once the ABC is implemented | Map each method to a fast-sandbox gRPC call |
+| Lifecycle (get/delete/renew/list/metadata) | Public routes + `SandboxService` ABC remain unchanged | Map each method to fast-sandbox gRPC and add the missing read/delete semantics described below |
 | execd exec/file | `specs/execd-api.yaml` (client → in-sandbox execd:44772) is backend-agnostic | Run execd inside the sandbox; implement `get_endpoint(id, 44772)` |
 | egress `network_policy` | `NetworkPolicy` schema + `egress-api.yaml` `/policy` (client → egress proxy:18080) | Deliver + enforce policy per sandbox netns; implement `get_endpoint(id, 18080)` with auth header |
 | Endpoint resolution | `SandboxService.get_endpoint` → `Endpoint`; ingress-gateway routing is backend-neutral | Route fleets ports through the ingress gateway |
@@ -293,7 +287,7 @@ The three "reused" API areas reuse *different* things. Being precise here avoids
 | `entrypoint` | **kept** | → `command` (+ `args`) |
 | `env` | **kept** | → `envs` |
 | `timeout` | **kept** (see note) | → `expire_time_seconds`. `CreateRequest` has no expiry field today, so it is set via a follow-up `UpdateSandbox`; a failed update must not leave an immortal sandbox — the create **rolls back** (deletes the sandbox) on update failure. Target: add `expire_time_seconds` to `CreateRequest` (proto, ask-first) to make it atomic |
-| `metadata` | **kept** | → CRD `labels` (delete semantics via read-modify-write; see Lifecycle) |
+| `metadata` | **kept** (see note) | → CRD user labels. `CreateRequest` has no labels field today, so initial labels share the post-create `UpdateSandbox` call and rollback rule; PATCH deletion requires an additive delete operation (see Lifecycle) |
 | `extensions.pool_ref` | **kept** | → `pool_ref` (else config default) |
 | `resource_limits` | **downgraded** | fast-sandbox enforces the pool's immutable `sandboxResources`; the request value is validated for pool compatibility, not applied per-sandbox |
 | `network_policy` | **staged (1b)** | Contract kept; rejected in phase 1a, enforced per-slot netns in phase 1b (see [Egress / Network Policy](#egress--network-policy)) |
@@ -310,7 +304,7 @@ In short, `fleets` Create keeps the "**what to run**" fields (image / entrypoint
 ### Notes/Constraints/Caveats
 
 - The fast-sandbox control plane (Fast-Path Servers, Reconcilers, Sandbox Proxy) and Fastlet pools + NodeJanitor must be deployed separately (by the user or via OpenSandbox-provided Helm charts)
-- fast-sandbox uses its own CRD types (`Sandbox`, `SandboxPool`, group `sandbox.fast.io/v1alpha1`) - OpenSandbox does not manipulate these directly
+- fast-sandbox uses its own CRD types (`Sandbox`, `SandboxPool`, group `sandbox.fast.io/v1alpha1`) - OpenSandbox does not manipulate these directly; missing lifecycle semantics are addressed through additive Fast-Path fields/operations rather than coupling the server to CRD internals
 - gRPC communication requires network reachability from OpenSandbox Server to the fast-sandbox Fast-Path Server
 - execd is injected via fast-sandbox's **Infra Component** mechanism (see [execd Injection](#execd-injection)), not the K8s init-container copy used by the pod backend
 - Because all sandboxes in a Fastlet pod share that pod's K8s network identity (SNAT to one pod IP), **standard Kubernetes NetworkPolicy cannot express per-sandbox egress** for fleets; per-sandbox egress is enforced inside each sandbox's netns (see [Egress / Network Policy](#egress--network-policy))
@@ -333,7 +327,7 @@ In short, `fleets` Create keeps the "**what to run**" fields (image / entrypoint
 
 ## Design Details
 
-### How Fast-Sandbox Achieves Millisecond-Scale Latency
+### How Fast-Sandbox Reduces Creation-Path Overhead
 
 The fast-sandbox architecture is built around three performance-critical design choices:
 
@@ -347,45 +341,31 @@ The fast-sandbox architecture is built around three performance-critical design 
 │  Prerequisite: Image is cached on the Fastlet's host node (containerd)   │
 │                                                                          |
 │  1. OpenSandbox Server → gRPC CreateSandbox request                      │
-│     └─────────────────────────────────────────────────> ~1ms             │
 │                                                                          |
 │  2. In-memory Top-K placement (registry-only, no K8s API)                │
-│     └─────────────────────────────────────────────────> ~1-14ms          │
 │     • Filter by pool, namespace, runtime/profile, capacity               │
 │     • Rank by: image-hit, then used/capacity, then stable hash           │
 │                                                                          |
 │  3. IO 1: Sandbox CRD write to K8s API / etcd                            │
-│     └─────────────────────────────────────────────────> ~20-50ms         │
 │     • Durable intent + idempotency by request_id                         │
 │                                                                          |
-│  4. IO 2: atomic Fastlet admission → containerd.Create() (cached image)  │
-│     └─────────────────────────────────────────────────> ~10-30ms         │
+│  4. IO 2: atomic Fastlet admission → runtime create/start (cached image) │
 │     • Direct socket access to host containerd                            │
 │     • No image pull (cached); sandbox gets its own netns + private IP    │
 │                                                                          |
 │  5. Fast-Path returns {sandbox_uid, sandbox_name, fastlet_pod}           │
-│     <───────────────────────────────────────────────── ~1ms              │
 │     • Returns at RuntimeReady; endpoints resolved later via ResolveEndpoint │
 │                                                                          |
-│  Total: ~50-100ms (end-to-end, with cached image)                        │
+│  Measure: client-observed Create through RuntimeReady                    │
+│  Do not infer this total by adding estimates from different runs.        │
 │                                                                          |
 │  If image is NOT cached: image pull time is added to step 4              │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-Compare to standard K8s:
-
-```
-1. API Server write to etcd              ~20ms
-2. Scheduler watch and decision          ~100-500ms
-3. Scheduler write to etcd               ~20ms
-4. Kubelet watch and pod creation        ~50-200ms
-5. Container runtime start               ~500ms-3s
-6. Image pull (if cache miss)            ~1-10s
-Total: 2-5s (best case, cache hit)
-```
-
 The difference is steps 2-4 of the K8s path (scheduler queue + watch propagation + kubelet). fast-sandbox keeps the etcd write (as IO 1) but replaces the scheduler/watch/kubelet steps with in-memory placement + a direct Fastlet create.
+
+The current public engineering baseline found that warm runc runtime work, not candidate ranking, dominated the tested path: mean RuntimeDriver work was 67.76 ms of a 76.02 ms client-observed Create, including 21.95 ms in `NewContainer`, 36.87 ms in `NewTask`, and 7.89 ms in `Start`. These are nested observations from one dated environment, not budgets for this diagram.
 
 #### 2. Registry Top-K Ranking
 
@@ -406,10 +386,7 @@ sort(candidates, func(a, b) bool {
 // Return top K; Fastlet atomic admission is the final authority on capacity.
 ```
 
-**Performance characteristics** (from fast-sandbox benchmarks; to be re-verified per methodology):
-
-- 100 Fastlets: ~1.3ms placement time
-- 1000 Fastlets: ~14ms placement time
+The repository currently provides `BenchmarkRegistryTopK1000` for same-machine regression comparisons, but publishes no raw result that supports a portable `100 Fastlets` or `1000 Fastlets` latency claim. This microbenchmark excludes Kubernetes, Fastlet admission, runtime/network creation, Infra readiness, and routing; it must not be presented as Sandbox Create latency.
 
 #### 3. Direct Containerd Integration
 
@@ -425,7 +402,7 @@ client, _ := containerd.New("/run/containerd/containerd.sock",
 container, _ := client.NewContainer(
     ctx, sandboxID,
     containerd.WithImage(image),                 // Already cached
-    containerd.WithNewSnapshot(...),             // Instant with cache
+    containerd.WithNewSnapshot(...),             // Snapshot setup still runs with a cached image
     // runc by default; "io.containerd.runsc.v1" (gVisor) or Kata shim per pool runtime
     oci.WithLinuxNamespace(networkNamespace),    // sandbox's own netns
 )
@@ -436,7 +413,7 @@ task.Start(ctx)
 
 This approach:
 
-- Eliminates kubelet API overhead (~50-200ms)
+- Eliminates kubelet reconciliation from the per-sandbox creation path
 - Enables image cache reuse (the Fastlet Pod shares the node's containerd image store)
 - Supports alternative runtimes (gVisor via `runsc`, Kata) via the pool's immutable runtime handler
 
@@ -653,11 +630,11 @@ server/opensandbox_server/services/fleets/
 | OpenSandbox API (`SandboxService`)      | fast-sandbox gRPC                    | Notes                                          |
 | --------------------------------------- | ------------------------------------ | ---------------------------------------------- |
 | `POST /sandboxes` (simplified)          | `CreateSandbox`                      | Returns `{uid, name, fastlet_pod}`, no endpoints |
-| `GET /sandboxes/{id}`                   | `GetSandbox`                         | Maps 3 ObservedState fields                    |
-| `GET /sandboxes` (list)                 | `ListSandboxes`                      | Namespace-only; label filter is a gap (see below) |
+| `GET /sandboxes/{id}`                   | `GetSandbox`                         | Requires labels + expiry in `SandboxInfo` (see below) |
+| `GET /sandboxes` (list)                 | `ListSandboxes`                      | Requires label filtering and labels/expiry in items |
 | `DELETE /sandboxes/{id}`                | `DeleteSandbox`                      | Async (finalizer); caller polls for NotFound   |
 | `POST /sandboxes/{id}/renew-expiration` | `UpdateSandbox` (expire_time_seconds)| Reconciler-enforced                            |
-| `PATCH /sandboxes/{id}/metadata`        | `UpdateSandbox` (labels)             | Merged into CRD labels                         |
+| `PATCH /sandboxes/{id}/metadata`        | `UpdateSandbox` (labels + delete keys)| Requires explicit delete semantics for RFC 7396 |
 | `GET /sandboxes/{id}/endpoints/{port}`  | `ResolveEndpoint`                    | Returns proxy URL + `Authorization` header     |
 | diagnostics (logs/inspect/events)       | `GetSandboxDiagnostics`              | Lifecycle events only; no process stdout/stderr |
 | `pause` / `resume` / snapshot           | (unsupported)                        | Clear "unsupported on fleets" error            |
@@ -671,9 +648,9 @@ server/opensandbox_server/services/fleets/
     "entrypoint": ["python", "-m", "http.server"],  # → command (+ args)
     "env": {"PYTHONUNBUFFERED": "1"},              # → envs
     "resource_limits": {"cpu": "500m"},            # → validated against SandboxPool profile
-    "timeout": 3600,                              # → UpdateSandbox expire_time_seconds
+    "timeout": 3600,                              # → post-create UpdateSandbox expire_time_seconds
     "network_policy": {...},                       # → new additive CreateRequest field (phase 1b)
-    "metadata": {...},                             # → labels
+    "metadata": {...},                             # → labels in the same post-create UpdateSandbox
     "extensions": {"pool_ref": "default-pool"},    # → pool_ref (else config default)
     # request_id (idempotency key + Sandbox CRD name) = OpenSandbox sandbox_id
 }
@@ -713,25 +690,26 @@ This section records, per integration area, whether fast-sandbox **today** provi
 
 ### Lifecycle integration
 
-**Verdict: READY, with three gaps to design around.**
+**Verdict: CONDITIONAL.** The current gRPC surface covers the operation names but lacks response fields and update semantics required by the existing OpenSandbox lifecycle contract. Phase 1a therefore depends on the additive Fast-Path extensions below (ask-first review with fast-sandbox maintainers).
 
 The gRPC `FastPathService` (`CreateSandbox` / `GetSandbox` / `ListSandboxes` / `DeleteSandbox` / `UpdateSandbox` / `GetSandboxDiagnostics`) covers the `SandboxService` lifecycle surface, but the semantics differ from the pod backend:
 
 | Method | Condition today | Plan |
 | --- | --- | --- |
 | Create | Idempotent by `request_id` (= Sandbox CRD name); returns at `RuntimeReady` | Use OpenSandbox `sandbox_id` as `request_id` |
-| Get | Reports 3 `ObservedState` strings; **no labels / expiry in payload** | Map states in `status_mapping.py` |
-| Renew-expiration | `UpdateSandbox(expire_time_seconds)`; reconciler garbage-collects on expiry (marks `Stopped/Expired`, does not delete CRD) | Treat expiry as eventual; poll status; `Stopped/Expired → Terminated` |
-| Metadata | `UpdateSandbox(labels)` **merges** labels — cannot delete a key | Implement RFC 7396 via **read-modify-write** (a `null` value deletes the key; preserve system labels) instead of relying on gRPC merge |
+| Get | Reports 3 `ObservedState` strings; **no labels / expiry in payload** | Add labels + expiry to `SandboxInfo`, then map the complete lifecycle response in `status_mapping.py` |
+| Renew-expiration | `UpdateSandbox(expire_time_seconds)` persists expiry in the CRD; reconciler marks an expired sandbox `Stopped/Expired` without deleting the CRD | Expose the persisted expiry in `SandboxInfo`; treat enforcement as eventual and map `Stopped/Expired → Terminated` |
+| Metadata | `UpdateSandbox(labels)` **merges** labels — it cannot delete a key | Add explicit user-label delete keys (or replace semantics) to `UpdateRequest`; reject changes to reserved system labels |
 | Delete | **Async** (finalizer-driven teardown); NotFound = success | Treat delete as async; poll for NotFound |
 | Diagnostics | `GetSandboxDiagnostics` returns **lifecycle events only, not stdout/stderr** | Back `inspect`/`events`; command output flows through execd, not this RPC |
-| List | **Namespace-only, no label selector; `SandboxInfo` omits labels** | **Gap** (see below) |
+| List | **Namespace-only, no label selector; `SandboxInfo` omits labels / expiry** | Add a label selector to `ListRequest` and return the extended `SandboxInfo` |
 
 **Gaps and feasibility:**
 
-1. **Label-filtered list** — OpenSandbox `list` uses label selectors, but `ListSandboxes` takes only a namespace and `SandboxInfo` does not carry labels. *Plan*: additive proto/impl extension on fast-sandbox (label filter + labels in `SandboxInfo`), or server-side filtering by tracking the mapping locally. Additive, non-breaking.
-2. **Sandbox logs (`get_sandbox_logs`) not implementable via execd** — `specs/execd-api.yaml` only exposes `/command/{id}/logs` for a known detached command ID; it has no endpoint for the sandbox entrypoint or an arbitrary container. The lifecycle diagnostics route has no command ID. *Plan (phase 1)*: `get_sandbox_logs` returns a clear **"unsupported on fleets"** error; `inspect`/`events` are backed by `GetSandboxDiagnostics` (lifecycle events only). A Fastlet/containerd log API or a backend extension is a future item, not a phase-1 claim.
-3. **Delete/expiry are eventual, not synchronous** — *Plan*: `FleetSandboxService` models both as async and preserves the lifecycle contract's poll-for-state semantics via status mapping (`Stopped/Expired → Terminated`, `Draining → Stopping`).
+1. **Lifecycle read/list fields** — Add `labels` and an optional expiry to `SandboxInfo`, plus a label selector to `ListRequest`. The values come from the durable Sandbox CRD, so get/list continue to work after an OpenSandbox server restart; an in-memory server-side mapping is not sufficient.
+2. **RFC 7396 metadata deletion** — Add explicit delete keys (for example, `repeated string delete_labels`) or full replace semantics to `UpdateRequest`. Omitting a key from the existing merge-only `labels` map does not delete it. The implementation must preserve fast-sandbox-owned labels and reject attempts to update/delete reserved keys.
+3. **Sandbox logs (`get_sandbox_logs`) not implementable via execd** — `specs/execd-api.yaml` only exposes `/command/{id}/logs` for a known detached command ID; it has no endpoint for the sandbox entrypoint or an arbitrary container. The lifecycle diagnostics route has no command ID. *Plan (phase 1)*: `get_sandbox_logs` returns a clear **"unsupported on fleets"** error; `inspect`/`events` are backed by `GetSandboxDiagnostics` (lifecycle events only). A Fastlet/containerd log API or a backend extension is a future item, not a phase-1 claim.
+4. **Delete/expiry are eventual, not synchronous** — *Plan*: `FleetSandboxService` models both as async and preserves the lifecycle contract's poll-for-state semantics via status mapping (`Stopped/Expired → Terminated`, `Draining → Stopping`).
 
 ### execd Injection
 
@@ -788,17 +766,17 @@ fast-sandbox today programs only NAT `MASQUERADE` + sibling `REJECT` — it has 
 
 Both phases are part of the first release. The split exists so the cross-repo network work (1b) does not block end-to-end validation of the service seam (1a). In phase 1a, `network_policy` is **rejected** (not silently ignored), so the backend never claims an enforcement it does not have.
 
-### Phase 1a — Service seam, lifecycle, execd, ingress (OpenSandbox-mostly, low risk)
+### Phase 1a — Service seam, lifecycle, execd, ingress (OpenSandbox-mostly, plus additive lifecycle RPC fields)
 
 - Add `FleetSandboxService` + register `"fleets"` in `factory.py`; add `FleetsRuntimeConfig`.
-- Implement `fastpath_client` (Create / Get / Delete / Update / List / Diagnostics / ResolveEndpoint).
+- Implement `fastpath_client` (Create / Get / Delete / Update / List / Diagnostics / ResolveEndpoint); add the lifecycle proto/implementation fields described above (`SandboxInfo` labels + expiry, list label selector, metadata delete keys) after ask-first review with fast-sandbox maintainers.
 - Simplified Create mapping + **explicit rejection** of `volumes` / `platform` / `resource_requests` / `credential_proxy` / `snapshot_id` / `image.auth`; **reject `network_policy` and `secure_access`** ("coming in fleets phase 1b"). No unsupported field is silently ignored.
-- Create+`timeout`: set expiry via follow-up `UpdateSandbox` with **rollback (delete) on update failure** so a failed update cannot leave an immortal sandbox.
+- Create+`timeout`/initial metadata: apply expiry and labels in one follow-up `UpdateSandbox` and **roll back (delete) on update failure**, so a failed update cannot leave an immortal or incorrectly labelled sandbox.
 - **Tenant handling**: map each OpenSandbox tenant to a fast-sandbox namespace on every call, or **reject `[tenants]` configuration** for fleets if the mapping is not implemented.
 - **Fleets ingress adapter**: add a fleets provider to `components/ingress` that routes to the fast-sandbox Sandbox Proxy path form and injects the `Authorization` bearer; expose a stable gateway URL and refresh the ephemeral credential internally (keeps SDK unchanged).
 - Implement `get_endpoint` via `ResolveEndpoint`; persist `sandbox_id → uid`; credential lifecycle handled by the ingress adapter, not the SDK.
 - execd via `opensandbox-execd-quickstart` Infra profile; verify exec/file end-to-end through the SDK.
-- Lifecycle get/delete/renew/metadata working (delete/expiry async; `Stopped/Expired → Terminated`, `Draining → Stopping`; metadata delete via read-modify-write); `get_sandbox_logs`, pause/resume/snapshot return clear unsupported errors.
+- Lifecycle get/delete/renew/list/metadata working (labels + expiry survive server restart; delete/expiry async; `Stopped/Expired → Terminated`, `Draining → Stopping`; metadata deletion uses explicit backend delete keys and protects reserved labels); `get_sandbox_logs`, pause/resume/snapshot return clear unsupported errors.
 - **Exit criteria**: full SDK flow (create → exec → file → delete) passes on a Kind cluster with fast-sandbox, no SDK changes; tenant isolation verified (or `[tenants]` rejected); unsupported-field rejection verified.
 
 ### Phase 1b — Per-sandbox egress enforcement + secure access (cross-repo, higher risk)
@@ -818,7 +796,7 @@ Both phases are part of the first release. The split exists so the cross-repo ne
 - **Integration Tests**: Deploy fast-sandbox in a Kind cluster; test create/get/delete/renew/list/metadata flows; execd connectivity on 44772
 - **E2E Tests**: Full OpenSandbox SDK flow using the `fleets` runtime, asserting behavior identical to the pod backend for lifecycle + exec/file
 - **Egress Tests (phase 1b)**: deny-by-default block, FQDN allowlist permit, per-sandbox isolation between co-located sandboxes, `/policy` GET/PATCH/DELETE, runc-only guard
-- **Performance Tests**: create latency and density vs the `kubernetes` pool backend, reported per fast-sandbox methodology (commit/env/runtime/cache-state/concurrency/percentiles)
+- **Performance Tests**: create latency and density vs the `kubernetes` pool backend, reported per fast-sandbox methodology (commit/env/runtime/cache-state/concurrency/percentiles); compare the user-visible `Running` + execd-usable milestone separately from fast-sandbox's internal `RuntimeReady`
 
 ### Test Scenarios
 
@@ -827,10 +805,10 @@ Both phases are part of the first release. The split exists so the cross-repo ne
 3. Create+`timeout` update failure triggers rollback (no immortal sandbox left behind)
 4. Simplified Create: `volumes` / `platform` / `resource_requests` / `credential_proxy` / `snapshot_id` / `image.auth` rejected with clear errors; `network_policy` / `secure_access` rejected in 1a, accepted in 1b; `credential_proxy` still rejected in 1b
 5. Tenant isolation: a tenant cannot see/operate another tenant's sandboxes via list or ID; or `[tenants]` is rejected for fleets
-6. Metadata PATCH with a `null` value deletes the key (read-modify-write), preserving system labels
+6. Metadata PATCH with a `null` value deletes the key through the explicit backend delete operation, preserving system labels; get/list return the result after a server restart
 7. Pool selection via `extensions.pool_ref`; `resource_limits` incompatible with pool profile rejected
 8. Ingress adapter: SDK reaches execd/user ports through the stable gateway URL; credential rotates internally without SDK involvement
-9. Image affinity: second sandbox on same Fastlet (should be faster)
+9. Image affinity: record candidate/cache-hit state for repeated creates and report it separately from end-to-end latency
 10. Failure: Fast-Path unavailable, invalid pool ref
 11. Concurrent sandbox creation (stress test)
 12. Egress (phase 1b): deny-by-default blocks; allowed FQDN permits; co-located sandboxes with different policies do not interfere
@@ -838,19 +816,22 @@ Both phases are part of the first release. The split exists so the cross-repo ne
 
 ### Performance Benchmarks
 
-Target metrics (to be verified in tests):
+The figures below are the current fast-sandbox engineering evidence, not `fleets` targets:
 
+| Scope | Observation | Measurement boundary |
+| --- | --- | --- |
+| Warm container (`runc`) | 20 samples: mean 76.02 ms, p50 75.95 ms, p95 83.15 ms | Concurrency 1; cached image/artifacts; minimal Infra profile; client Fast-Path Create through `RuntimeReady` |
+| gVisor (`runsc`) | 10 samples: mean 644.29 ms | Small diagnostic batch; cached artifacts; Execd readiness excluded |
+| Kata Cloud Hypervisor | 10 samples: mean 1,359.59 ms | Small diagnostic batch under nested KVM; Execd readiness excluded |
+| Kata QEMU | 10 samples: mean 2,125.58 ms | Small diagnostic batch under nested KVM; Execd readiness excluded |
+| BatchSandbox pool vs fleets | No comparable report yet | Must run both through the same OpenSandbox endpoint, environment, cache state, concurrency, and readiness boundary |
+| Registry Top-K | No portable latency claim | `BenchmarkRegistryTopK1000` is a scheduler microbenchmark, not Sandbox Create |
 
-| Scenario                                | Target Latency         | Notes                                           |
-| --------------------------------------- | ---------------------- | ----------------------------------------------- |
-| OpenSandbox BatchSandbox Pool           | ~1 second              | Measured with K8s API + watch overhead          |
-| Cold start, image cached (fleets)       | ~50-100ms + API write  | CRD-first; ~20-50ms for K8s API/etcd; scheduler + watch bypassed |
-| Cold start, image NOT cached            | Base + image pull time | Image pull depends on size and network          |
-| Warm start (reuse same Fastlet)         | <30ms                  | Fastlet already selected                        |
-| Registry Top-K placement (100 Fastlets) | ~1.3ms                 | In-memory scheduling                            |
-| Registry Top-K placement (1000 Fastlets)| ~14ms                  | In-memory scheduling                            |
+Source: fast-sandbox [`3af0222` performance guide](https://github.com/opensandbox-group/fast-sandbox/blob/3af02227a85d3ae872e67ef718b63c60e777edac/docs/guides/performance.md), whose measurements describe base revision `42fe03549598c3ab730b989c7757634b486697cf`.
 
-> **Important**: The latencies above assume the container image is already cached on the Fastlet's host node. In production, pre-pulling images (via `SandboxPool.spec.warmImages`) or using a common set of base images is recommended for consistent performance. Per fast-sandbox's performance methodology, benchmark results should record commit, environment, runtime, cache state, concurrency, and percentile distribution rather than a single headline number.
+There is no absolute-millisecond exit threshold. The performance goal passes only when the matched OpenSandbox benchmark shows lower fleets p50 and p95 from SDK create start through `Running` and an execd readiness probe than the BatchSandbox pool. fast-sandbox `RuntimeReady` is reported as a separate diagnostic milestone and is not substituted for that user-visible comparison.
+
+The `fleets` acceptance report must record commit SHA and command; hardware, virtualization, Kubernetes, and containerd versions; component replicas; runtime and Infra profile; image/cache/network-slot state; concurrency and request rate; start/end milestones; p50/p95/p99/max; failures, admission rejections, and retries. It must report `RuntimeReady`, `DataPlaneReady`, and OpenSandbox client-observed latency separately. Image-affinity and Top-K microbenchmarks remain supporting diagnostics and must not substitute for the end-to-end comparison.
 
 ## Drawbacks
 
@@ -874,7 +855,7 @@ Target metrics (to be verified in tests):
 - **CI/CD**: Kind cluster with fast-sandbox (Fast-Path, Reconcilers, Sandbox Proxy, a Fastlet pool, NodeJanitor) for integration/e2e
 - **Documentation**: fleets deployment guide; execd-as-Infra-Component setup; egress enforcement guide (phase 1b); compatibility matrix
 - **Helm Charts** (optional): Unified charts deploying OpenSandbox Server + fast-sandbox components
-- **Cross-repo coordination**: with fast-sandbox maintainers for the additive `network_policy` proto/CRD field
+- **Cross-repo coordination**: with fast-sandbox maintainers for the additive lifecycle RPC fields/delete semantics and the `network_policy` proto/CRD field
 
 ## Upgrade & Migration Strategy
 
