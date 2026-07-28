@@ -41,6 +41,8 @@ import (
 )
 
 const (
+	// Only retry fast, retained namespace cleanup. Process teardown is
+	// synchronous and may already consume its own bounded wait.
 	isolatedRunnerCloseRetryTimeout  = 5 * time.Second
 	isolatedRunnerCloseRetryInterval = 100 * time.Millisecond
 )
