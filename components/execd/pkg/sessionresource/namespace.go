@@ -715,130 +715,147 @@ func (p *NamespacePins) Close() error {
 		return nil
 	}
 
-	var cleanupErr error
-	if p.directoryCreated {
-		current, err := p.ops.statPath(p.directory)
-		if err != nil {
-			cleanupErr = errors.Join(
-				cleanupErr,
-				fmt.Errorf("stat namespace directory before cleanup: %w", err),
-			)
-		} else if !current.mode.IsDir() ||
-			current.uid != p.ops.effectiveUID() ||
-			(p.directoryInfo.inode != 0 &&
-				!sameObject(current, p.directoryInfo)) {
-			cleanupErr = errors.Join(
-				cleanupErr,
-				errors.New("namespace directory identity changed before cleanup"),
-			)
-		} else if p.directoryInfo.inode == 0 {
-			// mkdir succeeded but its first stat failed. At that point Pin has
-			// not created any children yet, so it is safe within the trusted
-			// execd-owned root to adopt the now-verifiable directory identity
-			// and finish rollback. Never adopt a directory after later resource
-			// creation, because its contents could belong to another object.
-			if p.netTargetCreated ||
-				p.userTargetCreated ||
-				p.netMounted ||
-				p.userMounted {
-				cleanupErr = errors.Join(
-					cleanupErr,
-					errors.New(
-						"namespace directory identity was unavailable after resource creation",
-					),
-				)
-			} else {
-				p.directoryInfo = current
-			}
-		}
+	if err := p.validateDirectoryForCleanup(); err != nil {
+		return errors.Join(ErrCleanupIncomplete, err)
 	}
-	if cleanupErr != nil {
-		return errors.Join(ErrCleanupIncomplete, cleanupErr)
+	if err := errors.Join(
+		p.unmountPin(
+			p.netPath,
+			"network namespace pin",
+			&p.netMounted,
+		),
+		p.unmountPin(
+			p.userPath,
+			"owning user namespace pin",
+			&p.userMounted,
+		),
+	); err != nil {
+		return errors.Join(ErrCleanupIncomplete, err)
+	}
+	if err := errors.Join(
+		p.removePinTarget(
+			p.netPath,
+			"network namespace pin target",
+			&p.netTargetCreated,
+		),
+		p.removePinTarget(
+			p.userPath,
+			"user namespace pin target",
+			&p.userTargetCreated,
+		),
+	); err != nil {
+		return errors.Join(ErrCleanupIncomplete, err)
+	}
+	if err := p.removeDirectory(); err != nil {
+		return errors.Join(ErrCleanupIncomplete, err)
 	}
 
-	if p.netMounted {
-		if err := p.ops.unmount(p.netPath); err != nil &&
-			!errors.Is(err, syscall.EINVAL) &&
-			!errors.Is(err, fs.ErrNotExist) {
-			cleanupErr = errors.Join(
-				cleanupErr,
-				fmt.Errorf("unmount network namespace pin: %w", err),
-			)
-		} else {
-			p.netMounted = false
-		}
-	}
-	if p.userMounted {
-		if err := p.ops.unmount(p.userPath); err != nil &&
-			!errors.Is(err, syscall.EINVAL) &&
-			!errors.Is(err, fs.ErrNotExist) {
-			cleanupErr = errors.Join(
-				cleanupErr,
-				fmt.Errorf("unmount owning user namespace pin: %w", err),
-			)
-		} else {
-			p.userMounted = false
-		}
-	}
-	if cleanupErr != nil {
-		return errors.Join(ErrCleanupIncomplete, cleanupErr)
-	}
-
-	if p.netTargetCreated {
-		if err := p.ops.remove(p.netPath); err != nil &&
-			!errors.Is(err, fs.ErrNotExist) {
-			cleanupErr = errors.Join(
-				cleanupErr,
-				fmt.Errorf("remove network namespace pin target: %w", err),
-			)
-		} else {
-			p.netTargetCreated = false
-		}
-	}
-	if p.userTargetCreated {
-		if err := p.ops.remove(p.userPath); err != nil &&
-			!errors.Is(err, fs.ErrNotExist) {
-			cleanupErr = errors.Join(
-				cleanupErr,
-				fmt.Errorf("remove user namespace pin target: %w", err),
-			)
-		} else {
-			p.userTargetCreated = false
-		}
-	}
-	if cleanupErr != nil {
-		return errors.Join(ErrCleanupIncomplete, cleanupErr)
-	}
-
-	if p.directoryCreated {
-		if err := p.ops.remove(p.directory); err != nil &&
-			!errors.Is(err, fs.ErrNotExist) {
-			return errors.Join(
-				ErrCleanupIncomplete,
-				fmt.Errorf("remove namespace directory: %w", err),
-			)
-		}
-		p.directoryCreated = false
-	}
-
-	if p.netFD >= 0 {
-		if err := p.ops.closeFD(p.netFD); err != nil {
-			cleanupErr = errors.Join(
-				cleanupErr,
-				fmt.Errorf("close network namespace descriptor: %w", err),
-			)
-		}
-		p.netFD = -1
-	}
-	if p.userFD >= 0 {
-		if err := p.ops.closeFD(p.userFD); err != nil {
-			cleanupErr = errors.Join(
-				cleanupErr,
-				fmt.Errorf("close owning user namespace descriptor: %w", err),
-			)
-		}
-		p.userFD = -1
-	}
+	cleanupErr := errors.Join(
+		p.closeDescriptor(
+			"network namespace descriptor",
+			&p.netFD,
+		),
+		p.closeDescriptor(
+			"owning user namespace descriptor",
+			&p.userFD,
+		),
+	)
 	p.closed = true
 	return cleanupErr
+}
+
+func (p *NamespacePins) validateDirectoryForCleanup() error {
+	if !p.directoryCreated {
+		return nil
+	}
+
+	current, err := p.ops.statPath(p.directory)
+	if err != nil {
+		return fmt.Errorf("stat namespace directory before cleanup: %w", err)
+	}
+	if !current.mode.IsDir() ||
+		current.uid != p.ops.effectiveUID() ||
+		(p.directoryInfo.inode != 0 &&
+			!sameObject(current, p.directoryInfo)) {
+		return errors.New("namespace directory identity changed before cleanup")
+	}
+	if p.directoryInfo.inode != 0 {
+		return nil
+	}
+
+	// mkdir succeeded but its first stat failed. At that point Pin has not
+	// created any children yet, so it is safe within the trusted execd-owned
+	// root to adopt the now-verifiable directory identity and finish rollback.
+	// Never adopt a directory after later resource creation, because its
+	// contents could belong to another object.
+	if p.netTargetCreated ||
+		p.userTargetCreated ||
+		p.netMounted ||
+		p.userMounted {
+		return errors.New(
+			"namespace directory identity was unavailable after resource creation",
+		)
+	}
+	p.directoryInfo = current
+	return nil
+}
+
+func (p *NamespacePins) unmountPin(
+	path string,
+	description string,
+	mounted *bool,
+) error {
+	if !*mounted {
+		return nil
+	}
+	if err := p.ops.unmount(path); err != nil &&
+		!errors.Is(err, syscall.EINVAL) &&
+		!errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("unmount %s: %w", description, err)
+	}
+	*mounted = false
+	return nil
+}
+
+func (p *NamespacePins) removePinTarget(
+	path string,
+	description string,
+	created *bool,
+) error {
+	if !*created {
+		return nil
+	}
+	if err := p.ops.remove(path); err != nil &&
+		!errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("remove %s: %w", description, err)
+	}
+	*created = false
+	return nil
+}
+
+func (p *NamespacePins) removeDirectory() error {
+	if !p.directoryCreated {
+		return nil
+	}
+	if err := p.ops.remove(p.directory); err != nil &&
+		!errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("remove namespace directory: %w", err)
+	}
+	p.directoryCreated = false
+	return nil
+}
+
+func (p *NamespacePins) closeDescriptor(
+	description string,
+	fd *int,
+) error {
+	if *fd < 0 {
+		return nil
+	}
+	err := p.ops.closeFD(*fd)
+	*fd = -1
+	if err != nil {
+		return fmt.Errorf("close %s: %w", description, err)
+	}
+	return nil
 }

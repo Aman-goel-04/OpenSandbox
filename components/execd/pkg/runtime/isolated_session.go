@@ -244,38 +244,15 @@ func (s *isolatedSession) start() error {
 		context.Background(),
 		isolatedSessionStartupTimeout,
 	)
-	identity, err := lifecycle.WaitForIdentity(startupCtx)
-	if err != nil {
-		cancelStartup()
-		return s.failStartup(fmt.Errorf("wait for isolated workload identity: %w", err))
-	}
-	s.identity = identity
-
-	if s.requiresNamespacePins(wrapOpts) {
-		if s.namespacePinner == nil {
-			cancelStartup()
-			return s.failStartup(ErrSessionNamespaceUnavailable)
-		}
-		pins, pinErr := s.namespacePinner(startupCtx, identity)
-		if pins != nil {
-			// A pinner can return ownership with an error when its rollback
-			// was incomplete. Retain it so failStartup and later GC retries
-			// can finish cleanup after the workload has stopped.
-			s.namespacePins = pins
-		}
-		if pinErr != nil {
-			cancelStartup()
-			return s.failStartup(errors.Join(
-				ErrSessionNamespaceUnavailable,
-				fmt.Errorf("pin isolated session namespaces: %w", pinErr),
-			))
-		}
-		if pins == nil {
-			cancelStartup()
-			return s.failStartup(ErrSessionNamespaceUnavailable)
-		}
-	}
+	prepareErr := s.prepareStartupIdentity(
+		startupCtx,
+		lifecycle,
+		wrapOpts,
+	)
 	cancelStartup()
+	if prepareErr != nil {
+		return s.failStartup(prepareErr)
+	}
 
 	if err := lifecycle.MarkReady(); err != nil {
 		return s.failStartup(fmt.Errorf("release isolated workload gate: %w", err))
@@ -308,6 +285,43 @@ func (s *isolatedSession) start() error {
 		return s.failStartup(err)
 	}
 
+	return nil
+}
+
+func (s *isolatedSession) prepareStartupIdentity(
+	ctx context.Context,
+	lifecycle isolation.WorkloadLifecycle,
+	wrapOpts isolation.WrapOptions,
+) error {
+	identity, err := lifecycle.WaitForIdentity(ctx)
+	if err != nil {
+		return fmt.Errorf("wait for isolated workload identity: %w", err)
+	}
+	s.identity = identity
+
+	if !s.requiresNamespacePins(wrapOpts) {
+		return nil
+	}
+	if s.namespacePinner == nil {
+		return ErrSessionNamespaceUnavailable
+	}
+
+	pins, err := s.namespacePinner(ctx, identity)
+	if pins != nil {
+		// A pinner can return ownership with an error when its rollback was
+		// incomplete. Retain it so failStartup and later GC retries can finish
+		// cleanup after the workload has stopped.
+		s.namespacePins = pins
+	}
+	if err != nil {
+		return errors.Join(
+			ErrSessionNamespaceUnavailable,
+			fmt.Errorf("pin isolated session namespaces: %w", err),
+		)
+	}
+	if pins == nil {
+		return ErrSessionNamespaceUnavailable
+	}
 	return nil
 }
 
