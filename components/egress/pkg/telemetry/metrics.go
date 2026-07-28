@@ -74,6 +74,14 @@ func registerEgressMetrics() error {
 		"egress.dns.query.duration",
 		metric.WithDescription("DNS forward latency"),
 		metric.WithUnit("s"),
+		// Explicit boundaries: this instrument records seconds, but the SDK default
+		// boundaries are the spec's millisecond ladder (0, 5, 10, ... 10000), so every
+		// realistic DNS latency lands in the same bucket and the quantiles are noise.
+		// The ladder below spans a cache hit (sub-ms) to the upstream timeout
+		// (DefaultDNSUpstreamTimeoutSec = 5s), with 10s as the overflow guard.
+		metric.WithExplicitBucketBoundaries(
+			0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10,
+		),
 	)
 	if err != nil {
 		return err

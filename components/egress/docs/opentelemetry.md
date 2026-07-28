@@ -17,6 +17,18 @@ This page lists the OpenTelemetry metrics currently implemented in egress.
 | `egress.system.memory.usage_bytes` | Observable Gauge | `By` | System memory used bytes (Linux: gopsutil; non-Linux build: `0`). |
 | `egress.system.cpu.utilization` | Observable Gauge | `1` | CPU busy ratio in `[0,1]` (Linux: gopsutil; non-Linux build: `0`). |
 
+`egress.dns.query.duration` declares its bucket boundaries explicitly:
+
+```
+0.001  0.0025  0.005  0.01  0.025  0.05  0.1  0.25  0.5  1  2.5  5  10
+```
+
+They span a cache hit (sub-millisecond) to the upstream timeout
+(`OPENSANDBOX_EGRESS_DNS_UPSTREAM_TIMEOUT`, 5s by default), with 10s as an overflow guard.
+Do not drop them: the instrument records **seconds**, while the SDK default boundaries are
+the spec's millisecond ladder (`0, 5, 10, … 10000`), so every realistic latency would fall
+into the single `le=5` bucket and the quantiles would be meaningless.
+
 ## Shared Attributes
 
 All egress metrics may include shared attributes:
