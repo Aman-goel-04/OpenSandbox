@@ -181,6 +181,29 @@ See [Credential Vault](/guides/credential-vault) for full API usage, binding rul
 
 Egress can export **OTLP metrics**; application logs use the **native zap** logger (JSON to stdout by default, configurable via `OPENSANDBOX_LOG_OUTPUT` / `OPENSANDBOX_EGRESS_LOG_LEVEL`). OTLP log export is not used.
 
+#### DNS latency buckets
+
+`egress.dns.query.duration` is recorded in **seconds** and declares its bucket boundaries
+explicitly:
+
+```
+0.001  0.0025  0.005  0.01  0.025  0.05  0.1  0.25  0.5  1  2.5  5  10  15  30  60  120
+```
+
+The head resolves a cache hit up to one upstream timeout
+(`OPENSANDBOX_EGRESS_DNS_UPSTREAM_TIMEOUT`, 5s by default). The coarse tail is there because
+the recorded duration covers the **whole resolver chain** — forwarding walks the upstreams
+serially with the full timeout each, so a query can legitimately take
+`timeout x len(upstreams)`. Anything past 120s falls in `+Inf` by design: the lookup has
+failed, and `_count` is the signal rather than a quantile.
+
+If you tune these, keep them on a seconds ladder. The SDK default boundaries are the spec's
+millisecond ladder (`0, 5, 10, … 10000`), which would put every realistic DNS latency in the
+single `le=5` bucket and make `histogram_quantile()` return an interpolation rather than a
+measurement.
+
+Full metric inventory and attribute semantics: [egress OpenTelemetry reference](https://github.com/opensandbox-group/OpenSandbox/blob/main/components/egress/docs/opentelemetry.md).
+
 ## Build & Run
 
 ### Build Docker Image
