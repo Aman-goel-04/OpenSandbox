@@ -39,6 +39,8 @@ The egress control is implemented as a **Sidecar** that shares the network names
     - Uses `nftables` to enforce IP-level allow/deny. Resolved IPs for allowed domains are added to dynamic allow sets with TTL (dynamic DNS).
     - At startup, the sidecar whitelists **127.0.0.1** (redirect target for the proxy) and **nameserver IPs** from `/etc/resolv.conf` so DNS resolution and proxy upstream work (including private DNS). Nameserver count is capped and invalid IPs are filtered.
 
+Dynamic entries initially use the DNS TTL plus a short safety margin, clamped to 60–360 seconds. The sidecar polls active TCP connections every 30 seconds and renews only DNS-authorized remote IPs that are still in use. When activity ends, one final six-minute renewal provides a bounded reconnect window before the entry expires normally. This means an active TCP connection can keep an IP authorized beyond its original DNS TTL; UDP and QUIC entries are not connection-tracked and continue to expire according to DNS-driven TTL updates.
+
 ### Kubernetes Service Access Under `defaultAction: deny`
 
 In Kubernetes deployments that use `defaultAction: deny`, reaching an in-cluster Service usually needs two separate allowances:
