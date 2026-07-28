@@ -93,6 +93,7 @@ func (m *Manager) ApplyStatic(ctx context.Context, p *policy.NetworkPolicy) erro
 				}
 			}
 		}
+		telemetry.RecordNftablesUpdateFailed(telemetry.NftOpStaticApply)
 		return err
 	}
 	telemetry.SetNftablesRuleCount(telemetry.NftRuleCountFromPolicy(p))
@@ -114,10 +115,15 @@ func (m *Manager) AddResolvedIPs(ctx context.Context, ips []ResolvedIP) error {
 	}
 	log.Debugf("nftables: adding %d resolved IP(s) to dynamic allow sets with script statement %s", len(ips), script)
 	_, err := m.run(ctx, script)
-	if err == nil {
-		telemetry.RecordNftablesUpdate()
+	if err != nil {
+		// The policy allows these destinations but the kernel does not know it yet, so
+		// the chain's final rule drops them. Indistinguishable from a policy denial
+		// inside the sandbox, hence its own counter.
+		telemetry.RecordNftablesUpdateFailed(telemetry.NftOpDynamicAdd)
+		return err
 	}
-	return err
+	telemetry.RecordNftablesUpdate()
+	return nil
 }
 
 // RemoveEnforcement drops inet opensandbox; missing table is not an error.
@@ -131,6 +137,7 @@ func (m *Manager) RemoveEnforcement(ctx context.Context) error {
 		if strings.Contains(msg, "no such file") || strings.Contains(msg, "does not exist") {
 			return nil
 		}
+		telemetry.RecordNftablesUpdateFailed(telemetry.NftOpRemove)
 		return err
 	}
 	log.Infof("nftables: removed table inet %s", tableName)
