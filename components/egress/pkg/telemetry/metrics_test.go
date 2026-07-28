@@ -63,9 +63,10 @@ func TestDNSQueryDurationBucketsSpanRealisticLatencies(t *testing.T) {
 
 	require.NoError(t, registerEgressMetrics())
 
-	// Cache hit, LAN upstream, slow upstream, one upstream timeout, and a serial retry
-	// through three resolvers at the default timeout.
-	for _, seconds := range []float64{0.0008, 0.012, 0.4, 5, 15} {
+	// Cache hit, LAN upstream, slow upstream, one upstream timeout, a serial retry through
+	// three resolvers at the default timeout, and a late success after two resolvers each
+	// burning the configurable 120s maximum.
+	for _, seconds := range []float64{0.0008, 0.012, 0.4, 5, 15, 240} {
 		RecordDNSForward(seconds)
 	}
 
@@ -87,8 +88,8 @@ func TestDNSQueryDurationBucketsSpanRealisticLatencies(t *testing.T) {
 			populated++
 		}
 	}
-	assert.Equal(t, 5, populated,
-		"the five latencies must land in five different buckets, got counts %v for bounds %v",
+	assert.Equal(t, 6, populated,
+		"the six latencies must land in six different buckets, got counts %v for bounds %v",
 		dp.BucketCounts, dp.Bounds)
 	assert.Zero(t, dp.BucketCounts[len(dp.BucketCounts)-1],
 		"a retry-chain latency fell into +Inf, where it cannot be distinguished or interpolated")
