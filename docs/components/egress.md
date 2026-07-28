@@ -181,6 +181,35 @@ See [Credential Vault](/guides/credential-vault) for full API usage, binding rul
 
 Egress can export **OTLP metrics**; application logs use the **native zap** logger (JSON to stdout by default, configurable via `OPENSANDBOX_LOG_OUTPUT` / `OPENSANDBOX_EGRESS_LOG_LEVEL`). OTLP log export is not used.
 
+#### Denied vs failed
+
+Two counters look similar and mean opposite things. Reading one for the other inverts the
+diagnosis:
+
+| Metric | Meaning | Expected in a healthy system? |
+|---|---|---|
+| `egress.policy.denied_total` | the policy did its job — the workload asked for something it may not reach | **yes** |
+| `egress.dns.query.failed_total` | the sidecar could not do its job — an allowed lookup returned `SERVFAIL` | **no** |
+
+So the alert for "DNS is broken inside sandboxes" is the second one:
+
+```promql
+rate(egress_dns_query_failed_total[5m]) > 0
+```
+
+`reason` comes from a closed set — `no_upstreams`, `upstream_error`, `empty_response`,
+`rcode` — so the counter's cardinality does not depend on what the workload queries. Neither
+the queried name nor the error text is ever attached as a label.
+
+`egress.nftables.updates.failed_total{operation}` covers the other silent failure, with
+`operation` one of `static_apply`, `dynamic_add`, `remove`. **`dynamic_add` is the one to
+alert on**: it adds the IPs behind an allowed domain to the dynamic allow set, so a failure
+means the kernel never learned about destinations the policy permits and the chain drops
+them. From inside the sandbox that is indistinguishable from a denial, while
+`egress.policy.denied_total` stays flat — a fail-closed outage with no other signal.
+
+Full metric inventory and attribute semantics: [egress OpenTelemetry reference](https://github.com/opensandbox-group/OpenSandbox/blob/main/components/egress/docs/opentelemetry.md).
+
 ## Build & Run
 
 ### Build Docker Image
