@@ -77,10 +77,17 @@ func registerEgressMetrics() error {
 		// Explicit boundaries: this instrument records seconds, but the SDK default
 		// boundaries are the spec's millisecond ladder (0, 5, 10, ... 10000), so every
 		// realistic DNS latency lands in the same bucket and the quantiles are noise.
-		// The ladder below spans a cache hit (sub-ms) to the upstream timeout
-		// (DefaultDNSUpstreamTimeoutSec = 5s), with 10s as the overflow guard.
+		//
+		// The head spans a cache hit (sub-ms) to one upstream timeout
+		// (DefaultDNSUpstreamTimeoutSec = 5s). The coarse tail covers the retry chain:
+		// forward() walks the resolvers serially, each with the full timeout, and the
+		// recorded duration is the whole chain — so a query can legitimately take
+		// timeout x len(upstreams). 15s is three resolvers at the default; 120s is the
+		// cap a single exchange can be configured to wait. Past that a lookup has simply
+		// failed, and _count is the signal, not a quantile.
 		metric.WithExplicitBucketBoundaries(
 			0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10,
+			15, 30, 60, 120,
 		),
 	)
 	if err != nil {

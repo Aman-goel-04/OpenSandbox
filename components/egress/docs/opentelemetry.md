@@ -20,14 +20,25 @@ This page lists the OpenTelemetry metrics currently implemented in egress.
 `egress.dns.query.duration` declares its bucket boundaries explicitly:
 
 ```
-0.001  0.0025  0.005  0.01  0.025  0.05  0.1  0.25  0.5  1  2.5  5  10
+0.001  0.0025  0.005  0.01  0.025  0.05  0.1  0.25  0.5  1  2.5  5  10  15  30  60  120
 ```
 
-They span a cache hit (sub-millisecond) to the upstream timeout
-(`OPENSANDBOX_EGRESS_DNS_UPSTREAM_TIMEOUT`, 5s by default), with 10s as an overflow guard.
 Do not drop them: the instrument records **seconds**, while the SDK default boundaries are
 the spec's millisecond ladder (`0, 5, 10, … 10000`), so every realistic latency would fall
 into the single `le=5` bucket and the quantiles would be meaningless.
+
+The head resolves a cache hit (sub-millisecond) up to one upstream timeout
+(`OPENSANDBOX_EGRESS_DNS_UPSTREAM_TIMEOUT`, 5s by default). The coarse tail exists because
+the recorded duration covers the **whole resolver chain**: forwarding walks the upstreams
+serially, each with the full timeout, so a query can legitimately take
+`timeout x len(upstreams)` — 15s is three resolvers at the default, and 120s is the cap a
+single exchange can be configured to wait. The chain has no finite worst case
+(`OPENSANDBOX_EGRESS_DNS_UPSTREAM` accepts an unbounded resolver list), so anything past
+120s falls in `+Inf` on purpose: at that point the lookup has failed and `_count` is the
+signal, not a quantile.
+
+Note both successful and failed lookups feed this histogram, so its tail mixes slow
+resolutions with exhausted retry chains.
 
 ## Shared Attributes
 

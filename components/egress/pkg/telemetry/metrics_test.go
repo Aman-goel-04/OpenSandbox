@@ -63,8 +63,9 @@ func TestDNSQueryDurationBucketsSpanRealisticLatencies(t *testing.T) {
 
 	require.NoError(t, registerEgressMetrics())
 
-	// Cache hit, LAN upstream, slow upstream, and the default upstream timeout.
-	for _, seconds := range []float64{0.0008, 0.012, 0.4, 5} {
+	// Cache hit, LAN upstream, slow upstream, one upstream timeout, and a serial retry
+	// through three resolvers at the default timeout.
+	for _, seconds := range []float64{0.0008, 0.012, 0.4, 5, 15} {
 		RecordDNSForward(seconds)
 	}
 
@@ -75,8 +76,10 @@ func TestDNSQueryDurationBucketsSpanRealisticLatencies(t *testing.T) {
 	require.NotEmpty(t, dp.Bounds)
 	assert.Less(t, dp.Bounds[0], 0.01,
 		"boundaries look like the millisecond default, not a seconds ladder")
-	assert.GreaterOrEqual(t, dp.Bounds[len(dp.Bounds)-1], float64(constants.DefaultDNSUpstreamTimeoutSec),
-		"the top boundary should cover an upstream timeout")
+	// forward() retries resolvers serially with the full timeout each and records the
+	// whole chain, so the tail has to reach well past a single timeout.
+	assert.Greater(t, dp.Bounds[len(dp.Bounds)-1], float64(constants.DefaultDNSUpstreamTimeoutSec),
+		"the top boundary must leave room for a serial retry chain, not just one timeout")
 
 	populated := 0
 	for _, count := range dp.BucketCounts {
@@ -84,9 +87,11 @@ func TestDNSQueryDurationBucketsSpanRealisticLatencies(t *testing.T) {
 			populated++
 		}
 	}
-	assert.Equal(t, 4, populated,
-		"the four latencies must land in four different buckets, got counts %v for bounds %v",
+	assert.Equal(t, 5, populated,
+		"the five latencies must land in five different buckets, got counts %v for bounds %v",
 		dp.BucketCounts, dp.Bounds)
+	assert.Zero(t, dp.BucketCounts[len(dp.BucketCounts)-1],
+		"a retry-chain latency fell into +Inf, where it cannot be distinguished or interpolated")
 }
 
 func dnsDurationDataPoint(t *testing.T, rm *metricdata.ResourceMetrics) metricdata.HistogramDataPoint[float64] {
