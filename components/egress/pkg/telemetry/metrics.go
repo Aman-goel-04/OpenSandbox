@@ -177,6 +177,13 @@ func registerEgressMetrics() error {
 	return err
 }
 
+// ForceFlush exports pending metrics immediately. Callers that are about to terminate the
+// process must use it: metrics leave through a periodic reader, and the deferred shutdown in
+// main does not run past os.Exit.
+func ForceFlush(ctx context.Context) error {
+	return inttelemetry.ForceFlush(ctx)
+}
+
 func NftRuleCountFromPolicy(p *policy.NetworkPolicy) int64 {
 	if p == nil {
 		p = policy.DefaultDenyPolicy()

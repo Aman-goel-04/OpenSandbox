@@ -45,6 +45,11 @@ alert on, because a failed add means the kernel never learned about IPs the poli
 so the chain drops traffic that should pass — which looks exactly like a policy denial from
 inside the sandbox while `egress.policy.denied_total` stays flat.
 
+A `static_apply` failure happens during startup, where the sidecar logs and exits. Metrics
+leave through a periodic reader and `os.Exit` skips the deferred shutdown, so that path
+flushes telemetry explicitly before terminating — otherwise the one sample explaining why the
+sidecar died would never be exported.
+
 ## Shared Attributes
 
 All egress metrics may include shared attributes:
