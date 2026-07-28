@@ -40,6 +40,15 @@ import (
 	"github.com/alibaba/opensandbox/execd/pkg/web/controller"
 )
 
+const (
+	isolatedRunnerCloseRetryTimeout  = 5 * time.Second
+	isolatedRunnerCloseRetryInterval = 100 * time.Millisecond
+)
+
+type isolatedRunnerCloser interface {
+	Close() error
+}
+
 func main() {
 	os.Exit(run())
 }
@@ -82,7 +91,17 @@ func run() int {
 		} else {
 			controller.InitIsolatedRunner(runner)
 			defer func() {
-				if err := runner.Close(); err != nil {
+				if err := closeIsolatedRunnerWithRetry(
+					runner,
+					isolatedRunnerCloseRetryTimeout,
+					isolatedRunnerCloseRetryInterval,
+					func(err error) {
+						log.Warn(
+							"isolation: runner shutdown cleanup failed; retrying: %v",
+							err,
+						)
+					},
+				); err != nil {
 					log.Error("isolation: runner shutdown failed: %v", err)
 				}
 			}()
@@ -124,6 +143,56 @@ func run() int {
 		return 1
 	}
 	return 0
+}
+
+func closeIsolatedRunnerWithRetry(
+	runner isolatedRunnerCloser,
+	retryTimeout time.Duration,
+	retryInterval time.Duration,
+	reportRetry func(error),
+) error {
+	err := runner.Close()
+	if !isRetryableIsolatedRunnerCloseError(err) {
+		return err
+	}
+
+	retryCtx, cancelRetry := context.WithTimeout(
+		context.Background(),
+		retryTimeout,
+	)
+	defer cancelRetry()
+	for {
+		if reportRetry != nil {
+			reportRetry(err)
+		}
+		timer := time.NewTimer(retryInterval)
+		select {
+		case <-retryCtx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return errors.Join(
+				err,
+				fmt.Errorf(
+					"retry isolated runner cleanup: %w",
+					retryCtx.Err(),
+				),
+			)
+		case <-timer.C:
+		}
+
+		err = runner.Close()
+		if !isRetryableIsolatedRunnerCloseError(err) {
+			return err
+		}
+	}
+}
+
+func isRetryableIsolatedRunnerCloseError(err error) bool {
+	return errors.Is(err, runtime.ErrSessionNamespaceCleanup)
 }
 
 func serveHTTPUntilShutdown(
