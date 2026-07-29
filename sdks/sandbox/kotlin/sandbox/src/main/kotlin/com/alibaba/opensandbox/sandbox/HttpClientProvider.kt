@@ -80,9 +80,7 @@ class HttpClientProvider(
     //
     // The SSE client deliberately does NOT install the retry interceptor: SSE
     // bootstraps hold the response body open and their request bodies are not
-    // safely replayable for a non-idempotent status opt-in. Fresh-connection
-    // recovery on pre-send failures is still provided by OkHttp's built-in
-    // retryOnConnectionFailure.
+    // safely replayable for a non-idempotent status opt-in.
     private val sseClientLazy =
         lazy {
             baseBuilder
@@ -92,6 +90,11 @@ class HttpClientProvider(
                 .callTimeout(0, TimeUnit.MILLISECONDS)
                 .addInterceptor(ExtraHeadersInterceptor(getSseHeaders()))
                 .addLoggingInterceptor()
+                .also { builder ->
+                    if (config.retryPolicy.maxRetries == 0) {
+                        builder.retryOnConnectionFailure(false)
+                    }
+                }
                 .build()
         }
 
