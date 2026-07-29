@@ -103,10 +103,11 @@ class HttpClientProvider(
         if (config.retryPolicy.wrapsTransport()) {
             addInterceptor(RetryInterceptor(config.retryPolicy))
         }
-        // When the SDK's own retry is disabled, also suppress OkHttp's built-in
-        // retryOnConnectionFailure so fast-fail callers genuinely see a single
-        // attempt (matches the Python transport wrapper).
-        if (!config.retryPolicy.wrapsTransport()) {
+        // When maxRetries is 0 (including disabled() and time-out-only
+        // policies), suppress OkHttp's built-in retryOnConnectionFailure so
+        // the public "no retry" contract is honoured regardless of whether
+        // the interceptor is installed for timeout/deadline/onRetry knobs.
+        if (config.retryPolicy.maxRetries == 0) {
             retryOnConnectionFailure(false)
         }
         return this

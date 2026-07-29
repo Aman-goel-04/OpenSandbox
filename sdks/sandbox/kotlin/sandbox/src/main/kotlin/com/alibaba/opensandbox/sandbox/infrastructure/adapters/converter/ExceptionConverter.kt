@@ -81,13 +81,21 @@ fun Exception.toSandboxException(): SandboxException {
                 cause = this,
                 isRetryable = false,
             )
+        // Pre-send connectivity failures: DNS, TCP connect, TLS handshake.
+        is ConnectException, is UnknownHostException, is NoRouteToHostException, is SSLException ->
+            SandboxConnectionException(
+                message = "Network connectivity error: ${this.message}",
+                cause = this,
+                isRetryable = true,
+            )
+
         // Read timeouts: the request was sent but did not finish in time.
         is SocketTimeoutException ->
             if (this.message?.lowercase()?.contains("connect") == true) {
                 SandboxConnectionException(
                     message = "Network connectivity error: ${this.message}",
                     cause = this,
-                    isRetryable = false,
+                    isRetryable = true,
                 )
             } else {
                 SandboxTimeoutException(
@@ -96,13 +104,6 @@ fun Exception.toSandboxException(): SandboxException {
                     isRetryable = false,
                 )
             }
-        // Pre-send connectivity failures: DNS, TCP connect, TLS handshake.
-        is ConnectException, is UnknownHostException, is NoRouteToHostException, is SSLException ->
-            SandboxConnectionException(
-                message = "Network connectivity error: ${this.message}",
-                cause = this,
-                isRetryable = false,
-            )
         is InterruptedIOException ->
             SandboxTimeoutException(
                 message = "Request timed out: ${this.message}",
