@@ -88,6 +88,11 @@ func PTYSessionWebSocket(ctx *gin.Context) {
 		return
 	}
 
+	if ctx.Query("mode") == "viewer" {
+		ptyViewerWebSocket(ctx, session, id)
+		return
+	}
+
 	// 2. Decide how to acquire the exclusive WS lock. Try without evicting first; a
 	//    plain "already connected" with no takeover is refused with HTTP 409 *before*
 	//    the upgrade. A ?takeover=1 request (on a real WS handshake) instead evicts the
@@ -229,13 +234,9 @@ func PTYSessionWebSocket(ctx *gin.Context) {
 
 	// 8. Send replay frame if there is missed output.
 	if len(snapshotBytes) > 0 {
-		frame := make([]byte, 1+8+len(snapshotBytes))
-		frame[0] = model.BinReplay
-		binary.BigEndian.PutUint64(frame[1:9], uint64(snapshotOffset))
-		copy(frame[9:], snapshotBytes)
 		// No connMu needed — pump goroutines not yet started.
 		_ = conn.SetWriteDeadline(time.Now().Add(wsWriteDeadline))
-		if err2 := conn.WriteMessage(websocket.BinaryMessage, frame); err2 != nil {
+		if err2 := writeReplayFrame(conn, snapshotBytes, snapshotOffset); err2 != nil {
 			log.Warn("pty ws send replay for session %s: %v", id, err2)
 			return
 		}
@@ -290,6 +291,206 @@ func PTYSessionWebSocket(ctx *gin.Context) {
 	ptyClientReadLoop(conn, session, id, writeJSON, cancelCh, cancelOnce)
 }
 
+// ptyViewerWebSocket serves an opt-in read-only attachment. Viewers do not
+// acquire the session's exclusive read/write lock, so any number can coexist
+// with the holder and survive holder takeovers. They consume the bounded replay
+// stream directly rather than attaching a fanout pipe, so viewer WebSocket
+// backpressure never stalls the interactive client's live output pipe.
+func ptyViewerWebSocket(ctx *gin.Context, session runtime.PTYSession, id string) {
+	// A viewer cannot start a shell because doing so would race the exclusive
+	// holder and leave nobody able to drive the new process. Connect a normal
+	// read/write client first, then attach viewers.
+	if !session.IsRunning() {
+		ctx.JSON(http.StatusConflict, model.ErrorResponse{
+			Code:    model.WSErrCodeViewerNotRunning,
+			Message: "pty session " + id + " must be running before a viewer can attach",
+		})
+		return
+	}
+
+	conn, err := wsUpgrader.Upgrade(ctx.Writer, ctx.Request, nil)
+	if err != nil {
+		log.Warn("pty viewer ws upgrade failed for session %s: %v", id, err)
+		return
+	}
+
+	cancelCh := make(chan struct{})
+	cancelOnce := sync.OnceFunc(func() {
+		close(cancelCh)
+		_ = conn.Close()
+	})
+	var workerWg sync.WaitGroup
+	defer func() {
+		cancelOnce()
+		workerWg.Wait()
+	}()
+
+	var connMu sync.Mutex
+	writeJSON := func(v any) error {
+		connMu.Lock()
+		defer connMu.Unlock()
+		_ = conn.SetWriteDeadline(time.Now().Add(wsWriteDeadline))
+		return conn.WriteJSON(v)
+	}
+	closeConn := func(code int, text string) {
+		connMu.Lock()
+		_ = conn.SetWriteDeadline(time.Now().Add(wsWriteDeadline))
+		_ = conn.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(code, text))
+		connMu.Unlock()
+		_ = conn.Close()
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(wsReadDeadline))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(wsReadDeadline))
+	})
+
+	since := queryInt64(ctx.Query("since"), 0)
+	if since < 0 {
+		since = 0
+	}
+	snapshotBytes, snapshotOffset, changed := session.ReadOutput(since)
+	nextOffset := snapshotOffset + int64(len(snapshotBytes))
+	if len(snapshotBytes) > 0 {
+		_ = conn.SetWriteDeadline(time.Now().Add(wsWriteDeadline))
+		if err2 := writeReplayFrame(conn, snapshotBytes, snapshotOffset); err2 != nil {
+			log.Warn("pty viewer ws send replay for session %s: %v", id, err2)
+			return
+		}
+	}
+
+	mode := "pty"
+	if !session.IsPTY() {
+		mode = "pipe"
+	}
+	if err2 := writeJSON(model.ServerFrame{
+		Type:      "connected",
+		SessionID: id,
+		Mode:      mode,
+	}); err2 != nil {
+		log.Warn("pty viewer ws send connected for session %s: %v", id, err2)
+		return
+	}
+
+	workerWg.Add(3)
+	safego.Go(func() {
+		defer workerWg.Done()
+		ptyPingLoop(conn, &connMu, cancelCh, cancelOnce)
+	})
+	safego.Go(func() {
+		defer workerWg.Done()
+		ptyViewerStreamPump(session, nextOffset, changed, id, conn, &connMu, cancelCh, cancelOnce)
+	})
+	safego.Go(func() {
+		defer workerWg.Done()
+		ptyExitWatcher(session, writeJSON, closeConn, cancelCh, cancelOnce)
+	})
+
+	ptyViewerClientReadLoop(conn, writeJSON, cancelCh, cancelOnce)
+}
+
+// ptyViewerStreamPump wakes on replay-buffer changes and sends every retained
+// delta as a replay frame. The absolute offset lets a lagging viewer detect when
+// the bounded buffer evicted bytes before it could consume them.
+func ptyViewerStreamPump(
+	session runtime.PTYSession,
+	nextOffset int64,
+	changed <-chan struct{},
+	id string,
+	conn *websocket.Conn,
+	connMu *sync.Mutex,
+	cancelCh <-chan struct{},
+	cancelOnce func(),
+) {
+	for {
+		select {
+		case <-cancelCh:
+			return
+		case <-changed:
+		}
+
+		data, actualOffset, nextChanged := session.ReadOutput(nextOffset)
+		changed = nextChanged
+		nextOffset = actualOffset + int64(len(data))
+		if len(data) == 0 {
+			continue
+		}
+
+		connMu.Lock()
+		_ = conn.SetWriteDeadline(time.Now().Add(wsWriteDeadline))
+		writeErr := writeReplayFrame(conn, data, actualOffset)
+		connMu.Unlock()
+		if writeErr != nil {
+			log.Warn("pty viewer ws write output for session %s: %v", id, writeErr)
+			cancelOnce()
+			return
+		}
+	}
+}
+
+// ptyViewerClientReadLoop accepts ping frames but rejects every operation that
+// could mutate the session. The connection stays open after a READ_ONLY error.
+func ptyViewerClientReadLoop(
+	conn *websocket.Conn,
+	writeJSON func(any) error,
+	cancelCh <-chan struct{},
+	cancelOnce func(),
+) {
+	readOnlyError := func() {
+		if err := writeJSON(model.ServerFrame{
+			Type:  "error",
+			Code:  model.WSErrCodeReadOnly,
+			Error: "viewer connections are read-only",
+		}); err != nil {
+			cancelOnce()
+		}
+	}
+
+	for {
+		select {
+		case <-cancelCh:
+			return
+		default:
+		}
+
+		msgType, data, err := conn.ReadMessage()
+		if err != nil {
+			cancelOnce()
+			return
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(wsReadDeadline))
+
+		switch msgType {
+		case websocket.BinaryMessage:
+			if len(data) > 0 && data[0] == model.BinStdin {
+				readOnlyError()
+			}
+		case websocket.TextMessage:
+			var frame model.ClientFrame
+			if json.Unmarshal(data, &frame) != nil {
+				continue
+			}
+			switch frame.Type {
+			case "stdin", "signal", "resize":
+				readOnlyError()
+			case "ping":
+				if err := writeJSON(model.ServerFrame{Type: "pong"}); err != nil {
+					cancelOnce()
+				}
+			default:
+				if err := writeJSON(model.ServerFrame{
+					Type:  "error",
+					Code:  model.WSErrCodeInvalidFrame,
+					Error: fmt.Sprintf("unknown frame type %q", frame.Type),
+				}); err != nil {
+					cancelOnce()
+				}
+			}
+		}
+	}
+}
+
 // ptyPingLoop sends periodic WebSocket pings until cancelCh is closed.
 func ptyPingLoop(conn *websocket.Conn, connMu *sync.Mutex, cancelCh <-chan struct{}, cancelOnce func()) {
 	t := time.NewTicker(wsPingInterval)
@@ -309,6 +510,14 @@ func ptyPingLoop(conn *websocket.Conn, connMu *sync.Mutex, cancelCh <-chan struc
 			}
 		}
 	}
+}
+
+func writeReplayFrame(conn *websocket.Conn, data []byte, offset int64) error {
+	frame := make([]byte, 1+8+len(data))
+	frame[0] = model.BinReplay
+	binary.BigEndian.PutUint64(frame[1:9], uint64(offset))
+	copy(frame[9:], data)
+	return conn.WriteMessage(websocket.BinaryMessage, frame)
 }
 
 // ptyStreamPump reads raw chunks from r and sends them as binary frames over WS.

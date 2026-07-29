@@ -72,6 +72,27 @@ Bash session API (which keeps its existing name for compatibility), and
 isolated sessions. Commands submitted to a fallback session must use syntax
 supported by that image's `sh` implementation.
 
+## PTY WebSocket access
+
+The first WebSocket attached to `/pty/{session_id}/ws` is the exclusive
+read/write holder. A second read/write connection receives `409 Conflict`
+unless it uses `?takeover=1` to replace that holder.
+
+After the read/write holder has started the shell, any number of read-only
+clients can attach with:
+
+```text
+ws://localhost:44772/pty/{session_id}/ws?mode=viewer&since=0
+```
+
+Viewer connections receive the retained replay followed by live output, but
+they never acquire or evict the read/write holder. Binary stdin and JSON
+`stdin`, `signal`, or `resize` frames are rejected with a `READ_ONLY` error;
+`ping` remains available. WebSocket backpressure from a slow or disconnected
+viewer does not block the interactive holder's live output pipe. In pipe mode,
+viewer output uses the combined replay stream because replay does not preserve
+stdout/stderr channel boundaries.
+
 ## Isolated Sessions
 
 Isolated sessions run a shell inside a per-execution

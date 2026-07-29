@@ -53,6 +53,7 @@ type PTYSession interface {
 	WriteStdin(p []byte) (int, error)
 	AttachOutput() (io.Reader, io.Reader, func())
 	AttachOutputWithSnapshot(since int64) (io.Reader, io.Reader, func(), []byte, int64)
+	ReadOutput(since int64) ([]byte, int64, <-chan struct{})
 	SendSignal(name string)
 	ResizePTY(cols, rows uint16) error
 }
@@ -217,6 +218,13 @@ func (s *ptySession) Done() <-chan struct{} {
 // ReplayBuffer returns the session's replay buffer (thread-safe).
 func (s *ptySession) ReplayBuffer() *replayBuffer {
 	return s.replay
+}
+
+// ReadOutput returns replay bytes starting at since and a notification channel
+// that closes when more output is appended. Snapshot and subscription are
+// atomic, so read-only viewers cannot miss output between the two operations.
+func (s *ptySession) ReadOutput(since int64) ([]byte, int64, <-chan struct{}) {
+	return s.replay.ReadFromAndSubscribe(since)
 }
 
 // buildPTYCommand selects Bash when available and otherwise falls back to sh.

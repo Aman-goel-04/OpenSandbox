@@ -52,6 +52,8 @@ const (
 	WSErrCodeInvalidFrame     = "INVALID_FRAME"
 	WSErrCodeAlreadyConnected = "ALREADY_CONNECTED"
 	WSErrCodeTakenOver        = "TAKEN_OVER"
+	WSErrCodeReadOnly         = "READ_ONLY"
+	WSErrCodeViewerNotRunning = "VIEWER_REQUIRES_RUNNING_SESSION"
 	WSErrCodeRuntimeError     = "RUNTIME_ERROR"
 )
 
