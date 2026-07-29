@@ -45,6 +45,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.Condition
@@ -593,15 +594,17 @@ class SandboxPool internal constructor(
         source: String,
     ) {
         if (sandboxIds.isEmpty()) return
+        val cleanupTask = TrackedCleanupTask(poolName, sandboxIds.toList(), source)
         val executor = warmupExecutor
         if (executor == null) {
-            killDiscardedAlive(poolName, sandboxIds, source)
+            cleanupTask.run()
             return
         }
         try {
-            executor.submit {
-                killDiscardedAlive(poolName, sandboxIds, source)
-            }
+            // execute() deliberately preserves the task identity in ThreadPoolExecutor's queue.
+            // shutdownNow() can then return this exact task so its drain count is completed even
+            // when the cleanup never starts.
+            executor.execute(cleanupTask)
         } catch (e: Exception) {
             // Executor may reject if the pool is mid-shutdown; fall back to inline kill.
             logger.debug(
@@ -610,7 +613,43 @@ class SandboxPool internal constructor(
                 sandboxIds.size,
                 e.message,
             )
-            killDiscardedAlive(poolName, sandboxIds, source)
+            cleanupTask.run()
+        }
+    }
+
+    private inner class TrackedCleanupTask(
+        private val poolName: String,
+        private val sandboxIds: List<String>,
+        private val source: String,
+    ) : Runnable {
+        private val completed = AtomicBoolean(false)
+
+        init {
+            beginOperation()
+        }
+
+        override fun run() {
+            try {
+                killDiscardedAlive(poolName, sandboxIds, source)
+            } finally {
+                complete()
+            }
+        }
+
+        fun completeIfDropped() {
+            complete()
+        }
+
+        private fun complete() {
+            if (completed.compareAndSet(false, true)) {
+                endOperation()
+            }
+        }
+    }
+
+    private fun completeDroppedCleanupTasks(dropped: List<Runnable>) {
+        dropped.forEach { task ->
+            (task as? TrackedCleanupTask)?.completeIfDropped()
         }
     }
 
@@ -1081,7 +1120,7 @@ class SandboxPool internal constructor(
         reconcileTask = null
         scheduler?.shutdown()
         scheduler = null
-        warmupExecutor?.shutdownNow()
+        warmupExecutor?.let { completeDroppedCleanupTasks(it.shutdownNow()) }
         warmupExecutor = null
         releasePrimaryLockBestEffort()
         closeProvider()
@@ -1108,6 +1147,7 @@ class SandboxPool internal constructor(
         try {
             if (executor.awaitTermination(5, TimeUnit.SECONDS)) return
             val dropped = executor.shutdownNow()
+            completeDroppedCleanupTasks(dropped)
             if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
                 logger.warn(
                     "Pool {} executor did not terminate after forced stop: pool_name={} dropped_tasks={}",
@@ -1118,6 +1158,7 @@ class SandboxPool internal constructor(
             }
         } catch (_: InterruptedException) {
             val dropped = executor.shutdownNow()
+            completeDroppedCleanupTasks(dropped)
             Thread.currentThread().interrupt()
             logger.warn(
                 "Pool {} executor shutdown interrupted; forced stop issued: pool_name={} dropped_tasks={}",
@@ -1133,6 +1174,7 @@ class SandboxPool internal constructor(
         role: String,
     ) {
         val dropped = executor.shutdownNow()
+        completeDroppedCleanupTasks(dropped)
         try {
             if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
                 logger.warn(
