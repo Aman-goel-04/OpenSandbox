@@ -536,7 +536,8 @@ class SandboxPool internal constructor(
 
     /**
      * Stops pool replenish workers. If [graceful] is true, transitions to DRAINING, stops reconcile worker,
-     * and waits until local in-flight operations complete or [PoolConfig.drainTimeout] elapses before STOPPED.
+     * prevents future reconcile ticks without interrupting the current tick, and waits until local in-flight
+     * operations complete or [PoolConfig.drainTimeout] elapses before STOPPED.
      * acquire() is rejected while pool is not RUNNING. If [graceful] is false, stops immediately.
      */
     @Synchronized
@@ -550,9 +551,10 @@ class SandboxPool internal constructor(
             return
         }
         lifecycleState.set(LifecycleState.DRAINING)
-        stopReconcile()
+        var drained = false
         try {
-            val drained = awaitInFlightDrain(config.drainTimeout)
+            beginGracefulReconcileStop()
+            drained = awaitInFlightDrain(config.drainTimeout)
             if (!drained) {
                 logger.warn(
                     "Pool graceful shutdown timed out waiting in-flight operations: pool_name={} in_flight={} timeout_ms={}",
@@ -565,6 +567,11 @@ class SandboxPool internal constructor(
             Thread.currentThread().interrupt()
             logger.warn("Pool graceful shutdown interrupted during drain: pool_name={}", config.poolName)
         } finally {
+            if (drained) {
+                completeGracefulReconcileStop()
+            } else {
+                forceStopReconcileAfterGracefulDrain()
+            }
             lifecycleState.set(LifecycleState.STOPPED)
             closeProvider()
             logger.info("Pool stopped (graceful): pool_name={} state={}", config.poolName, LifecycleState.STOPPED)
@@ -1025,6 +1032,28 @@ class SandboxPool internal constructor(
         releasePrimaryLockBestEffort()
     }
 
+    private fun beginGracefulReconcileStop() {
+        reconcileTask?.cancel(false)
+        reconcileTask = null
+        scheduler?.shutdown()
+    }
+
+    private fun completeGracefulReconcileStop() {
+        scheduler?.let { shutdownExecutor(it, "scheduler") }
+        scheduler = null
+        warmupExecutor?.let { shutdownExecutor(it, "warmup") }
+        warmupExecutor = null
+        releasePrimaryLockBestEffort()
+    }
+
+    private fun forceStopReconcileAfterGracefulDrain() {
+        scheduler?.let { forceShutdownExecutor(it, "scheduler") }
+        scheduler = null
+        warmupExecutor?.let { forceShutdownExecutor(it, "warmup") }
+        warmupExecutor = null
+        releasePrimaryLockBestEffort()
+    }
+
     private fun stopAfterNamespaceDestroyed() {
         if (!lifecycleState.compareAndSet(LifecycleState.RUNNING, LifecycleState.STOPPED)) return
         reconcileTask?.cancel(false)
@@ -1071,6 +1100,31 @@ class SandboxPool internal constructor(
             Thread.currentThread().interrupt()
             logger.warn(
                 "Pool {} executor shutdown interrupted; forced stop issued: pool_name={} dropped_tasks={}",
+                role,
+                config.poolName,
+                dropped.size,
+            )
+        }
+    }
+
+    private fun forceShutdownExecutor(
+        executor: ExecutorService,
+        role: String,
+    ) {
+        val dropped = executor.shutdownNow()
+        try {
+            if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+                logger.warn(
+                    "Pool {} executor did not terminate after forced stop: pool_name={} dropped_tasks={}",
+                    role,
+                    config.poolName,
+                    dropped.size,
+                )
+            }
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            logger.warn(
+                "Pool {} executor forced stop wait interrupted: pool_name={} dropped_tasks={}",
                 role,
                 config.poolName,
                 dropped.size,

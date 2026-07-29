@@ -51,10 +51,12 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import java.time.Duration
 import java.time.Instant
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 class SandboxPoolTest {
@@ -120,6 +122,116 @@ class SandboxPoolTest {
         val snap = pool.snapshot()
         assertEquals(PoolState.STOPPED, snap.state)
         assertEquals(PoolLifecycleState.STOPPED, snap.lifecycleState)
+    }
+
+    @Test
+    fun `shutdown graceful waits for in-flight warmup without interrupting it`() {
+        val store = InMemoryPoolStateStore()
+        val sandbox = mockk<Sandbox>(relaxed = true)
+        val warmupStarted = CountDownLatch(1)
+        val releaseWarmup = CountDownLatch(1)
+        val warmupInterrupted = AtomicBoolean(false)
+        every { sandbox.id } returns "warmup-id"
+
+        val pool =
+            SandboxPool.builder()
+                .poolName("test-pool")
+                .ownerId("test-owner")
+                .maxIdle(1)
+                .warmupConcurrency(1)
+                .stateStore(store)
+                .connectionConfig(ConnectionConfig.builder().build())
+                .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
+                .sandboxCreator(PooledSandboxCreator { sandbox })
+                .warmupSkipHealthCheck()
+                .warmupSandboxPreparer(
+                    SandboxPreparer {
+                        warmupStarted.countDown()
+                        try {
+                            releaseWarmup.await()
+                        } catch (e: InterruptedException) {
+                            warmupInterrupted.set(true)
+                            throw e
+                        }
+                    },
+                ).drainTimeout(Duration.ofSeconds(2))
+                .reconcileInterval(Duration.ofSeconds(30))
+                .build()
+
+        var releaser: Thread? = null
+        pool.start()
+        try {
+            assertTrue(warmupStarted.await(5, TimeUnit.SECONDS))
+            releaser =
+                Thread {
+                    Thread.sleep(250)
+                    releaseWarmup.countDown()
+                }.apply { start() }
+
+            pool.shutdown(graceful = true)
+
+            assertEquals(false, warmupInterrupted.get())
+            assertEquals(1, store.snapshotCounters("test-pool").idleCount)
+            verify(exactly = 0) { sandbox.kill() }
+            verify(exactly = 1) { sandbox.close() }
+        } finally {
+            releaseWarmup.countDown()
+            releaser?.join(5_000)
+            pool.shutdown(graceful = false)
+        }
+    }
+
+    @Test
+    fun `shutdown graceful force interrupts warmup after drain timeout`() {
+        val store = InMemoryPoolStateStore()
+        val sandbox = mockk<Sandbox>(relaxed = true)
+        val warmupStarted = CountDownLatch(1)
+        val blockWarmup = CountDownLatch(1)
+        val warmupInterrupted = AtomicBoolean(false)
+        every { sandbox.id } returns "timed-out-warmup-id"
+
+        val pool =
+            SandboxPool.builder()
+                .poolName("test-pool")
+                .ownerId("test-owner")
+                .maxIdle(1)
+                .warmupConcurrency(1)
+                .stateStore(store)
+                .connectionConfig(ConnectionConfig.builder().build())
+                .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
+                .sandboxCreator(PooledSandboxCreator { sandbox })
+                .warmupSkipHealthCheck()
+                .warmupSandboxPreparer(
+                    SandboxPreparer {
+                        warmupStarted.countDown()
+                        try {
+                            blockWarmup.await()
+                        } catch (e: InterruptedException) {
+                            warmupInterrupted.set(true)
+                            throw e
+                        }
+                    },
+                ).drainTimeout(Duration.ofMillis(200))
+                .reconcileInterval(Duration.ofSeconds(30))
+                .build()
+
+        pool.start()
+        try {
+            assertTrue(warmupStarted.await(5, TimeUnit.SECONDS))
+            val shutdownStartedAt = System.nanoTime()
+
+            pool.shutdown(graceful = true)
+
+            val shutdownElapsedMs = Duration.ofNanos(System.nanoTime() - shutdownStartedAt).toMillis()
+            assertTrue(shutdownElapsedMs >= 150, "graceful shutdown should wait for drain timeout before forcing stop")
+            assertEquals(true, warmupInterrupted.get())
+            assertEquals(0, store.snapshotCounters("test-pool").idleCount)
+            verify(exactly = 1) { sandbox.kill() }
+            verify(exactly = 1) { sandbox.close() }
+        } finally {
+            blockWarmup.countDown()
+            pool.shutdown(graceful = false)
+        }
     }
 
     @Test
