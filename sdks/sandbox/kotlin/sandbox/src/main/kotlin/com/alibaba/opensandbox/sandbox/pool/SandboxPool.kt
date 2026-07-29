@@ -698,17 +698,7 @@ class SandboxPool internal constructor(
                 sandbox.renew(config.idleTimeout)
                 sandbox.id
             } catch (e: Exception) {
-                try {
-                    sandbox.kill()
-                } catch (cleanupEx: Exception) {
-                    logger.warn(
-                        "Pool warmup sandbox preparer cleanup failed: pool_name={} sandbox_id={} error={}",
-                        config.poolName,
-                        sandbox.id,
-                        cleanupEx.message,
-                    )
-                    e.addSuppressed(cleanupEx)
-                }
+                killWarmupSandboxAfterFailure(sandbox, e)
                 throw e
             } finally {
                 sandbox.close()
@@ -718,6 +708,32 @@ class SandboxPool internal constructor(
             throw e
         } finally {
             endOperation()
+        }
+    }
+
+    private fun killWarmupSandboxAfterFailure(
+        sandbox: Sandbox,
+        failure: Exception,
+    ) {
+        // A warmup preparer may restore the thread's interrupted status before propagating an
+        // InterruptedException. OkHttp treats that status as cancellation and can reject the
+        // cleanup request before the DELETE is sent. Temporarily clear it for the synchronous
+        // cleanup, then restore it so executor shutdown semantics are preserved.
+        val restoreInterrupt = Thread.interrupted()
+        try {
+            sandbox.kill()
+        } catch (cleanupEx: Exception) {
+            logger.warn(
+                "Pool warmup sandbox preparer cleanup failed: pool_name={} sandbox_id={} error={}",
+                config.poolName,
+                sandbox.id,
+                cleanupEx.message,
+            )
+            failure.addSuppressed(cleanupEx)
+        } finally {
+            if (restoreInterrupt) {
+                Thread.currentThread().interrupt()
+            }
         }
     }
 
@@ -1047,10 +1063,13 @@ class SandboxPool internal constructor(
     }
 
     private fun forceStopReconcileAfterGracefulDrain() {
-        scheduler?.let { forceShutdownExecutor(it, "scheduler") }
-        scheduler = null
+        // Stop warmup workers first and let their failure cleanup finish before interrupting
+        // the scheduler. Interrupting the scheduler while it waits in invokeAll() would cancel
+        // the same warmup futures again and could re-interrupt an in-progress cleanup DELETE.
         warmupExecutor?.let { forceShutdownExecutor(it, "warmup") }
         warmupExecutor = null
+        scheduler?.let { forceShutdownExecutor(it, "scheduler") }
+        scheduler = null
         releasePrimaryLockBestEffort()
     }
 

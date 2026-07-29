@@ -49,6 +49,7 @@ import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import java.io.InterruptedIOException
 import java.time.Duration
 import java.time.Instant
 import java.util.concurrent.CountDownLatch
@@ -188,7 +189,18 @@ class SandboxPoolTest {
         val warmupStarted = CountDownLatch(1)
         val blockWarmup = CountDownLatch(1)
         val warmupInterrupted = AtomicBoolean(false)
+        val killSawInterrupt = AtomicBoolean(false)
+        val closeSawInterrupt = AtomicBoolean(false)
         every { sandbox.id } returns "timed-out-warmup-id"
+        every { sandbox.kill() } answers {
+            killSawInterrupt.set(Thread.currentThread().isInterrupted)
+            if (killSawInterrupt.get()) {
+                throw InterruptedIOException("interrupted")
+            }
+        }
+        every { sandbox.close() } answers {
+            closeSawInterrupt.set(Thread.currentThread().isInterrupted)
+        }
 
         val pool =
             SandboxPool.builder()
@@ -208,6 +220,7 @@ class SandboxPoolTest {
                             blockWarmup.await()
                         } catch (e: InterruptedException) {
                             warmupInterrupted.set(true)
+                            Thread.currentThread().interrupt()
                             throw e
                         }
                     },
@@ -225,6 +238,8 @@ class SandboxPoolTest {
             val shutdownElapsedMs = Duration.ofNanos(System.nanoTime() - shutdownStartedAt).toMillis()
             assertTrue(shutdownElapsedMs >= 150, "graceful shutdown should wait for drain timeout before forcing stop")
             assertEquals(true, warmupInterrupted.get())
+            assertEquals(false, killSawInterrupt.get(), "cleanup kill must not inherit the worker interrupt state")
+            assertEquals(true, closeSawInterrupt.get(), "worker interrupt state must be restored after cleanup kill")
             assertEquals(0, store.snapshotCounters("test-pool").idleCount)
             verify(exactly = 1) { sandbox.kill() }
             verify(exactly = 1) { sandbox.close() }
