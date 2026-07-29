@@ -137,6 +137,9 @@ class SandboxPool internal constructor(
                 }
             scheduler = exec
             val reconcileIntervalMs = config.reconcileInterval.toMillis()
+            // The first reconcile may run immediately. Publish RUNNING only after all of its
+            // dependencies are initialized, but before scheduling it so that tick is not skipped.
+            lifecycleState.set(LifecycleState.RUNNING)
             reconcileTask =
                 exec.scheduleAtFixedRate(
                     {
@@ -151,7 +154,6 @@ class SandboxPool internal constructor(
                     reconcileIntervalMs,
                     TimeUnit.MILLISECONDS,
                 )
-            lifecycleState.set(LifecycleState.RUNNING)
             logger.info(
                 "Pool started: pool_name={} state={} maxIdle={}",
                 config.poolName,
