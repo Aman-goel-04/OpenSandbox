@@ -16,6 +16,7 @@
 
 package com.alibaba.opensandbox.sandbox.config
 
+import com.alibaba.opensandbox.sandbox.transport.RetryPolicy
 import okhttp3.ConnectionPool
 import java.time.Duration
 
@@ -58,6 +59,12 @@ class ConnectionConfig private constructor(
      * Also honored via the `OPENSANDBOX_DISABLE_METRICS=1` environment variable.
      */
     val disableMetrics: Boolean = false,
+    /**
+     * Retry policy applied to non-streaming requests. Enabled by default; pass
+     * [RetryPolicy.disabled] for fast-fail. SSE / streaming requests always
+     * bypass retry regardless of this value.
+     */
+    val retryPolicy: RetryPolicy = RetryPolicy(),
 ) {
     /**
      * Creates a copy of this ConnectionConfig without copying the connectionPool.
@@ -79,6 +86,7 @@ class ConnectionConfig private constructor(
             endpointCacheSize = this.endpointCacheSize,
             endpointCacheDisabled = this.endpointCacheDisabled,
             disableMetrics = this.disableMetrics,
+            retryPolicy = this.retryPolicy,
         )
 
     companion object {
@@ -178,6 +186,7 @@ class ConnectionConfig private constructor(
         private var endpointCacheSize: Int = 1024
         private var endpointCacheDisabled: Boolean = false
         private var disableMetrics: Boolean = false
+        private var retryPolicy: RetryPolicy = RetryPolicy()
 
         /**
          * Use sandbox server as proxy for process execd requests.
@@ -284,6 +293,18 @@ class ConnectionConfig private constructor(
         }
 
         /**
+         * Set the retry policy applied to non-streaming requests.
+         *
+         * Retries are enabled by default (idempotent methods only). Pass
+         * [RetryPolicy.disabled] for fast-fail semantics. SSE / streaming
+         * requests always bypass retry.
+         */
+        fun retryPolicy(retryPolicy: RetryPolicy): Builder {
+            this.retryPolicy = retryPolicy
+            return this
+        }
+
+        /**
          * Enable or disable HTTP request logging (headers).
          *
          * This is intended for local debugging. Sensitive headers will be redacted.
@@ -358,6 +379,7 @@ class ConnectionConfig private constructor(
                 endpointCacheSize = endpointCacheSize,
                 endpointCacheDisabled = endpointCacheDisabled,
                 disableMetrics = disableMetrics,
+                retryPolicy = retryPolicy,
             )
         }
     }

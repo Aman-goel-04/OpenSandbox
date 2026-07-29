@@ -21,15 +21,27 @@ import com.alibaba.opensandbox.sandbox.api.infrastructure.ClientException
 import com.alibaba.opensandbox.sandbox.api.infrastructure.ServerError
 import com.alibaba.opensandbox.sandbox.api.infrastructure.ServerException
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxApiException
+import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxConnectionException
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxError
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxError.Companion.UNEXPECTED_RESPONSE
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxException
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxInternalException
+import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxRateLimitException
+import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxTimeoutException
+import com.alibaba.opensandbox.sandbox.transport.RetryDeadlineExceededException
+import com.alibaba.opensandbox.sandbox.transport.RetryPolicy
+import com.alibaba.opensandbox.sandbox.transport.parseRetryAfter
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.encodeToJsonElement
 import java.io.IOException
+import java.io.InterruptedIOException
+import java.net.ConnectException
+import java.net.NoRouteToHostException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
+import javax.net.ssl.SSLException
 import com.alibaba.opensandbox.sandbox.api.diagnostic.infrastructure.ClientError as DiagnosticClientError
 import com.alibaba.opensandbox.sandbox.api.diagnostic.infrastructure.ClientException as DiagnosticClientException
 import com.alibaba.opensandbox.sandbox.api.diagnostic.infrastructure.ServerError as DiagnosticServerError
@@ -61,6 +73,42 @@ fun Exception.toSandboxException(): SandboxException {
         is ExecdClientException, is ExecdServerException,
         is DiagnosticClientException, is DiagnosticServerException,
         -> this.toApiException()
+        // The retry interceptor exhausted the overall deadline before the next
+        // attempt: surface as a timeout, never retryable.
+        is RetryDeadlineExceededException ->
+            SandboxTimeoutException(
+                message = "Request timed out: ${this.message}",
+                cause = this,
+                isRetryable = false,
+            )
+        // Read timeouts: the request was sent but did not finish in time.
+        is SocketTimeoutException ->
+            if (this.message?.lowercase()?.contains("connect") == true) {
+                SandboxConnectionException(
+                    message = "Network connectivity error: ${this.message}",
+                    cause = this,
+                    isRetryable = false,
+                )
+            } else {
+                SandboxTimeoutException(
+                    message = "Request timed out: ${this.message}",
+                    cause = this,
+                    isRetryable = false,
+                )
+            }
+        // Pre-send connectivity failures: DNS, TCP connect, TLS handshake.
+        is ConnectException, is UnknownHostException, is NoRouteToHostException, is SSLException ->
+            SandboxConnectionException(
+                message = "Network connectivity error: ${this.message}",
+                cause = this,
+                isRetryable = false,
+            )
+        is InterruptedIOException ->
+            SandboxTimeoutException(
+                message = "Request timed out: ${this.message}",
+                cause = this,
+                isRetryable = false,
+            )
         is IOException ->
             SandboxInternalException(
                 message = "Network connectivity error: ${this.message}",
@@ -96,16 +144,18 @@ private fun Exception.toApiException(): SandboxApiException {
             else -> 0 to null
         }
 
-    val requestId =
+    val headers: Map<String, List<String>>? =
         when (rawResponse) {
-            is ClientError<*> -> rawResponse.headers.extractRequestId()
-            is ServerError<*> -> rawResponse.headers.extractRequestId()
-            is ExecdClientError<*> -> rawResponse.headers.extractRequestId()
-            is ExecdServerError<*> -> rawResponse.headers.extractRequestId()
-            is DiagnosticClientError<*> -> rawResponse.headers.extractRequestId()
-            is DiagnosticServerError<*> -> rawResponse.headers.extractRequestId()
+            is ClientError<*> -> rawResponse.headers
+            is ServerError<*> -> rawResponse.headers
+            is ExecdClientError<*> -> rawResponse.headers
+            is ExecdServerError<*> -> rawResponse.headers
+            is DiagnosticClientError<*> -> rawResponse.headers
+            is DiagnosticServerError<*> -> rawResponse.headers
             else -> null
         }
+
+    val requestId = headers?.extractRequestId()
 
     val errorBody =
         when (rawResponse) {
@@ -125,12 +175,35 @@ private fun Exception.toApiException(): SandboxApiException {
             SandboxError(UNEXPECTED_RESPONSE)
         }
 
+    val responseBody = errorBody as? String
+    // Status-code-based transient indicator. Matches the Python SDK behavior:
+    // flags {429,502,503} as retryable regardless of HTTP method or budget state.
+    // In practice, the retry interceptor has already exhausted retries before the
+    // exception surfaces here, so the boundary value is almost always false.
+    // The flag is a transient-status signal, not a "we retried this" signal.
+    val isRetryable = statusCode in RetryPolicy.DEFAULT_IDEMPOTENT_STATUS
+
+    if (statusCode == 429) {
+        return SandboxRateLimitException(
+            message = this.message,
+            statusCode = statusCode,
+            cause = this,
+            error = sandboxError,
+            requestId = requestId,
+            retryAfter = headers?.extractRetryAfter(),
+            responseBody = responseBody,
+            isRetryable = isRetryable,
+        )
+    }
+
     return SandboxApiException(
         message = this.message,
         statusCode = statusCode,
         cause = this,
         error = sandboxError,
         requestId = requestId,
+        responseBody = responseBody,
+        isRetryable = isRetryable,
     )
 }
 
@@ -138,6 +211,14 @@ private fun Map<String, List<String>>.extractRequestId(): String? {
     return entries.firstOrNull { (key, _) ->
         key.equals("X-Request-ID", ignoreCase = true)
     }?.value?.firstOrNull()?.takeIf { it.isNotBlank() }
+}
+
+private fun Map<String, List<String>>.extractRetryAfter(): java.time.Duration? {
+    val raw =
+        entries.firstOrNull { (key, _) ->
+            key.equals("Retry-After", ignoreCase = true)
+        }?.value?.firstOrNull()
+    return parseRetryAfter(raw)
 }
 
 fun parseSandboxError(body: Any?): SandboxError? {

@@ -18,6 +18,7 @@ package com.alibaba.opensandbox.sandbox
 
 import com.alibaba.opensandbox.sandbox.config.ConnectionConfig
 import com.alibaba.opensandbox.sandbox.domain.models.execd.SECURE_ACCESS_HEADER
+import com.alibaba.opensandbox.sandbox.transport.RetryInterceptor
 import okhttp3.ConnectionPool
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
@@ -55,6 +56,7 @@ class HttpClientProvider(
         lazy {
             baseBuilder
                 .applyStandardTimeouts()
+                .addRetryInterceptor()
                 .addLoggingInterceptor()
                 .build()
         }
@@ -66,6 +68,7 @@ class HttpClientProvider(
         lazy {
             baseBuilder
                 .applyStandardTimeouts()
+                .addRetryInterceptor()
                 .addInterceptor(AuthenticationInterceptor(config.getApiKey())) // Add auth before logging
                 .addLoggingInterceptor()
                 .build()
@@ -74,6 +77,12 @@ class HttpClientProvider(
     val authenticatedClient: OkHttpClient by authenticatedClientLazy
 
     // 3. Explicit lazy definition for SSE client
+    //
+    // The SSE client deliberately does NOT install the retry interceptor: SSE
+    // bootstraps hold the response body open and their request bodies are not
+    // safely replayable for a non-idempotent status opt-in. Fresh-connection
+    // recovery on pre-send failures is still provided by OkHttp's built-in
+    // retryOnConnectionFailure.
     private val sseClientLazy =
         lazy {
             baseBuilder
@@ -89,6 +98,19 @@ class HttpClientProvider(
     val sseClient: OkHttpClient by sseClientLazy
 
     // --- Helper Extensions ---
+
+    private fun OkHttpClient.Builder.addRetryInterceptor(): OkHttpClient.Builder {
+        if (config.retryPolicy.wrapsTransport()) {
+            addInterceptor(RetryInterceptor(config.retryPolicy))
+        }
+        // When the SDK's own retry is disabled, also suppress OkHttp's built-in
+        // retryOnConnectionFailure so fast-fail callers genuinely see a single
+        // attempt (matches the Python transport wrapper).
+        if (!config.retryPolicy.wrapsTransport()) {
+            retryOnConnectionFailure(false)
+        }
+        return this
+    }
 
     private fun OkHttpClient.Builder.applyStandardTimeouts(): OkHttpClient.Builder {
         val timeout = config.requestTimeout.toMillis()
