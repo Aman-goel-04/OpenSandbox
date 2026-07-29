@@ -52,13 +52,71 @@ func TestAppendMetricAttrsFromKeyValuePairs(t *testing.T) {
 	assert.Len(t, out, 0)
 }
 
+// The instrument records seconds, so it needs boundaries on a seconds ladder. With the
+// SDK default (the spec's millisecond ladder) every realistic DNS latency collapses into
+// one bucket and the quantiles are meaningless.
+func TestDNSQueryDurationBucketsSpanRealisticLatencies(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	previous := otel.GetMeterProvider()
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
+	t.Cleanup(func() { otel.SetMeterProvider(previous) })
+
+	require.NoError(t, registerEgressMetrics())
+
+	// Cache hit, LAN upstream, slow upstream, one upstream timeout, a serial retry through
+	// three resolvers at the default timeout, and a late success after two resolvers each
+	// burning the configurable 120s maximum.
+	for _, seconds := range []float64{0.0008, 0.012, 0.4, 5, 15, 240} {
+		RecordDNSForward(seconds)
+	}
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+
+	dp := dnsDurationDataPoint(t, &rm)
+	require.NotEmpty(t, dp.Bounds)
+	assert.Less(t, dp.Bounds[0], 0.01,
+		"boundaries look like the millisecond default, not a seconds ladder")
+	// forward() retries resolvers serially with the full timeout each and records the
+	// whole chain, so the tail has to reach well past a single timeout.
+	assert.Greater(t, dp.Bounds[len(dp.Bounds)-1], float64(constants.DefaultDNSUpstreamTimeoutSec),
+		"the top boundary must leave room for a serial retry chain, not just one timeout")
+
+	populated := 0
+	for _, count := range dp.BucketCounts {
+		if count > 0 {
+			populated++
+		}
+	}
+	assert.Equal(t, 6, populated,
+		"the six latencies must land in six different buckets, got counts %v for bounds %v",
+		dp.BucketCounts, dp.Bounds)
+	assert.Zero(t, dp.BucketCounts[len(dp.BucketCounts)-1],
+		"a retry-chain latency fell into +Inf, where it cannot be distinguished or interpolated")
+}
+
+func dnsDurationDataPoint(t *testing.T, rm *metricdata.ResourceMetrics) metricdata.HistogramDataPoint[float64] {
+	t.Helper()
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "egress.dns.query.duration" {
+				continue
+			}
+			hist, ok := m.Data.(metricdata.Histogram[float64])
+			require.True(t, ok, "unexpected aggregation %T", m.Data)
+			require.Len(t, hist.DataPoints, 1)
+			return hist.DataPoints[0]
+		}
+	}
+	t.Fatal("egress.dns.query.duration not collected")
+	return metricdata.HistogramDataPoint[float64]{}
+}
+
 // The failure counters carry a bounded attribute on top of the shared set. This checks the
 // attribute lands and, critically, that adding it does not corrupt the shared slice: it is
 // returned by a sync.OnceValue and may have spare capacity, so appending in place would
 // leak one call's reason into the next.
 func TestFailureCountersCarryBoundedAttributeWithoutSharingState(t *testing.T) {
-	t.Setenv(constants.EnvSandboxID, "sbx-1")
-
 	reader := sdkmetric.NewManualReader()
 	previous := otel.GetMeterProvider()
 	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
@@ -85,6 +143,10 @@ func TestFailureCountersCarryBoundedAttributeWithoutSharingState(t *testing.T) {
 
 // counterByAttr sums an Int64 counter's data points keyed by one attribute, and asserts
 // every point still carries the shared attributes it was created with.
+//
+// It compares against egressSharedAttrs() rather than a fixed sandbox_id: that slice comes
+// from a sync.OnceValue resolved by whichever test records first, so hardcoding a value here
+// would make this test depend on the order tests run in.
 func counterByAttr(t *testing.T, rm *metricdata.ResourceMetrics, name, key string) map[string]int64 {
 	t.Helper()
 	out := map[string]int64{}
@@ -98,9 +160,11 @@ func counterByAttr(t *testing.T, rm *metricdata.ResourceMetrics, name, key strin
 			for _, dp := range sum.DataPoints {
 				value, found := dp.Attributes.Value(attribute.Key(key))
 				require.True(t, found, "%s data point without a %q attribute: %v", name, key, dp.Attributes)
-				sandbox, found := dp.Attributes.Value("sandbox_id")
-				require.True(t, found, "shared attributes were lost: %v", dp.Attributes)
-				require.Equal(t, "sbx-1", sandbox.AsString())
+				for _, want := range egressSharedAttrs() {
+					got, present := dp.Attributes.Value(want.Key)
+					require.True(t, present, "shared attribute %s was lost: %v", want.Key, dp.Attributes)
+					require.Equal(t, want.Value.AsString(), got.AsString())
+				}
 				out[value.AsString()] += dp.Value
 			}
 			return out
