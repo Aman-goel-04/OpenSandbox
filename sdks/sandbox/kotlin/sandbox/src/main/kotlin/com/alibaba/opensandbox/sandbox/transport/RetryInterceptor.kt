@@ -277,12 +277,14 @@ class RetryInterceptor
                 return Outcome(isTransportError = true, isPreSend = true, cause = RetryCause.PRE_SEND)
             }
             // SSLHandshakeException is pre-send (handshake never completed).
-            // Other SSLExceptions (e.g. mid-stream protocol errors) are opaque.
             if (e is SSLHandshakeException) {
                 return Outcome(isTransportError = true, isPreSend = true, cause = RetryCause.PRE_SEND)
             }
+            // Generic mid-stream SSL failures (e.g. TLS alerts, protocol errors
+            // after bytes were already written) are not retryable: they indicate
+            // a permanent connection-level issue, not a transient one.
             if (e is SSLException) {
-                return Outcome(isTransportError = true, isOpaqueTransport = true, cause = RetryCause.OPAQUE_TRANSPORT)
+                return Outcome(isTransportError = false)
             }
             // Generic InterruptedIOException that is not a socket timeout: treat as
             // a post-send read timeout for observability.
