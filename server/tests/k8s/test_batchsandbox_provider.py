@@ -1267,7 +1267,7 @@ spec:
         assert result.endpoint == "10.0.0.1:8080"
         assert result.headers is None
 
-    def test_get_endpoint_info_uses_first_ip(self):
+    def test_get_internal_endpoint_uses_first_ip(self):
         provider = BatchSandboxProvider(MagicMock())
         workload = {
             "metadata": {
@@ -1275,34 +1275,34 @@ spec:
             }
         }
 
-        result = provider.get_endpoint_info(workload, 8080, "sandbox-123")
+        result = provider.get_internal_endpoint(workload, 8080, "sandbox-123")
 
         assert result.endpoint == "10.0.0.1:8080"
         assert result.headers is None
 
-    def test_get_endpoint_info_returns_none_when_missing(self):
+    def test_get_internal_endpoint_returns_none_when_missing(self):
         provider = BatchSandboxProvider(MagicMock())
         workload = {"metadata": {"annotations": {}}}
 
-        result = provider.get_endpoint_info(workload, 8080, "sandbox-123")
+        result = provider.get_internal_endpoint(workload, 8080, "sandbox-123")
 
         assert result is None
 
-    def test_get_endpoint_info_returns_none_on_invalid_json(self):
+    def test_get_internal_endpoint_returns_none_on_invalid_json(self):
         provider = BatchSandboxProvider(MagicMock())
         workload = {
             "metadata": {"annotations": {"sandbox.opensandbox.io/endpoints": "invalid-json"}}
         }
 
-        result = provider.get_endpoint_info(workload, 8080, "sandbox-123")
+        result = provider.get_internal_endpoint(workload, 8080, "sandbox-123")
 
         assert result is None
 
-    def test_get_endpoint_info_returns_none_on_empty_array(self):
+    def test_get_internal_endpoint_returns_none_on_empty_array(self):
         provider = BatchSandboxProvider(MagicMock())
         workload = {"metadata": {"annotations": {"sandbox.opensandbox.io/endpoints": "[]"}}}
 
-        result = provider.get_endpoint_info(workload, 8080, "sandbox-123")
+        result = provider.get_internal_endpoint(workload, 8080, "sandbox-123")
 
         assert result is None
 
