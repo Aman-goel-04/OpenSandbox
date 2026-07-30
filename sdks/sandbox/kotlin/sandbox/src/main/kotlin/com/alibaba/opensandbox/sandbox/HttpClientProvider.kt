@@ -102,16 +102,18 @@ class HttpClientProvider(
 
     // --- Helper Extensions ---
 
+    /**
+     * Installs [RetryInterceptor] and disables OkHttp's built-in connection
+     * recovery, so the SDK is the single owner of retry behaviour (matching
+     * the Python transport wrapper single-owner model).
+     *
+     * When the policy does not require the interceptor (wrapsTransport() is
+     * false), this is a no-op — the caller relies on OkHttp defaults.
+     */
     private fun OkHttpClient.Builder.addRetryInterceptor(): OkHttpClient.Builder {
         if (config.retryPolicy.wrapsTransport()) {
-            addInterceptor(RetryInterceptor(config.retryPolicy))
-        }
-        // When maxRetries is 0 (including disabled() and time-out-only
-        // policies), suppress OkHttp's built-in retryOnConnectionFailure so
-        // the public "no retry" contract is honoured regardless of whether
-        // the interceptor is installed for timeout/deadline/onRetry knobs.
-        if (config.retryPolicy.maxRetries == 0) {
             retryOnConnectionFailure(false)
+            addInterceptor(RetryInterceptor(config.retryPolicy))
         }
         return this
     }
