@@ -45,6 +45,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.Condition
@@ -137,6 +138,9 @@ class SandboxPool internal constructor(
                 }
             scheduler = exec
             val reconcileIntervalMs = config.reconcileInterval.toMillis()
+            // The first reconcile may run immediately. Publish RUNNING only after all of its
+            // dependencies are initialized, but before scheduling it so that tick is not skipped.
+            lifecycleState.set(LifecycleState.RUNNING)
             reconcileTask =
                 exec.scheduleAtFixedRate(
                     {
@@ -151,7 +155,6 @@ class SandboxPool internal constructor(
                     reconcileIntervalMs,
                     TimeUnit.MILLISECONDS,
                 )
-            lifecycleState.set(LifecycleState.RUNNING)
             logger.info(
                 "Pool started: pool_name={} state={} maxIdle={}",
                 config.poolName,
@@ -536,7 +539,8 @@ class SandboxPool internal constructor(
 
     /**
      * Stops pool replenish workers. If [graceful] is true, transitions to DRAINING, stops reconcile worker,
-     * and waits until local in-flight operations complete or [PoolConfig.drainTimeout] elapses before STOPPED.
+     * prevents future reconcile ticks without interrupting the current tick, and waits until local in-flight
+     * operations complete or [PoolConfig.drainTimeout] elapses before STOPPED.
      * acquire() is rejected while pool is not RUNNING. If [graceful] is false, stops immediately.
      */
     @Synchronized
@@ -550,9 +554,10 @@ class SandboxPool internal constructor(
             return
         }
         lifecycleState.set(LifecycleState.DRAINING)
-        stopReconcile()
+        var drained = false
         try {
-            val drained = awaitInFlightDrain(config.drainTimeout)
+            beginGracefulReconcileStop()
+            drained = awaitInFlightDrain(config.drainTimeout)
             if (!drained) {
                 logger.warn(
                     "Pool graceful shutdown timed out waiting in-flight operations: pool_name={} in_flight={} timeout_ms={}",
@@ -565,6 +570,11 @@ class SandboxPool internal constructor(
             Thread.currentThread().interrupt()
             logger.warn("Pool graceful shutdown interrupted during drain: pool_name={}", config.poolName)
         } finally {
+            if (drained) {
+                completeGracefulReconcileStop()
+            } else {
+                forceStopReconcileAfterGracefulDrain()
+            }
             lifecycleState.set(LifecycleState.STOPPED)
             closeProvider()
             logger.info("Pool stopped (graceful): pool_name={} state={}", config.poolName, LifecycleState.STOPPED)
@@ -584,15 +594,17 @@ class SandboxPool internal constructor(
         source: String,
     ) {
         if (sandboxIds.isEmpty()) return
+        val cleanupTask = TrackedCleanupTask(poolName, sandboxIds.toList(), source)
         val executor = warmupExecutor
         if (executor == null) {
-            killDiscardedAlive(poolName, sandboxIds, source)
+            cleanupTask.run()
             return
         }
         try {
-            executor.submit {
-                killDiscardedAlive(poolName, sandboxIds, source)
-            }
+            // execute() deliberately preserves the task identity in ThreadPoolExecutor's queue.
+            // shutdownNow() can then return this exact task so its drain count is completed even
+            // when the cleanup never starts.
+            executor.execute(cleanupTask)
         } catch (e: Exception) {
             // Executor may reject if the pool is mid-shutdown; fall back to inline kill.
             logger.debug(
@@ -601,7 +613,43 @@ class SandboxPool internal constructor(
                 sandboxIds.size,
                 e.message,
             )
-            killDiscardedAlive(poolName, sandboxIds, source)
+            cleanupTask.run()
+        }
+    }
+
+    private inner class TrackedCleanupTask(
+        private val poolName: String,
+        private val sandboxIds: List<String>,
+        private val source: String,
+    ) : Runnable {
+        private val completed = AtomicBoolean(false)
+
+        init {
+            beginOperation()
+        }
+
+        override fun run() {
+            try {
+                killDiscardedAlive(poolName, sandboxIds, source)
+            } finally {
+                complete()
+            }
+        }
+
+        fun completeIfDropped() {
+            complete()
+        }
+
+        private fun complete() {
+            if (completed.compareAndSet(false, true)) {
+                endOperation()
+            }
+        }
+    }
+
+    private fun completeDroppedCleanupTasks(dropped: List<Runnable>) {
+        dropped.forEach { task ->
+            (task as? TrackedCleanupTask)?.completeIfDropped()
         }
     }
 
@@ -691,17 +739,7 @@ class SandboxPool internal constructor(
                 sandbox.renew(config.idleTimeout)
                 sandbox.id
             } catch (e: Exception) {
-                try {
-                    sandbox.kill()
-                } catch (cleanupEx: Exception) {
-                    logger.warn(
-                        "Pool warmup sandbox preparer cleanup failed: pool_name={} sandbox_id={} error={}",
-                        config.poolName,
-                        sandbox.id,
-                        cleanupEx.message,
-                    )
-                    e.addSuppressed(cleanupEx)
-                }
+                killWarmupSandboxAfterFailure(sandbox, e)
                 throw e
             } finally {
                 sandbox.close()
@@ -711,6 +749,32 @@ class SandboxPool internal constructor(
             throw e
         } finally {
             endOperation()
+        }
+    }
+
+    private fun killWarmupSandboxAfterFailure(
+        sandbox: Sandbox,
+        failure: Exception,
+    ) {
+        // A warmup preparer may restore the thread's interrupted status before propagating an
+        // InterruptedException. OkHttp treats that status as cancellation and can reject the
+        // cleanup request before the DELETE is sent. Temporarily clear it for the synchronous
+        // cleanup, then restore it so executor shutdown semantics are preserved.
+        val restoreInterrupt = Thread.interrupted()
+        try {
+            sandbox.kill()
+        } catch (cleanupEx: Exception) {
+            logger.warn(
+                "Pool warmup sandbox preparer cleanup failed: pool_name={} sandbox_id={} error={}",
+                config.poolName,
+                sandbox.id,
+                cleanupEx.message,
+            )
+            failure.addSuppressed(cleanupEx)
+        } finally {
+            if (restoreInterrupt) {
+                Thread.currentThread().interrupt()
+            }
         }
     }
 
@@ -1025,13 +1089,38 @@ class SandboxPool internal constructor(
         releasePrimaryLockBestEffort()
     }
 
+    private fun beginGracefulReconcileStop() {
+        reconcileTask?.cancel(false)
+        reconcileTask = null
+        scheduler?.shutdown()
+    }
+
+    private fun completeGracefulReconcileStop() {
+        scheduler?.let { shutdownExecutor(it, "scheduler") }
+        scheduler = null
+        warmupExecutor?.let { shutdownExecutor(it, "warmup") }
+        warmupExecutor = null
+        releasePrimaryLockBestEffort()
+    }
+
+    private fun forceStopReconcileAfterGracefulDrain() {
+        // Stop warmup workers first and let their failure cleanup finish before interrupting
+        // the scheduler. Interrupting the scheduler while it waits in invokeAll() would cancel
+        // the same warmup futures again and could re-interrupt an in-progress cleanup DELETE.
+        warmupExecutor?.let { forceShutdownExecutor(it, "warmup") }
+        warmupExecutor = null
+        scheduler?.let { forceShutdownExecutor(it, "scheduler") }
+        scheduler = null
+        releasePrimaryLockBestEffort()
+    }
+
     private fun stopAfterNamespaceDestroyed() {
         if (!lifecycleState.compareAndSet(LifecycleState.RUNNING, LifecycleState.STOPPED)) return
         reconcileTask?.cancel(false)
         reconcileTask = null
         scheduler?.shutdown()
         scheduler = null
-        warmupExecutor?.shutdownNow()
+        warmupExecutor?.let { completeDroppedCleanupTasks(it.shutdownNow()) }
         warmupExecutor = null
         releasePrimaryLockBestEffort()
         closeProvider()
@@ -1058,6 +1147,7 @@ class SandboxPool internal constructor(
         try {
             if (executor.awaitTermination(5, TimeUnit.SECONDS)) return
             val dropped = executor.shutdownNow()
+            completeDroppedCleanupTasks(dropped)
             if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
                 logger.warn(
                     "Pool {} executor did not terminate after forced stop: pool_name={} dropped_tasks={}",
@@ -1068,9 +1158,36 @@ class SandboxPool internal constructor(
             }
         } catch (_: InterruptedException) {
             val dropped = executor.shutdownNow()
+            completeDroppedCleanupTasks(dropped)
             Thread.currentThread().interrupt()
             logger.warn(
                 "Pool {} executor shutdown interrupted; forced stop issued: pool_name={} dropped_tasks={}",
+                role,
+                config.poolName,
+                dropped.size,
+            )
+        }
+    }
+
+    private fun forceShutdownExecutor(
+        executor: ExecutorService,
+        role: String,
+    ) {
+        val dropped = executor.shutdownNow()
+        completeDroppedCleanupTasks(dropped)
+        try {
+            if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+                logger.warn(
+                    "Pool {} executor did not terminate after forced stop: pool_name={} dropped_tasks={}",
+                    role,
+                    config.poolName,
+                    dropped.size,
+                )
+            }
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            logger.warn(
+                "Pool {} executor forced stop wait interrupted: pool_name={} dropped_tasks={}",
                 role,
                 config.poolName,
                 dropped.size,
