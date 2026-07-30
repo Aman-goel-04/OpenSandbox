@@ -700,6 +700,16 @@ spec:
         assert endpoint.headers is None
         mock_k8s_client.list_pods.assert_not_called()
 
+    def test_get_internal_endpoint_brackets_ipv6_pod_ip(self, mock_k8s_client):
+        provider = AgentSandboxProvider(mock_k8s_client)
+        workload = {"status": {"podIPs": ["fd00::9"]}}
+
+        endpoint = provider.get_internal_endpoint(workload, 8080, "sandbox-123")
+
+        assert endpoint.endpoint == "[fd00::9]:8080"
+        assert endpoint.headers is None
+        mock_k8s_client.list_pods.assert_not_called()
+
     def test_get_endpoint_info_prefers_running_pod(self, mock_k8s_client):
         provider = AgentSandboxProvider(mock_k8s_client)
         mock_k8s_client.list_pods.return_value = [

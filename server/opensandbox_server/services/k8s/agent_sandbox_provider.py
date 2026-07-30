@@ -540,7 +540,8 @@ class AgentSandboxProvider(WorkloadProvider):
 
         for pod_ip in pod_ips:
             if isinstance(pod_ip, str) and pod_ip:
-                return Endpoint(endpoint=f"{pod_ip}:{port}")
+                host = f"[{pod_ip}]" if ":" in pod_ip else pod_ip
+                return Endpoint(endpoint=f"{host}:{port}")
         return None
 
     def get_endpoint_info(self, workload: Dict[str, Any], port: int, sandbox_id: str) -> Optional[Endpoint]:
