@@ -4,7 +4,7 @@ authors:
   - "@fengcone"
   - "@Pangjiping"
 creation-date: 2026-02-08
-last-updated: 2026-07-27
+last-updated: 2026-07-30
 status: provisional
 ---
 # OSEP-0007: Sandbox Fleets Runtime (fast-sandbox backend)
@@ -47,12 +47,13 @@ Introduce a new OpenSandbox backend type, **`sandbox fleets`** (runtime `type = 
 - **Create** is a *simplified* subset of `CreateSandboxRequest`. Pod-identity-dependent fields (`volumes`, `platform` node-selectors, `resource_requests`, `credential_proxy`, `snapshot_id`, pause/resume) are explicitly rejected; `network_policy` and `secure_access` are staged (contract kept, enforced in phase 1b).
 - **Lifecycle** (get / delete / renew-expiration / list / metadata), **execd** (exec / file), and **egress** (`network_policy`) reuse the *existing public API contracts* unchanged, so upstream SDKs are unaffected.
 
-**Current performance evidence**:
+**Implementation baseline and current performance evidence**:
 
-- At fast-sandbox [`3af0222`](https://github.com/opensandbox-group/fast-sandbox/tree/3af02227a85d3ae872e67ef718b63c60e777edac), the repository explicitly has **no release-grade Sandbox Create benchmark**. Its [dated engineering baseline](https://github.com/opensandbox-group/fast-sandbox/blob/3af02227a85d3ae872e67ef718b63c60e777edac/docs/guides/performance.md) measured 20 concurrency-1, warm-image runc creates through `RuntimeReady`: mean **76.02 ms**, p50 **75.95 ms**, and p95 **83.15 ms**.
+- This revision is aligned to fast-sandbox master [`aac0c2c`](https://github.com/opensandbox-group/fast-sandbox/tree/aac0c2c80f08a8efa455f057ff7323a8248b558d), which implements **FastPath v2** and the `sandbox.fast.io/v1alpha2` CRDs. FastPath v2 carries initial expiry and metadata atomically in Create, returns metadata/expiry in lifecycle reads, supports metadata filtering and explicit deletion, waits directly on Fastlet readiness, and resolves named Infra Components or raw user ports.
+- The repository still explicitly has **no release-grade Sandbox Create benchmark**. Its [dated engineering baseline](https://github.com/opensandbox-group/fast-sandbox/blob/aac0c2c80f08a8efa455f057ff7323a8248b558d/docs/guides/performance.md) measured 20 concurrency-1, warm-image runc creates through `RuntimeReady`: mean **76.02 ms**, p50 **75.95 ms**, and p95 **83.15 ms**. Those measurements describe base revision `42fe03549598c3ab730b989c7757634b486697cf`, not `aac0c2c`.
 - That baseline excludes Infra readiness, route publication, `DataPlaneReady`, and the OpenSandbox server/gateway path. It is evidence about the current fast-sandbox implementation, not a `fleets` release target or a comparison with the BatchSandbox pool.
 
-> **Correction from earlier drafts**: fast-sandbox does **not** implement a "Fast Mode" (container-first / async-CRD / eventual-consistency) path. Every create ranks in-memory candidates, persists one Sandbox CRD, and only then performs atomic Fastlet admission/runtime creation. Here, **CRD-first** means durable intent precedes runtime creation; it does not mean the CRD write precedes candidate ranking. The gRPC entry avoids the K8s *scheduler* and *watch propagation*, not the CRD/etcd write. This OSEP also uses the real fast-sandbox terminology (**Fastlet** / **SandboxPool**), not the "Agent" / "AgentPool" terms from earlier drafts.
+> **Correction from earlier drafts**: fast-sandbox does **not** implement a "Fast Mode" (container-first / async-CRD / eventual-consistency) path. Every create ranks in-memory candidates, persists one Sandbox CRD containing the complete initial intent, and only then performs atomic Fastlet admission/runtime creation. Here, **CRD-first** means durable intent precedes runtime creation; it does not mean the CRD write precedes candidate ranking. The gRPC entry avoids the K8s *scheduler* and *watch propagation*, not the CRD/etcd write. There is consequently no `strong` / `fast` consistency switch, request field, or CRD label in this proposal. This OSEP also uses the real fast-sandbox terminology (**Fastlet** / **SandboxPool**), not the "Agent" / "AgentPool" terms from earlier drafts.
 
 > **Note**: The observations above assume the container image and runtime artifacts are already cached on the Fastlet's host node. Cache misses add pull/unpack work and must be reported separately.
 
@@ -111,7 +112,7 @@ fast-sandbox reduces creation-path overhead through three key design choices:
 | **Customization**               | entrypoint, env only                               | entrypoint, env, image per request          |
 | **Container creation**          | pre-warmed                                         | Direct containerd socket inside Fastlet     |
 | **Consistency**                 | Durable K8s state is the source of truth            | Sandbox CRD is persisted synchronously before runtime creation |
-| **Failure recovery**            | K8s Controller reconciliation                      | NodeJanitor + AutoRecreate policy           |
+| **Failure recovery**            | K8s Controller reconciliation                      | NodeJanitor cleanup + Manual/AutoRecreate policy |
 
 Both approaches use pre-provisioned resource pools to eliminate cold start overhead. fast-sandbox's key advantage is bypassing the K8s **scheduler and watch propagation** for container placement while still committing durable intent through a CRD write.
 
@@ -180,10 +181,10 @@ The key insight: **use K8s for what it's good at** (resource accounting, cluster
 
 ### Goals
 
-- Add a `fleets` runtime type (`config.runtime.type = "fleets"`) implemented as a new `FleetSandboxService` (a `SandboxService`, **not** a Kubernetes `WorkloadProvider`)
+- Add a `fleets` runtime type (`config.runtime.type = "fleets"`) implemented as a new `FleetSandboxService` (both `SandboxService` and `ExtensionService`, **not** a Kubernetes `WorkloadProvider`)
 - Reuse the existing lifecycle API (`get` / `delete` / `renew-expiration` / `list` / `metadata`) with no changes to routes or SDKs
 - Reuse the existing execd exec/file access pattern (`get_endpoint(id, 44772)` → in-sandbox execd HTTP) unchanged
-- Reuse the existing egress contract (`network_policy` at create; `egress-api.yaml` `/policy` at runtime), and **enforce per-sandbox egress** on fast-sandbox
+- Reuse the existing egress contract (`network_policy` at create; `egress-api.yaml` `/policy` at runtime) only in separately gated phase 1b, after per-sandbox enforcement exists on fast-sandbox
 - Provide a simplified Create that maps a well-defined subset of `CreateSandboxRequest` to fast-sandbox's gRPC `CreateSandbox`, and cleanly rejects unsupported fields
 - Demonstrate lower p50 and p95 user-visible creation latency than the `kubernetes` pool backend, measured from SDK create start until `Running` and the execd endpoint are usable under the same environment, cache state, workload, and concurrency; this OSEP sets no universal absolute-millisecond threshold
 - Provide flexible deployment: users can bring their own fast-sandbox or use OpenSandbox-provided charts
@@ -201,11 +202,16 @@ The key insight: **use K8s for what it's good at** (resource accounting, cluster
 ## Requirements
 
 - Must register as a new `SandboxService` under `config.runtime.type = "fleets"`; must not modify the `WorkloadProvider` contract
+- Must also implement `ExtensionService`, because OpenSandbox startup unconditionally requires it for renew-on-access behavior
+- Must map `fleets` to `NoopSnapshotRuntime` in `create_snapshot_runtime()` so the server can start while snapshot operations remain explicitly unsupported
 - Must not change the public lifecycle, execd, or egress API contracts or the SDKs
 - Simplified Create must reject unsupported fields with a clear, actionable error rather than silently ignoring them
-- Must resolve `get_endpoint(id, port)` for at least ports 44772 (execd) and 18080 (egress policy) and arbitrary user ports, via the ingress gateway
-- Per-sandbox egress must be enforced (not advisory) once `network_policy` is accepted; see [Construction Phases](#construction-phases) for the staged rollout within the first release
+- Must resolve `get_endpoint(id, port)` for port 44772 (execd) and arbitrary user ports via the ingress gateway; phase 1b additionally resolves port 18080 only after its policy-manager contract exists
+- Must extend the ingress provider/proxy contract to carry the requested port, complete upstream URL/path, upstream-only headers, and route expiry; adding only a provider is insufficient
+- Per-sandbox egress must be enforced (not advisory) once `network_policy` is accepted; phase 1a rejects it, and a separately gated phase 1b may accept it only after the cross-repository enforcement contract is implemented
 - Must handle status mapping between fast-sandbox and OpenSandbox states
+- Must preserve actual NotFound semantics: a missing fast-sandbox CRD maps to OpenSandbox HTTP 404, while a retained `Stopped`/expired CRD maps to `Terminated`
+- Must preserve OpenSandbox list semantics, including state filtering, page/pageSize, totalItems, totalPages, and hasNextPage, even though FastPath v2 exposes metadata filtering plus continue-token pagination
 - Must preserve tenant isolation: when `[tenants]` is configured, every namespaced Fast-Path call (create/get/list/update/delete/endpoint) must resolve the current tenant to a fast-sandbox namespace; otherwise `fleets` must **reject** tenant configuration (a shared/default namespace would leak other tenants' sandboxes through the namespace-only `ListSandboxes` and ID-based operations)
 - gRPC reachability from the OpenSandbox Server to the fast-sandbox Fast-Path Server is required
 
@@ -274,40 +280,42 @@ The three "reused" API areas reuse *different* things. Being precise here avoids
 
 | Area | What is reused | What must be built for `fleets` |
 | --- | --- | --- |
-| Lifecycle (get/delete/renew/list/metadata) | Public routes + `SandboxService` ABC remain unchanged | Map each method to fast-sandbox gRPC and add the missing read/delete semantics described below |
-| execd exec/file | `specs/execd-api.yaml` (client → in-sandbox execd:44772) is backend-agnostic | Run execd inside the sandbox; implement `get_endpoint(id, 44772)` |
-| egress `network_policy` | `NetworkPolicy` schema + `egress-api.yaml` `/policy` (client → egress proxy:18080) | Deliver + enforce policy per sandbox netns; implement `get_endpoint(id, 18080)` with auth header |
-| Endpoint resolution | `SandboxService.get_endpoint` → `Endpoint`; ingress-gateway routing is backend-neutral | Route fleets ports through the ingress gateway |
+| Lifecycle (get/delete/renew/list/metadata) | Public routes + `SandboxService` ABC remain unchanged | Map to FastPath v2; adapt OpenSandbox state/page pagination and error semantics |
+| execd exec/file | `specs/execd-api.yaml` (client → in-sandbox execd:44772) is backend-agnostic | Declare the Pool Infra Component `execd`; map public port 44772 to `component_name = "execd"` |
+| egress `network_policy` | `NetworkPolicy` schema + `egress-api.yaml` `/policy` (client → egress proxy:18080) | Phase 1b: deliver + enforce policy per sandbox netns and expose an authenticated, assignment-fenced policy route |
+| Endpoint resolution | `SandboxService.get_endpoint` → public stable `Endpoint` remains unchanged | Extend ingress lookup from host-only data to a complete FastPath upstream route |
 
 **Simplified Create.** The `fleets` Create is a subset of the full `CreateSandboxRequest`. The table below classifies every field as **kept** (mapped through), **downgraded** (accepted but semantics change), **staged** (contract kept, enforced in a later phase), or **rejected** (HTTP 400 with a clear message). The common thread among rejected fields is that they assume *1 sandbox = 1 dedicated K8s Pod* (own rootfs, node, volume set, netns), which does not hold in the shared-Fastlet model.
 
 | `CreateSandboxRequest` field | fleets | Mapping / reason |
 | --- | --- | --- |
-| `image.uri` | **kept** | → `CreateRequest.image` |
-| `entrypoint` | **kept** | → `command` (+ `args`) |
-| `env` | **kept** | → `envs` |
-| `timeout` | **kept** (see note) | → `expire_time_seconds`. `CreateRequest` has no expiry field today, so it is set via a follow-up `UpdateSandbox`; a failed update must not leave an immortal sandbox — the create **rolls back** (deletes the sandbox) on update failure. Target: add `expire_time_seconds` to `CreateRequest` (proto, ask-first) to make it atomic |
-| `metadata` | **kept** (see note) | → CRD user labels. `CreateRequest` has no labels field today, so initial labels share the post-create `UpdateSandbox` call and rollback rule; PATCH deletion requires an additive delete operation (see Lifecycle) |
-| `extensions.pool_ref` | **kept** | → `pool_ref` (else config default) |
+| `image.uri` | **kept, required** | → FastPath v2 `CreateRequest.image`. Unlike the existing BatchSandbox pool mode, a fast-sandbox `SandboxPool` does not define the workload image, so fleets rejects a request that omits it even when `extensions.poolRef` is set |
+| `entrypoint` | **kept, required** | → `command` / `args`. A fast-sandbox Pool defines Infra Components and resources, not the user process |
+| `env` | **kept** | → `envs`; null values are rejected because FastPath v2 uses `map<string,string>` |
+| `timeout` | **kept** | Convert the relative duration once to an absolute `expires_at_unix_seconds`; it is included in the first idempotent Create/CRD write and must be reused unchanged on retries |
+| `metadata` | **kept** | → FastPath v2 `metadata` in the first Create. Keys/values must satisfy the existing OpenSandbox/Kubernetes label validation |
+| `extensions.poolRef` | **kept** | Preserve the existing public camelCase key and translate it only inside the backend to FastPath `pool_ref` (else use `default_pool_ref`) |
+| `extensions["access.renew.extend.seconds"]` | **kept** | Persist under a fleets-reserved, DNS-safe FastPath metadata key, strip it from public metadata, and expose it through `ExtensionService.get_access_renew_extend_seconds()` |
+| Other `extensions` keys | **rejected unless explicitly supported** | Prevent silent loss of opaque or pod-specific options, including `bootstrap.execd.isolation` |
 | `resource_limits` | **downgraded** | fast-sandbox enforces the pool's immutable `sandboxResources`; the request value is validated for pool compatibility, not applied per-sandbox |
 | `network_policy` | **staged (1b)** | Contract kept; rejected in phase 1a, enforced per-slot netns in phase 1b (see [Egress / Network Policy](#egress--network-policy)) |
 | `secure_access` | **staged (1b)** | Naturally aligned: fast-sandbox already returns `required_headers` with a short-lived Ed25519 bearer per `ResolveEndpoint`. Server-issued access headers are layered on the gateway route by the fleets ingress adapter; deferred to 1b (see [Ingress / Endpoint Access](#ingress--endpoint-access)) |
 | `image.auth` | **rejected** | Private-registry credentials are not carried to fast-sandbox; an authenticated image is rejected rather than attempting an unauthenticated pull (future: map to a pool-level imagePullSecret) |
 | `snapshot_id` | **rejected** | No snapshot capability in fast-sandbox (explicit non-goal) |
 | `platform` | **rejected** | No per-sandbox node scheduling; scheduling is per Fastlet pool |
-| `resource_requests` | **rejected** | No K8s requests / Burstable QoS; resources are fixed by the pool profile |
+| `resource_requests` | **rejected** | No per-sandbox K8s requests / Burstable QoS; resources are fixed by `SandboxPool.spec.sandboxResources` |
 | `credential_proxy` | **rejected (all phases)** | Rides the per-pod egress mitmproxy sidecar, which has no place in the shared-Fastlet model. Rejected even after 1b accepts `network_policy`, so it is never silently ignored |
 | `volumes` | **rejected** | Fastlet child containers cannot receive dynamic PVC/CSI mounts |
 
-In short, `fleets` Create keeps the "**what to run**" fields (image / entrypoint / env) plus "**which pool, how long, what tags**" (pool_ref / timeout / metadata), and drops or stages the pod-level isolation / storage / snapshot / signed-network fields.
+In short, `fleets` Create keeps the "**what to run**" fields (image / entrypoint / env) plus "**which pool, how long, what tags**" (`poolRef` / timeout / metadata), and drops or stages the pod-level isolation / storage / snapshot / signed-network fields. The fast-sandbox v2 Create persists image, absolute expiry, metadata, Pool, command, environment, failure defaults, and assignment atomically in the initial CRD write; there is no follow-up Update or create rollback for these fields.
 
 ### Notes/Constraints/Caveats
 
 - The fast-sandbox control plane (Fast-Path Servers, Reconcilers, Sandbox Proxy) and Fastlet pools + NodeJanitor must be deployed separately (by the user or via OpenSandbox-provided Helm charts)
-- fast-sandbox uses its own CRD types (`Sandbox`, `SandboxPool`, group `sandbox.fast.io/v1alpha1`) - OpenSandbox does not manipulate these directly; missing lifecycle semantics are addressed through additive Fast-Path fields/operations rather than coupling the server to CRD internals
+- fast-sandbox uses its own CRD types (`Sandbox`, `SandboxPool`, group `sandbox.fast.io/v1alpha2`) - OpenSandbox does not manipulate these directly
 - gRPC communication requires network reachability from OpenSandbox Server to the fast-sandbox Fast-Path Server
 - execd is injected via fast-sandbox's **Infra Component** mechanism (see [execd Injection](#execd-injection)), not the K8s init-container copy used by the pod backend
-- Because all sandboxes in a Fastlet pod share that pod's K8s network identity (SNAT to one pod IP), **standard Kubernetes NetworkPolicy cannot express per-sandbox egress** for fleets; per-sandbox egress is enforced inside each sandbox's netns (see [Egress / Network Policy](#egress--network-policy))
+- Because all sandboxes in a Fastlet pod share that pod's K8s network identity (SNAT to one pod IP), **standard Kubernetes NetworkPolicy cannot express per-sandbox egress** for fleets; phase 1b must enforce it inside each sandbox's netns (see [Egress / Network Policy](#egress--network-policy))
 - **Tenant isolation** relies on fast-sandbox namespaces: `ListSandboxes` is namespace-only, so a shared namespace would expose tenants to each other. `FleetSandboxService` must map each OpenSandbox tenant to a distinct namespace on every call, or reject `[tenants]` configuration outright (phase 1a)
 
 ### Risks and Mitigations
@@ -315,14 +323,16 @@ In short, `fleets` Create keeps the "**what to run**" fields (image / entrypoint
 
 | Risk                                                                     | Mitigation                                                                                                                         |
 | ------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
-| Fast-Path Server becomes a single point of failure                       | Fast-Path Servers are multi-active; `FleetSandboxService` retries; optionally fall through to the declarative CRD create path      |
+| Fast-Path Server becomes a single point of failure                       | Fast-Path Servers are multi-active; retry only with the same sandbox ID and absolute expiry, then read the durable intent to disambiguate post-persistence failures |
 | gRPC API changes in fast-sandbox could break integration                 | Version pinning in deployment; compatibility matrix documentation                                                                  |
 | Network partition between OpenSandbox Server and fast-sandbox Fast-Path  | Configurable timeouts; health check endpoint integration                                                                           |
 | State drift if sandboxes are managed outside OpenSandbox                 | OpenSandbox tracks sandbox IDs; periodic state reconciliation via gRPC GetSandbox                                                  |
+| FastPath pagination does not match OpenSandbox page/total semantics       | Phase 1a follows FastPath continue tokens to exhaustion, maps/filter states, then computes the requested page and totals; optimize only with a later indexed API |
+| FastPath v2 `GetSandbox` does not normalize Kubernetes NotFound at `aac0c2c` | Fix the upstream handler to return gRPC `codes.NotFound`; the fleets adapter maps only that code to HTTP 404 |
 | "Reusing egress" misread as reusing a server API, underestimating cost  | This OSEP states explicitly that egress enforcement is bespoke; only the HTTP contract + endpoint/token plumbing are reused        |
 | Carrying `network_policy` needs a proto/CRD change on fast-sandbox       | Additive, backward-compatible field; gated behind an "ask first" review with fast-sandbox maintainers                             |
-| gVisor/Kata do not honor host-netns egress rules                         | Phase 1 restricts `network_policy` to the `container` (runc) runtime; reject egress on gVisor/Kata                                 |
-| Orphaned sandboxes on Fastlet/node loss                                  | fast-sandbox NodeJanitor + `AutoRecreate` failure policy (note: not state-preserving)                                             |
+| gVisor/Kata do not honor host-netns egress rules                         | Phase 1b restricts `network_policy` to the `container` (runc) runtime; reject egress on gVisor/Kata                                |
+| Orphaned sandboxes on Fastlet/node loss                                  | fast-sandbox NodeJanitor performs fenced cleanup; the phase-1a backend keeps FastPath's default `MANUAL` failure policy             |
 | Users expect volumes/snapshot on fleets                                  | Simplified Create rejects them with a clear message pointing to the `kubernetes` backend                                          |
 
 ## Design Details
@@ -465,11 +475,11 @@ fast-sandbox defines two CRDs:
 
 ```yaml
 # SandboxPool - manages Fastlet Pod lifecycle (fields illustrative; see fast-sandbox CRD)
-apiVersion: sandbox.fast.io/v1alpha1
+apiVersion: sandbox.fast.io/v1alpha2
 kind: SandboxPool
 metadata:
   name: default-pool
-  namespace: default
+  namespace: fast-sandbox
 spec:
   capacity:
     poolMin: 2
@@ -482,7 +492,28 @@ spec:
     cpu: "500m"
     memory: "512Mi"
     pids: 256
-  infraProfile: opensandbox-execd-quickstart   # injects execd on 44772
+  infraComponents:
+    - name: execd
+      artifact:
+        source:
+          image:
+            reference: ghcr.io/opensandbox/execd@sha256:<digest>
+        mappings:
+          - sourcePath: /execd
+            targetPath: /.fast/components/execd/execd
+      process:
+        command:
+          - /.fast/components/execd/execd
+          - --port
+          - "44772"
+        restartPolicy: OnFailure
+        healthCheck:
+          httpGet:
+            path: /ping
+          timeoutSeconds: 10
+      endpoint:
+        protocol: HTTP
+        port: 44772
   warmImages:                      # asynchronously pre-pulled, protected from cache GC
     - python:3.11
   fastletTemplate:
@@ -500,22 +531,29 @@ spec:
 
 ---
 # Sandbox - durable intent + audit trail (created by the Fast-Path or declaratively)
-apiVersion: sandbox.fast.io/v1alpha1
+apiVersion: sandbox.fast.io/v1alpha2
 kind: Sandbox
 metadata:
   name: my-sandbox                 # = request_id (OpenSandbox sandbox_id)
-  namespace: default
+  namespace: fast-sandbox
   labels:
     sandbox.fast.io/created-by: fastpath
+    metadata.sandbox.fast.io/team: agents
 spec:
   image: python:3.11
   poolRef: default-pool
   command: ["python", "-m", "http.server", "8000"]
-  failurePolicy: AutoRecreate         # or "Manual"
+  expireTime: "2026-07-30T12:00:00Z"
+  failurePolicy: Manual               # FastPath v2 default; AutoRecreate is available upstream
   recoveryTimeoutSeconds: 60
 status:
   runtimeState: Ready               # ObservedState: Pending/Creating/Ready/Draining/Stopped/Failed/Unavailable
   dataPlaneState: Ready
+  components:
+    - name: execd
+      state: Ready
+      protocol: HTTP
+      port: 44772
   assignment:
     fastletName: fast-sandbox-fastlet-node-1
     fastletPodUID: ...
@@ -543,7 +581,7 @@ kata-clh    → containerd Kata shim (Cloud Hypervisor)
 
 The runtime is a `SandboxPool` field (immutable per pool), so OpenSandbox selects isolation level by targeting a pool, without changing the integration layer.
 
-> **Caveat for egress**: gVisor and Kata run their network stack in a user-space kernel / guest VM, so host-netns iptables rules do not reliably filter their egress. Phase 1 restricts per-sandbox `network_policy` to the `container` (runc) runtime (see [Egress / Network Policy](#egress--network-policy)).
+> **Caveat for egress**: gVisor and Kata run their network stack in a user-space kernel / guest VM, so host-netns iptables rules do not reliably filter their egress. Phase 1b restricts per-sandbox `network_policy` to the `container` (runc) runtime unless another runtime is separately proven (see [Egress / Network Policy](#egress--network-policy)).
 
 #### NodeJanitor: Orphan Cleanup
 
@@ -580,10 +618,16 @@ class FleetsRuntimeConfig(BaseModel):
     )
     default_pool_ref: str = Field(
         default="default-pool",
-        description="Default SandboxPool when extensions.pool_ref is unset.",
+        description="Default SandboxPool when extensions.poolRef is unset.",
     )
-    execd_port: int = Field(default=44772, description="execd port inside the sandbox.")
-    egress_port: int = Field(default=18080, description="egress policy port inside the sandbox.")
+    execd_component_name: str = Field(
+        default="execd",
+        description="Pool Infra Component used for public execd port 44772.",
+    )
+    endpoint_access_mode: Literal["central_proxy", "direct_fastlet_proxy"] = Field(
+        default="central_proxy",
+        description="FastPath v2 endpoint mode used by the trusted ingress.",
+    )
     require_ingress_gateway: bool = Field(
         default=True,
         description="fleets resolves endpoints via the ingress gateway only.",
@@ -602,13 +646,12 @@ api_key = "your-secret-key"
 
 [runtime]
 type = "fleets"
-execd_image = "opensandbox/execd:v1.0.21"
 
 [fleets]
-fastpath_endpoint = "fast-sandbox-fastpath.opensandbox.svc:9090"
+fastpath_endpoint = "fast-sandbox-fastpath.fast-sandbox-system.svc:9090"
 default_pool_ref = "default-pool"
-execd_port = 44772
-egress_port = 18080
+execd_component_name = "execd"
+endpoint_access_mode = "central_proxy"
 require_ingress_gateway = true
 ```
 
@@ -617,11 +660,13 @@ require_ingress_gateway = true
 ```
 server/opensandbox_server/services/fleets/
 ├── __init__.py
-├── fleet_service.py         # New: FleetSandboxService(SandboxService)
-├── fastpath_client.py       # New: gRPC client wrapper for fast-sandbox FastPathService
-├── create_mapping.py        # New: CreateSandboxRequest subset → CreateRequest; field rejection
+├── fleet_service.py         # New: FleetSandboxService(SandboxService, ExtensionService)
+├── fastpath_client.py       # New: gRPC client wrapper for fast-sandbox FastPathService v2
+├── create_mapping.py        # New: CreateSandboxRequest subset → v2 CreateRequest; field rejection
 └── status_mapping.py        # New: fast-sandbox Sandbox status → OpenSandbox states
 # Modified: server/opensandbox_server/services/factory.py (register "fleets")
+# Modified: server/opensandbox_server/services/snapshot_runtime_factory.py (fleets → NoopSnapshotRuntime)
+# Modified: components/ingress provider/proxy contract + fleets provider
 ```
 
 ### API Mapping
@@ -629,15 +674,16 @@ server/opensandbox_server/services/fleets/
 
 | OpenSandbox API (`SandboxService`)      | fast-sandbox gRPC                    | Notes                                          |
 | --------------------------------------- | ------------------------------------ | ---------------------------------------------- |
-| `POST /sandboxes` (simplified)          | `CreateSandbox`                      | Returns `{uid, name, fastlet_pod}`, no endpoints |
-| `GET /sandboxes/{id}`                   | `GetSandbox`                         | Requires labels + expiry in `SandboxInfo` (see below) |
-| `GET /sandboxes` (list)                 | `ListSandboxes`                      | Requires label filtering and labels/expiry in items |
-| `DELETE /sandboxes/{id}`                | `DeleteSandbox`                      | Async (finalizer); caller polls for NotFound   |
-| `POST /sandboxes/{id}/renew-expiration` | `UpdateSandbox` (expire_time_seconds)| Reconciler-enforced                            |
-| `PATCH /sandboxes/{id}/metadata`        | `UpdateSandbox` (labels + delete keys)| Requires explicit delete semantics for RFC 7396 |
-| `GET /sandboxes/{id}/endpoints/{port}`  | `ResolveEndpoint`                    | Returns proxy URL + `Authorization` header     |
+| `POST /sandboxes` (simplified)          | v2 `CreateSandbox`, then `WaitSandboxReady(data_plane=true)` | Initial expiry/metadata are atomic. If the bounded readiness wait expires, return the accepted sandbox as `Pending`; do not delete durable intent |
+| `GET /sandboxes/{id}`                   | v2 `GetSandbox`                      | `SandboxInfo` already includes metadata + expiry. gRPC NotFound maps to HTTP 404 |
+| `GET /sandboxes` (list)                 | v2 `ListSandboxes`                   | Follow continue tokens, then apply OpenSandbox state filtering and page/total response semantics |
+| `DELETE /sandboxes/{id}`                | `GetSandbox` + v2 `DeleteSandbox`    | Preflight preserves public 404; accepted delete remains async/finalizer-driven |
+| `POST /sandboxes/{id}/renew-expiration` | v2 `UpdateSandbox(expires_at_unix_seconds)` | Absolute expiry is persisted in the CRD |
+| `PATCH /sandboxes/{id}/metadata`        | v2 `UpdateSandbox(metadata_upsert, metadata_delete_keys)` | Direct RFC 7396 mapping without read-modify-write |
+| `GET /sandboxes/{id}/endpoints/{port}`  | v2 `ResolveEndpoint`                 | 44772 maps to component `execd`; other user ports use raw-port targets; route auth uses `X-Fast-Sandbox-Route-Credential` |
 | diagnostics (logs/inspect/events)       | `GetSandboxDiagnostics`              | Lifecycle events only; no process stdout/stderr |
-| `pause` / `resume` / snapshot           | (unsupported)                        | Clear "unsupported on fleets" error            |
+| `pause` / `resume`                      | (unsupported)                        | Clear "unsupported on fleets" error |
+| snapshot API                            | OpenSandbox `NoopSnapshotRuntime`     | Server starts successfully; snapshot operations return the existing unsupported/no-op result |
 
 ### Request Parameter Mapping
 
@@ -648,10 +694,10 @@ server/opensandbox_server/services/fleets/
     "entrypoint": ["python", "-m", "http.server"],  # → command (+ args)
     "env": {"PYTHONUNBUFFERED": "1"},              # → envs
     "resource_limits": {"cpu": "500m"},            # → validated against SandboxPool profile
-    "timeout": 3600,                              # → post-create UpdateSandbox expire_time_seconds
+    "timeout": 3600,                              # → one absolute expires_at_unix_seconds in Create
     "network_policy": {...},                       # → new additive CreateRequest field (phase 1b)
-    "metadata": {...},                             # → labels in the same post-create UpdateSandbox
-    "extensions": {"pool_ref": "default-pool"},    # → pool_ref (else config default)
+    "metadata": {...},                             # → CreateRequest.metadata
+    "extensions": {"poolRef": "default-pool"},     # public key → FastPath pool_ref
     # request_id (idempotency key + Sandbox CRD name) = OpenSandbox sandbox_id
 }
 # Rejected (HTTP 400): volumes, platform, resource_requests, credential_proxy, snapshot_id, image.auth
@@ -666,23 +712,26 @@ server/opensandbox_server/services/fleets/
 | RuntimeState Ready + DataPlaneState Ready           | Running           |
 | Pending / Creating                                  | Pending           |
 | Draining (delete in progress)                       | Stopping          |
-| Stopped / Expired (reconciler-stopped, CRD retained)| Terminated        |
+| Stopped with `RuntimeReady=False, reason=Expired` (CRD retained) | Terminated |
+| Stopped (CRD retained)                              | Terminated        |
 | Failed / Unavailable                                | Failed            |
-| (deleted / NotFound)                                | Terminated        |
+| Actual missing CRD / gRPC `codes.NotFound`          | HTTP 404 (no synthetic Sandbox object) |
 
 fast-sandbox splits `RuntimeReady` (runtime up) from `DataPlaneReady` (route + Infra published). OpenSandbox reports **Running only when both are Ready**, matching the existing "endpoint usable" expectation.
 
-> **Important**: On expiry, fast-sandbox's reconciler sets `Stopped/Expired` and **does not delete the CRD**. This state **must** map to `Terminated` so expiration polling reaches a terminal state instead of stalling on an unknown value; `Draining` maps to `Stopping`.
+> **Important**: On expiry, fast-sandbox's reconciler sets `runtimeState=Stopped` and a `RuntimeReady=False, reason=Expired` Condition while retaining the CRD. That retained object maps to `Terminated`; it is distinct from an actual missing CRD, which maps to HTTP 404. `Draining` maps to `Stopping`.
 
 ### Extensions Field Support
 
 The `extensions` field in `CreateSandboxRequest` supports fleets-specific options:
 
 
-| Extension Key    | Type                       | Description                                  |
-| ---------------- | -------------------------- | -------------------------------------------- |
-| `pool_ref`       | string                     | Target SandboxPool name (overrides default)  |
-| `failure_policy` | "manual" \| "auto_recreate"| fast-sandbox failure recovery policy         |
+| Extension Key | Type | Description |
+| --- | --- | --- |
+| `poolRef` | string | Existing OpenSandbox key; selects the fast-sandbox `SandboxPool` and is translated internally to `pool_ref` |
+| `access.renew.extend.seconds` | decimal string | Existing renew-on-access setting; persisted durably under a fleets-reserved metadata key and served through `ExtensionService` |
+
+All other extension keys are rejected in phase 1a instead of being silently ignored. Fast-sandbox `failure_policy` is not exposed as a new OpenSandbox extension; the backend uses FastPath v2's default `MANUAL` policy and 60-second recovery timeout.
 
 ## Integration Conditions & Feasibility
 
@@ -690,129 +739,152 @@ This section records, per integration area, whether fast-sandbox **today** provi
 
 ### Lifecycle integration
 
-**Verdict: CONDITIONAL.** The current gRPC surface covers the operation names but lacks response fields and update semantics required by the existing OpenSandbox lifecycle contract. Phase 1a therefore depends on the additive Fast-Path extensions below (ask-first review with fast-sandbox maintainers).
+**Verdict: READY at the FastPath v2 field/operation layer; CONDITIONAL at the OpenSandbox adapter layer.** fast-sandbox master `aac0c2c` implements the previously missing expiry, metadata, filtering, deletion, readiness, and endpoint fields. Phase 1a no longer requires those additive lifecycle fields, but it must adapt errors, pagination, extensions, and asynchronous readiness correctly.
 
 The gRPC `FastPathService` (`CreateSandbox` / `GetSandbox` / `ListSandboxes` / `DeleteSandbox` / `UpdateSandbox` / `GetSandboxDiagnostics`) covers the `SandboxService` lifecycle surface, but the semantics differ from the pod backend:
 
 | Method | Condition today | Plan |
 | --- | --- | --- |
-| Create | Idempotent by `request_id` (= Sandbox CRD name); returns at `RuntimeReady` | Use OpenSandbox `sandbox_id` as `request_id` |
-| Get | Reports 3 `ObservedState` strings; **no labels / expiry in payload** | Add labels + expiry to `SandboxInfo`, then map the complete lifecycle response in `status_mapping.py` |
-| Renew-expiration | `UpdateSandbox(expire_time_seconds)` persists expiry in the CRD; reconciler marks an expired sandbox `Stopped/Expired` without deleting the CRD | Expose the persisted expiry in `SandboxInfo`; treat enforcement as eventual and map `Stopped/Expired → Terminated` |
-| Metadata | `UpdateSandbox(labels)` **merges** labels — it cannot delete a key | Add explicit user-label delete keys (or replace semantics) to `UpdateRequest`; reject changes to reserved system labels |
-| Delete | **Async** (finalizer-driven teardown); NotFound = success | Treat delete as async; poll for NotFound |
+| Create | Idempotent by `request_id`; v2 Create includes absolute expiry + metadata in the first CRD write and returns at `RuntimeReady` | Use OpenSandbox `sandbox_id` as `request_id`; reuse the same absolute expiry on retry; wait for `DataPlaneReady` separately |
+| Get | `SandboxInfo` returns metadata, expiry, image, pool, states, assignment and component data | Map the complete lifecycle response; normalize missing CRD to HTTP 404 |
+| Renew-expiration | `UpdateSandbox(expires_at_unix_seconds)` persists absolute expiry; expiry becomes retained `Stopped` + `reason=Expired` | Map the retained object to `Terminated` |
+| Metadata | `metadata_upsert` + `metadata_delete_keys` are implemented | Split RFC 7396 non-null/null entries directly; protect both OpenSandbox and fast-sandbox reserved keys |
+| Delete | **Async** (finalizer-driven teardown); FastPath Delete itself is idempotent for NotFound | Preflight Get for the public DELETE 404 contract, then submit delete and poll Get until 404 |
 | Diagnostics | `GetSandboxDiagnostics` returns **lifecycle events only, not stdout/stderr** | Back `inspect`/`events`; command output flows through execd, not this RPC |
-| List | **Namespace-only, no label selector; `SandboxInfo` omits labels / expiry** | Add a label selector to `ListRequest` and return the extended `SandboxInfo` |
+| List | Namespace + metadata AND-filter + continue token; items include metadata/expiry | Follow all bounded pages, map/filter OpenSandbox states, then compute page/pageSize/totalItems/totalPages |
 
 **Gaps and feasibility:**
 
-1. **Lifecycle read/list fields** — Add `labels` and an optional expiry to `SandboxInfo`, plus a label selector to `ListRequest`. The values come from the durable Sandbox CRD, so get/list continue to work after an OpenSandbox server restart; an in-memory server-side mapping is not sufficient.
-2. **RFC 7396 metadata deletion** — Add explicit delete keys (for example, `repeated string delete_labels`) or full replace semantics to `UpdateRequest`. Omitting a key from the existing merge-only `labels` map does not delete it. The implementation must preserve fast-sandbox-owned labels and reject attempts to update/delete reserved keys.
-3. **Sandbox logs (`get_sandbox_logs`) not implementable via execd** — `specs/execd-api.yaml` only exposes `/command/{id}/logs` for a known detached command ID; it has no endpoint for the sandbox entrypoint or an arbitrary container. The lifecycle diagnostics route has no command ID. *Plan (phase 1)*: `get_sandbox_logs` returns a clear **"unsupported on fleets"** error; `inspect`/`events` are backed by `GetSandboxDiagnostics` (lifecycle events only). A Fastlet/containerd log API or a backend extension is a future item, not a phase-1 claim.
-4. **Delete/expiry are eventual, not synchronous** — *Plan*: `FleetSandboxService` models both as async and preserves the lifecycle contract's poll-for-state semantics via status mapping (`Stopped/Expired → Terminated`, `Draining → Stopping`).
+1. **OpenSandbox list contract** — FastPath's continue-token pagination cannot directly return OpenSandbox's page number and total counts, and FastPath does not filter mapped OpenSandbox states. The phase-1 adapter follows FastPath pages to exhaustion, applies state mapping/filtering, then produces the requested page and totals. This is correct but O(total); a future indexed FastPath API may optimize it without changing the public OpenSandbox route.
+2. **NotFound normalization** — At `aac0c2c`, `GetSandbox` returns the raw Kubernetes Get error instead of passing it through `grpcKubernetesError`, unlike other v2 handlers. fast-sandbox must normalize this to gRPC `codes.NotFound`; the OpenSandbox adapter must not infer NotFound from error strings.
+3. **ExtensionService durability** — Store `access.renew.extend.seconds` under a reserved DNS-safe FastPath metadata key, remove that internal key from public metadata/list filters, and implement `get_access_renew_extend_seconds()` by reading it from FastPath. This survives OpenSandbox restarts without adding server-memory state.
+4. **Post-persistence Create failures** — FastPath may return an error after durable intent exists. On an ambiguous Create error, the adapter reads the same namespaced sandbox ID: if found, it returns an accepted `Pending` response and lets reconciliation continue; if absent, it maps the original error. It never retries with a new ID or a recomputed expiry.
+5. **Sandbox logs (`get_sandbox_logs`) not implementable via execd** — `specs/execd-api.yaml` only exposes `/command/{id}/logs` for a known detached command ID; it has no endpoint for the sandbox entrypoint or an arbitrary container. The lifecycle diagnostics route has no command ID. *Plan (phase 1)*: `get_sandbox_logs` returns a clear **"unsupported on fleets"** error; `inspect`/`events` are backed by `GetSandboxDiagnostics` (lifecycle events only). A Fastlet/containerd log API or a backend extension is a future item, not a phase-1 claim.
+6. **Delete/expiry are eventual, not synchronous** — `FleetSandboxService` preserves poll-for-state semantics via status mapping (`Stopped` with expired reason → `Terminated`, `Draining → Stopping`, actual NotFound → HTTP 404).
 
 ### execd Injection
 
-**Verdict: READY for development, config-only for production.**
+**Verdict: READY, Pool configuration required.**
 
-fast-sandbox has a real, tested **Infra Component** mechanism, and it ships two execd profiles selectable via `SandboxPool.spec.infraProfile`:
+fast-sandbox v1alpha2 replaces the old named `infraProfile` catalog with inline, immutable `SandboxPool.spec.infraComponents[]`. The canonical sample declares a component named `execd` with:
 
-- `opensandbox-execd-quickstart` — `Configured: true`, runnable today. The execd binary (pinned digest, "OpenSandbox Execd v1.0.21") is **baked into the Fastlet image** at build time and supervised inside the sandbox by `sandbox-init` (activation `EntrypointSupervisor`). Service on **port 44772, HTTP, readiness `GET /ping`**. Credential `EXECD_ACCESS_TOKEN` → upstream header `X-EXECD-ACCESS-TOKEN` is injected on the upstream hop only. An e2e test creates a sandbox with this profile and actually runs `opensandbox exec` + file upload/stat/read/download through the official OpenSandbox Go SDK.
-- `opensandbox-execd` (production) — deliberately `Configured: false` (placeholder OCI ref + zero digest); the injection mechanism is complete, only the supply-chain binding is missing.
+- an OCI artifact reference pinned by `@sha256:`;
+- `/execd` mapped read-only to `/.fast/components/execd/execd`;
+- a supervised process on port 44772;
+- readiness `GET /ping`;
+- one named HTTP endpoint.
+
+Fastlet prepares the artifact revision before admission, `sandbox-init` starts execd and the user process concurrently, and Fastlet Proxy publishes the named route only after the health check passes. The official OpenSandbox Go SDK exec/file flow is exercised by fast-sandbox's integration tests.
 
 **What OpenSandbox must provide:**
 
-1. **Quick path (phase 1a)**: nothing new — set `SandboxPool.spec.infraProfile = "opensandbox-execd-quickstart"`; execd is already in the Fastlet image.
-2. **Production**: bind the `opensandbox-execd` profile with a real immutable OCI reference + valid sha256 digest and configure an `OCIArtifactOpener`. This is **profile registration + supply-chain binding (data/config), no code change to the injection mechanism**.
+1. Provide or reference a `SandboxPool` whose current Infra revision contains the named `execd` component.
+2. Pin the production execd artifact by immutable OCI digest and configure namespace-scoped fast-sandbox Registry credentials when the artifact is private.
+3. Map public OpenSandbox port 44772 to FastPath v2 `component_name = "execd"`; raw-port resolution of 44772 is deliberately rejected because component ports are reserved.
 
-Readiness contract: `RuntimeReady` (Create returns) is distinct from `DataPlaneReady` (execd probed ready AND route published). OpenSandbox reports Running only at `DataPlaneReady`.
+Execd is started **without** `EXECD_ACCESS_TOKEN`; neither gateway injects `X-EXECD-ACCESS-TOKEN`. Fast Sandbox protects its upstream hop with `X-Fast-Sandbox-Route-Credential`, OpenSandbox independently protects its public gateway, and application `Authorization` is preserved.
+
+Readiness contract: `RuntimeReady` (FastPath Create returns) is distinct from `ComponentReady("execd")` and `DataPlaneReady` (all Pool-declared components ready). OpenSandbox reports Running only at `DataPlaneReady`.
 
 ### Ingress / Endpoint Access
 
-**Verdict: FEASIBLE, but requires a new fleets-aware ingress adapter.** `get_endpoint` resolves through fast-sandbox `ResolveEndpoint`, but the *existing* ingress component cannot consume the result as-is.
+**Verdict: FEASIBLE, but requires a target-aware ingress provider/proxy contract, not only a fleets provider.** `get_endpoint` resolves through FastPath v2 `ResolveEndpoint`, but the existing ingress component cannot consume the result as-is.
 
-`ResolveEndpoint` returns `proxy_endpoint` (`SandboxProxyBaseURL` + `/v1/sandboxes/{uid}/ports/{port}`), `required_headers` (`{"Authorization": "Bearer <ed25519-credential>"}`), `route_generation`, and `expires_at_unix_seconds`. fast-sandbox's own `pkg/sandboxclient` shows the "resolve on behalf of a caller, hand back endpoint + headers" pattern, so an intermediary is a first-class supported caller.
+FastPath v2 accepts a `SandboxReference` by namespace/name or UID and an `EndpointTarget` by component name or raw port. It returns the resolved protocol/port, a complete `proxy_endpoint`, `required_headers` containing `X-Fast-Sandbox-Route-Credential`, `route_generation`, and credential expiry. Component routes use `/v2/sandboxes/{uid}/components/{name}`; raw ports use `/v2/sandboxes/{uid}/ports/{port}`.
 
-**Why the current ingress component cannot be reused unchanged**: `components/ingress` supports only BatchSandbox / AgentSandbox providers, and its `EndpointInfo` carries only a host + secure-access token while the proxy appends `:{port}` itself. It therefore **cannot** consume the path-bearing `ResolveEndpoint` URL (`/v1/sandboxes/{uid}/ports/{port}`) nor inject the required `Authorization` header. Without changes, the phase-1a SDK flow would hit failed/unauthorized upstreams.
+**Why the current ingress component cannot be reused unchanged**: `components/ingress` supports only BatchSandbox / AgentSandbox providers; `Provider.GetEndpoint(sandboxId)` receives no port; `EndpointInfo` carries only a host + secure-access token; and `resolveRealHost` always constructs `endpoint:port`. That contract cannot carry a scheme, path, upstream-only header, or expiry, so it cannot represent either FastPath v2 route form.
 
 **The fleets ingress adapter (phase 1a work item)**:
 
-- Add a **fleets provider** to the ingress component that resolves a sandbox → fast-sandbox Sandbox Proxy route (path form `/v1/sandboxes/{uid}/ports/{port}`) and **injects the `Authorization` bearer** on the upstream hop.
-- The gateway exposes a **stable, backend-neutral URL** to the SDK (keyed on `sandbox_id + port`); it holds and **refreshes the ephemeral fast-sandbox credential internally** on expiry / reassignment. This keeps the SDK contract unchanged (no SDK changes) while satisfying fast-sandbox's short-lived credential model — the SDK always calls the same gateway URL and never sees the rotating bearer.
+- Change the provider lookup to receive the requested target: conceptually `ResolveEndpoint(ctx, sandboxID, port)`, not `GetEndpoint(sandboxID)`.
+- Extend `EndpointInfo` to carry the complete upstream route: scheme + authority + base path, upstream-only headers, route expiry, plus the existing OpenSandbox public secure-access metadata.
+- Stop unconditionally building `endpoint:port`. Join the incoming suffix and query onto the provider's base path, preserve HTTP/SSE/WebSocket/file streaming, remove caller-supplied values for reserved upstream headers, and inject `X-Fast-Sandbox-Route-Credential` only on the upstream hop.
+- Add the **fleets provider** on top of that contract. For port 44772 it requests `component_name="execd"`; for ordinary user ports it requests a raw-port target. It selects `CENTRAL_PROXY` by default, or `DIRECT_FASTLET_PROXY` only when the ingress can reach Fastlet Pod IPs and NetworkPolicy restricts that path.
+- Expose a **stable, backend-neutral URL** to the SDK keyed on tenant namespace + `sandbox_id + port`. Cache the FastPath route only until before its expiry; refresh on expiry, reassignment, Pod failure, or a route-stale response. Do not blindly replay a non-idempotent or streaming request after refresh.
 
 **Integration facts to design around:**
 
-1. **ID mapping** — `ResolveEndpoint` requires the **K8s CRD UID**, not a name. OpenSandbox's `sandbox_id` is used as `request_id` at create (becomes CRD `name`); the server must resolve `name → uid` (via `GetSandbox`, or persist `sandbox_id → uid`). There is no resolve-by-name on `ResolveEndpoint`.
-2. **Ephemeral, instance-fenced credentials** — the bearer is short-lived and fenced on `uid + port + FastletPodUID + AssignmentAttempt + RouteGeneration`. The **ingress adapter** (not the SDK) re-resolves (or `IssueRouteCredential`) on expiry and after any reset/reassignment, behind the stable gateway URL. This is what preserves the "no SDK changes" claim; a design that handed the raw bearer to the SDK would require SDK-side refresh and break that claim.
+1. **No server-side UID cache is required** — FastPath v2 accepts `namespaced_name`; OpenSandbox uses its stable sandbox ID as the CRD name and supplies the tenant-resolved namespace on every lookup.
+2. **Ephemeral, instance-fenced credentials** — the route credential is short-lived and fenced on the Sandbox/assignment/route identity plus the component or raw port target. The **ingress adapter** (not the SDK) re-resolves behind the stable gateway URL.
 3. **HTTP only** — the transparent proxy supports HTTP/SSE/WebSocket-over-HTTP; raw TCP is not supported. (execd:44772 and egress:18080 are HTTP, so this is fine.)
-4. **Route path scheme** — fast-sandbox uses `/v1/sandboxes/{uid}/ports/{port}/...`, deterministic from uid+port; the adapter constructs it.
-5. **Any port resolvable** — `ResolveEndpoint` accepts any 1–65535 port with no declared-port allowlist, so 44772, 18080, and user ports all work; OpenSandbox knows the well-known ports out-of-band.
+4. **Application authentication is separate** — Fast Sandbox does not consume `Authorization`; OpenSandbox removes its own public secure-access proof, Fastlet Proxy removes `X-Fast-Sandbox-Route-Credential`, and the application header survives.
+5. **Component ports are reserved** — a raw request for 44772 fails when the Pool declares `execd`; the adapter must resolve the logical name. Other 1–65535 ports are raw HTTP targets unless reserved by another component.
 
 ### Egress / Network Policy
 
-**Verdict: FEASIBLE for runc; requires a self-contained new enforcement layer (phase 1b). NOT a reuse of Kubernetes NetworkPolicy.**
+**Verdict: NOT READY on current master; technically feasible for runc only after a separately reviewed phase 1b. It is not a reuse of Kubernetes NetworkPolicy.**
 
-fast-sandbox today programs only NAT `MASQUERADE` + sibling `REJECT` — it has **no** FQDN filtering, DNS interception, nftables policy, or per-sandbox ACL. But each sandbox owns its own netns, which is the hook.
+fast-sandbox `aac0c2c` programs only NAT `MASQUERADE` plus sibling `REJECT`. FastPath v2, the v1alpha2 `Sandbox` CRD, the Fastlet protocol, and `Slot` do **not** carry a network policy. There is also no FQDN filtering, DNS interception, nftables policy manager, or authenticated runtime policy endpoint. Therefore phase 1a rejects both create-time `network_policy` and runtime `/policy` mutation.
 
-- **Injection point**: `internal/fastlet/network/linux_driver.go` — the per-slot netns `OUTPUT` chain where the existing gateway-ACCEPT / sibling-REJECT rules are applied (`ip netns exec <slot> iptables ...`). The `components/egress` nftables + DNS-interception logic (default-drop OUTPUT, DNS-learned `allowed_ips` set, FQDN/CIDR rules) is ported to run **per slot netns** instead of as a pod sidecar.
-- **Timing blocker (must be handled)**: slots are **pre-warmed with no owner** and `Prepare()` runs before the sandbox identity exists. A per-sandbox policy therefore **cannot** be applied in `Prepare()`; it needs a new "apply on bind" driver step invoked from `Acquire` (when the owner/policy is known), or pre-warm disabled for policy-bearing sandboxes.
-- **Policy delivery (additive contract change, ask-first)**: `network_policy` must flow Create → gRPC `CreateRequest` (new field) → `Sandbox` CRD `SandboxSpec` (new field) → Fastlet protocol `SandboxSpec` → bound to the `Slot`. None of these carry a policy field today; the additions are backward-compatible but touch a public proto/CRD, so they require review with fast-sandbox maintainers.
-- **Runtime restriction (evidence-justified)**: the runtime driver attaches the netns uniformly for runc/gVisor/Kata with no per-runtime network compensation, and Kata translates the interface into a guest NIC (its own stack). In-netns `OUTPUT` iptables therefore reliably filter **runc** only. Phase 1 restricts `network_policy` to the `container` runtime and rejects egress on gVisor/Kata.
-- **Runtime `/policy` API**: a small per-slot policy endpoint on 18080 reachable via the gateway serves `egress-api.yaml` GET/PATCH/DELETE, or maps onto a fast-sandbox control-plane call.
-- **Janitor**: in-netns rules are reaped for free by netns deletion (no janitor change); any out-of-netns state (e.g. a host-side DNS proxy or ipset) would need NodeJanitor awareness.
-- **DNS**: no DNS proxy exists (each slot copies `resolv.conf`). FQDN policy requires a net-new per-netns DNS listener + a `resolv.conf` pointing at it.
+A viable phase-1b design has these prerequisites:
+
+- **Policy delivery (public, additive change)**: carry `network_policy` through FastPath v2 `CreateRequest` → v1alpha2 `SandboxSpec` → Fastlet protocol `SandboxSpec` → the bound `Slot`. Because this changes a public proto and CRD, it requires explicit fast-sandbox maintainer review and generated-output updates.
+- **Bind-time enforcement**: slots are pre-warmed before an owner or policy is known, so policy cannot be installed in `Prepare()`. Add a fail-closed `ApplyPolicy` step after `Acquire` has bound the owner and before the runtime network is released to the workload. A partial install must roll back the slot or make it unavailable.
+- **Per-netns enforcement**: for runc, install default-drop OUTPUT rules, CIDR rules, and DNS-learned allow sets inside the slot netns. Netns deletion naturally removes in-netns rules; any host-side DNS or set state must be keyed by assignment identity and reaped by NodeJanitor.
+- **DNS mediation**: each slot currently copies the host `resolv.conf`. FQDN policy requires a new per-sandbox DNS listener and a sandbox `resolv.conf` that points to it, with bounded TTL and stale-entry behavior defined.
+- **Runtime restriction**: the current network driver provides sufficient evidence only for runc. Kata moves the interface into a guest network stack, and gVisor behavior needs separate validation. Phase 1b must reject policy on unsupported runtimes.
+- **Authenticated runtime mutation**: an unprivileged inline Infra Component cannot mutate its host netns merely by listening on port 18080. The preferred design is a Fastlet-owned policy manager with an authenticated, assignment-fenced per-sandbox facade routed through the gateway. Its authorization, optimistic concurrency, PATCH/DELETE semantics, restart recovery, and cleanup must be specified before exposing OpenSandbox's `/policy` API. A privileged in-sandbox component is not assumed by this OSEP.
+
+Until that control contract exists, the ingress adapter is required to support execd and ordinary user ports only. Port 18080 becomes mandatory only in phase 1b.
 
 ## Construction Phases
 
-Both phases are part of the first release. The split exists so the cross-repo network work (1b) does not block end-to-end validation of the service seam (1a). In phase 1a, `network_policy` is **rejected** (not silently ignored), so the backend never claims an enforcement it does not have.
+Phase 1a is the initial `fleets` release. Phase 1b is a separately gated cross-repository follow-up and is not implied by phase-1a acceptance. In phase 1a, `network_policy` and `secure_access` are rejected rather than silently ignored.
 
-### Phase 1a — Service seam, lifecycle, execd, ingress (OpenSandbox-mostly, plus additive lifecycle RPC fields)
+### Phase 1a — Service seam, lifecycle, execd, ingress
 
-- Add `FleetSandboxService` + register `"fleets"` in `factory.py`; add `FleetsRuntimeConfig`.
-- Implement `fastpath_client` (Create / Get / Delete / Update / List / Diagnostics / ResolveEndpoint); add the lifecycle proto/implementation fields described above (`SandboxInfo` labels + expiry, list label selector, metadata delete keys) after ask-first review with fast-sandbox maintainers.
-- Simplified Create mapping + **explicit rejection** of `volumes` / `platform` / `resource_requests` / `credential_proxy` / `snapshot_id` / `image.auth`; **reject `network_policy` and `secure_access`** ("coming in fleets phase 1b"). No unsupported field is silently ignored.
-- Create+`timeout`/initial metadata: apply expiry and labels in one follow-up `UpdateSandbox` and **roll back (delete) on update failure**, so a failed update cannot leave an immortal or incorrectly labelled sandbox.
-- **Tenant handling**: map each OpenSandbox tenant to a fast-sandbox namespace on every call, or **reject `[tenants]` configuration** for fleets if the mapping is not implemented.
-- **Fleets ingress adapter**: add a fleets provider to `components/ingress` that routes to the fast-sandbox Sandbox Proxy path form and injects the `Authorization` bearer; expose a stable gateway URL and refresh the ephemeral credential internally (keeps SDK unchanged).
-- Implement `get_endpoint` via `ResolveEndpoint`; persist `sandbox_id → uid`; credential lifecycle handled by the ingress adapter, not the SDK.
-- execd via `opensandbox-execd-quickstart` Infra profile; verify exec/file end-to-end through the SDK.
-- Lifecycle get/delete/renew/list/metadata working (labels + expiry survive server restart; delete/expiry async; `Stopped/Expired → Terminated`, `Draining → Stopping`; metadata deletion uses explicit backend delete keys and protects reserved labels); `get_sandbox_logs`, pause/resume/snapshot return clear unsupported errors.
-- **Exit criteria**: full SDK flow (create → exec → file → delete) passes on a Kind cluster with fast-sandbox, no SDK changes; tenant isolation verified (or `[tenants]` rejected); unsupported-field rejection verified.
+- Add `FleetSandboxService(SandboxService, ExtensionService)`, register `"fleets"` in `factory.py`, and add `FleetsRuntimeConfig`.
+- Map `fleets` to `NoopSnapshotRuntime` during server startup; snapshot, pause, and resume operations remain explicitly unsupported.
+- Implement a FastPath v2 client for Create / Get / Delete / Update / List / Diagnostics / WaitSandboxReady / ResolveEndpoint and Pool discovery. No new lifecycle request or response fields are required on current fast-sandbox master.
+- Map Create atomically: public `extensions["poolRef"]`, image, command/args, string-valued environment, absolute expiry, public metadata, and the reserved renew-on-access value all go into the first Create request. Preserve the same request ID, normalized intent, and absolute expiry across retries.
+- On an ambiguous Create error, Get the same namespaced sandbox ID; return accepted `Pending` when durable intent exists, otherwise map the original error. Do not delete a valid durable intent or retry under a new ID.
+- Reject `volumes` / `platform` / `resource_requests` / `credential_proxy` / `snapshot_id` / `image.auth` / null environment values, and reject `network_policy` / `secure_access` until phase 1b. No unsupported field is silently ignored.
+- **Tenant handling**: map each OpenSandbox tenant to a fast-sandbox namespace on every namespaced call, or reject `[tenants]` configuration for fleets if that mapping is not implemented.
+- **Ingress contract and fleets provider**: extend provider lookup and proxying to consume the requested port, the complete upstream URL/base path, upstream-only headers, and expiry. Map 44772 to named component `execd`; use raw-port targets for ordinary user ports; preserve application `Authorization`; inject only `X-Fast-Sandbox-Route-Credential` upstream. No sandbox-ID-to-UID store is required.
+- **Execd**: require an inline v1alpha2 `infraComponents[]` entry named `execd`, pinned by OCI digest, with the documented binary mapping, process, health check, and named endpoint. Verify exec/file end to end through the SDK.
+- **Lifecycle semantics**: implement get/delete/renew/list/metadata; keep reserved metadata private; exhaust FastPath pages before state filtering and OpenSandbox page/total calculation; preflight Delete to preserve public 404; map retained `Stopped/Expired` to `Terminated`, `Draining` to `Stopping`, and actual NotFound to HTTP 404.
+- Normalize fast-sandbox `GetSandbox` Kubernetes NotFound to gRPC `codes.NotFound`; do not string-match backend errors in OpenSandbox.
+- Return a clear unsupported error for sandbox logs; back `inspect`/events only with lifecycle diagnostics.
+- **Exit criteria**: server starts under `fleets`; full SDK flow (create → exec → file → delete) passes on a Kind cluster without SDK changes; tenant isolation, list pagination/totals, extensions, unsupported-field rejection, and actual-NotFound behavior are verified.
 
-### Phase 1b — Per-sandbox egress enforcement + secure access (cross-repo, higher risk)
+### Phase 1b — Per-sandbox egress enforcement + secure access (separately gated)
 
 - Additive `network_policy` field on fast-sandbox `CreateRequest` (proto), `Sandbox` CRD, Fastlet protocol `SandboxSpec`, and `Slot` (ask-first review with fast-sandbox maintainers).
 - New "apply on bind" driver step invoked from `Acquire` (resolves the pre-warm timing blocker); port `components/egress` nft + DNS logic into the per-slot netns.
-- Per-slot `/policy` runtime endpoint on 18080 via the gateway; validate against `egress-api.yaml`.
+- Add the Fastlet-owned, assignment-fenced policy manager and authenticated per-sandbox `/policy` facade on port 18080; validate its GET/PATCH/DELETE behavior against `egress-api.yaml`.
 - Restrict `network_policy` to the `container` (runc) runtime; reject egress on gVisor/Kata.
 - Extend NodeJanitor for any out-of-netns state (DNS proxy / ipset).
-- Flip Create to **accept and enforce** `network_policy`.
+- Flip Create to accept `network_policy` only after enforcement, restart recovery, mutation authorization, and cleanup tests pass.
 - **Secure access**: accept `secure_access`; layer server-issued access headers onto the ingress-gateway route, reusing fast-sandbox's `required_headers` / short-lived Ed25519 credential model (OSEP-0011 semantics).
 - **Exit criteria**: a fleets sandbox with a deny-by-default FQDN allowlist blocks non-allowed egress and permits allowed FQDNs, end-to-end; co-located sandboxes with different policies do not interfere; a `secure_access` sandbox returns access headers and rejects unauthenticated endpoint access.
 
 ## Test Plan
 
-- **Unit Tests**: `fastpath_client` gRPC wrapper; Create field acceptance/rejection matrix; status mapping; `get_endpoint` gateway routing
-- **Integration Tests**: Deploy fast-sandbox in a Kind cluster; test create/get/delete/renew/list/metadata flows; execd connectivity on 44772
+- **Unit Tests**: FastPath v2 wrapper; atomic Create mapping and idempotent retry; ambiguous post-persistence error recovery; `ExtensionService` persistence/filtering; status and error mapping; full-route ingress path/header/expiry handling; state filtering and page/total calculation
+- **Startup Tests**: `fleets` satisfies the unconditional `ExtensionService` requirement and selects `NoopSnapshotRuntime`; server startup succeeds while snapshot operations remain unsupported
+- **Integration Tests**: Deploy fast-sandbox in a Kind cluster; test create/get/delete/renew/list/metadata flows, actual NotFound, retained expiry, multi-page list behavior, and named execd connectivity on 44772
 - **E2E Tests**: Full OpenSandbox SDK flow using the `fleets` runtime, asserting behavior identical to the pod backend for lifecycle + exec/file
-- **Egress Tests (phase 1b)**: deny-by-default block, FQDN allowlist permit, per-sandbox isolation between co-located sandboxes, `/policy` GET/PATCH/DELETE, runc-only guard
+- **Egress Tests (phase 1b)**: fail-closed bind, deny-by-default block, FQDN allowlist permit/expiry, per-sandbox isolation between co-located sandboxes, authenticated and assignment-fenced `/policy` GET/PATCH/DELETE, restart recovery/cleanup, and unsupported-runtime rejection
 - **Performance Tests**: create latency and density vs the `kubernetes` pool backend, reported per fast-sandbox methodology (commit/env/runtime/cache-state/concurrency/percentiles); compare the user-visible `Running` + execd-usable milestone separately from fast-sandbox's internal `RuntimeReady`
 
 ### Test Scenarios
 
 1. Basic lifecycle: create → status query → delete (delete is async; poll for NotFound)
-2. Expiration: renewal (eventual; poll status); expired sandbox reaches `Terminated` (Stopped/Expired mapping), not a stuck/unknown state
-3. Create+`timeout` update failure triggers rollback (no immortal sandbox left behind)
-4. Simplified Create: `volumes` / `platform` / `resource_requests` / `credential_proxy` / `snapshot_id` / `image.auth` rejected with clear errors; `network_policy` / `secure_access` rejected in 1a, accepted in 1b; `credential_proxy` still rejected in 1b
-5. Tenant isolation: a tenant cannot see/operate another tenant's sandboxes via list or ID; or `[tenants]` is rejected for fleets
-6. Metadata PATCH with a `null` value deletes the key through the explicit backend delete operation, preserving system labels; get/list return the result after a server restart
-7. Pool selection via `extensions.pool_ref`; `resource_limits` incompatible with pool profile rejected
-8. Ingress adapter: SDK reaches execd/user ports through the stable gateway URL; credential rotates internally without SDK involvement
-9. Image affinity: record candidate/cache-hit state for repeated creates and report it separately from end-to-end latency
-10. Failure: Fast-Path unavailable, invalid pool ref
-11. Concurrent sandbox creation (stress test)
-12. Egress (phase 1b): deny-by-default blocks; allowed FQDN permits; co-located sandboxes with different policies do not interfere
-13. `get_sandbox_logs` / `pause` / `resume` / snapshot return clear "unsupported on fleets" errors
+2. NotFound distinction: an unknown ID returns HTTP 404; an expired but retained CRD returns `Terminated`
+3. Expiration: initial absolute expiry is present in the first Create; renewal is eventual; an expired sandbox reaches `Terminated`
+4. Idempotency: a retry reuses request ID, normalized intent, and absolute expiry; a changed intent conflicts
+5. Ambiguous Create failure: when the first CRD write succeeded, the adapter reads the same ID and returns accepted `Pending` without duplicate creation or deletion
+6. Simplified Create: `volumes` / `platform` / `resource_requests` / `credential_proxy` / `snapshot_id` / `image.auth` and null environment values are rejected; `network_policy` / `secure_access` are rejected in 1a and accepted only after 1b exits
+7. Tenant isolation: a tenant cannot see/operate another tenant's sandboxes via list or ID; or `[tenants]` is rejected for fleets
+8. Metadata PATCH with a `null` value deletes the key through `metadata_delete_keys`, preserving reserved keys; get/list return public metadata after a server restart
+9. Extensions: pool selection uses public `extensions["poolRef"]`; renew-on-access is durable through `ExtensionService`; internal metadata is hidden from get/list/filter results
+10. List compatibility: FastPath continue-token pages are exhausted, mapped state filters are applied, and page/pageSize/totalItems/totalPages/hasNextPage match the public contract
+11. Ingress adapter: SDK reaches named execd and raw user ports through the stable gateway URL; base paths and queries are preserved; the route credential rotates internally; application `Authorization` survives
+12. Server startup: fleets selects `NoopSnapshotRuntime`, implements `ExtensionService`, and returns clear unsupported errors for logs/pause/resume/snapshot
+13. Image affinity: record candidate/cache-hit state for repeated creates and report it separately from end-to-end latency
+14. Failure: FastPath unavailable and invalid `poolRef`
+15. Concurrent sandbox creation (stress test)
+16. Egress (phase 1b): fail-closed bind, deny-by-default, allowed FQDN, policy mutation fencing, restart cleanup, and co-located policy isolation
 
 ### Performance Benchmarks
 
@@ -820,24 +892,24 @@ The figures below are the current fast-sandbox engineering evidence, not `fleets
 
 | Scope | Observation | Measurement boundary |
 | --- | --- | --- |
-| Warm container (`runc`) | 20 samples: mean 76.02 ms, p50 75.95 ms, p95 83.15 ms | Concurrency 1; cached image/artifacts; minimal Infra profile; client Fast-Path Create through `RuntimeReady` |
+| Warm container (`runc`) | 20 samples: mean 76.02 ms, p50 75.95 ms, p95 83.15 ms | Concurrency 1; cached image/artifacts; minimal Infra Component revision; client FastPath Create through `RuntimeReady` |
 | gVisor (`runsc`) | 10 samples: mean 644.29 ms | Small diagnostic batch; cached artifacts; Execd readiness excluded |
 | Kata Cloud Hypervisor | 10 samples: mean 1,359.59 ms | Small diagnostic batch under nested KVM; Execd readiness excluded |
 | Kata QEMU | 10 samples: mean 2,125.58 ms | Small diagnostic batch under nested KVM; Execd readiness excluded |
 | BatchSandbox pool vs fleets | No comparable report yet | Must run both through the same OpenSandbox endpoint, environment, cache state, concurrency, and readiness boundary |
 | Registry Top-K | No portable latency claim | `BenchmarkRegistryTopK1000` is a scheduler microbenchmark, not Sandbox Create |
 
-Source: fast-sandbox [`3af0222` performance guide](https://github.com/opensandbox-group/fast-sandbox/blob/3af02227a85d3ae872e67ef718b63c60e777edac/docs/guides/performance.md), whose measurements describe base revision `42fe03549598c3ab730b989c7757634b486697cf`.
+Source: fast-sandbox [`aac0c2c` performance guide](https://github.com/opensandbox-group/fast-sandbox/blob/aac0c2c80f08a8efa455f057ff7323a8248b558d/docs/guides/performance.md), whose dated measurements still describe base revision `42fe03549598c3ab730b989c7757634b486697cf`. The current guide explicitly does not claim a release-grade OpenSandbox end-to-end result.
 
 There is no absolute-millisecond exit threshold. The performance goal passes only when the matched OpenSandbox benchmark shows lower fleets p50 and p95 from SDK create start through `Running` and an execd readiness probe than the BatchSandbox pool. fast-sandbox `RuntimeReady` is reported as a separate diagnostic milestone and is not substituted for that user-visible comparison.
 
-The `fleets` acceptance report must record commit SHA and command; hardware, virtualization, Kubernetes, and containerd versions; component replicas; runtime and Infra profile; image/cache/network-slot state; concurrency and request rate; start/end milestones; p50/p95/p99/max; failures, admission rejections, and retries. It must report `RuntimeReady`, `DataPlaneReady`, and OpenSandbox client-observed latency separately. Image-affinity and Top-K microbenchmarks remain supporting diagnostics and must not substitute for the end-to-end comparison.
+The `fleets` acceptance report must record commit SHA and command; hardware, virtualization, Kubernetes, and containerd versions; component replicas; runtime and Infra Component revision; image/cache/network-slot state; concurrency and request rate; start/end milestones; p50/p95/p99/max; failures, admission rejections, and retries. It must report `RuntimeReady`, `DataPlaneReady`, and OpenSandbox client-observed latency separately. Image-affinity and Top-K microbenchmarks remain supporting diagnostics and must not substitute for the end-to-end comparison.
 
 ## Drawbacks
 
 - **Added Dependency**: Requires deploying and managing the fast-sandbox control plane (Fast-Path Servers, Reconcilers, Sandbox Proxy), Fastlet pools, and NodeJanitor DaemonSet
 - **Feature gap vs. pod backend**: no volumes, no pause/resume/snapshot, no per-sandbox K8s NetworkPolicy, no per-sandbox node scheduling — fleets is a deliberate subset
-- **Bespoke egress layer (phase 1b)**: per-sandbox egress is a new network layer with a cross-repo proto/CRD change — the highest-cost part of the integration; gVisor/Kata + egress is unsupported in phase 1
+- **Bespoke egress layer (phase 1b)**: per-sandbox egress is a new network layer with a cross-repo proto/CRD change — the highest-cost part of the integration; gVisor/Kata + egress remains unsupported in phase 1b unless separately proven
 - **Operational Complexity**: Teams need to understand both OpenSandbox and fast-sandbox concepts
 - **gRPC Protocol**: Introduces gRPC on the server's backend surface (vs pure HTTP/REST)
 - **Limited Ecosystem**: fast-sandbox is a newer project with a smaller community than vanilla K8s
@@ -855,7 +927,7 @@ The `fleets` acceptance report must record commit SHA and command; hardware, vir
 - **CI/CD**: Kind cluster with fast-sandbox (Fast-Path, Reconcilers, Sandbox Proxy, a Fastlet pool, NodeJanitor) for integration/e2e
 - **Documentation**: fleets deployment guide; execd-as-Infra-Component setup; egress enforcement guide (phase 1b); compatibility matrix
 - **Helm Charts** (optional): Unified charts deploying OpenSandbox Server + fast-sandbox components
-- **Cross-repo coordination**: with fast-sandbox maintainers for the additive lifecycle RPC fields/delete semantics and the `network_policy` proto/CRD field
+- **Cross-repo coordination**: with fast-sandbox maintainers for `GetSandbox` NotFound normalization and, separately, the phase-1b `network_policy` proto/CRD/Fastlet contract
 
 ## Upgrade & Migration Strategy
 
@@ -863,4 +935,4 @@ The `fleets` acceptance report must record commit SHA and command; hardware, vir
 - **No Migration**: Existing Docker/Kubernetes runtime users unaffected
 - **Enable by Config**: Set `type = "fleets"` and add the `[fleets]` block; deploy fast-sandbox and an ingress gateway wired to its Sandbox Proxy
 - **Rollback**: Switch `type` back to `kubernetes` or `docker`; fleets sandboxes are ephemeral (no persistent state to migrate)
-- **Choosing a backend**: use `kubernetes` when you need volumes, pause/resume/snapshot, per-sandbox K8s NetworkPolicy, or per-sandbox node scheduling; use `fleets` for latency-sensitive, stateless, high-density workloads needing only lifecycle + exec/file + per-sandbox FQDN egress
+- **Choosing a backend**: use `kubernetes` when you need volumes, pause/resume/snapshot, per-sandbox K8s NetworkPolicy, or per-sandbox node scheduling; use phase-1a `fleets` for latency-sensitive, stateless, high-density workloads needing lifecycle + exec/file. Do not select `fleets` for FQDN egress until phase 1b is implemented and enabled.
