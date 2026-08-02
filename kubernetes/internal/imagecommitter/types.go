@@ -20,9 +20,6 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
-// APIVersion is the current executable contract version.
-const APIVersion = "v1"
-
 const (
 	PodNameLabel       = "io.kubernetes.pod.name"
 	PodNamespaceLabel  = "io.kubernetes.pod.namespace"

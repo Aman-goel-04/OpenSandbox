@@ -375,10 +375,7 @@ func (r *SandboxSnapshotReconciler) buildCommitJob(snapshot *sandboxv1alpha1.San
 		containerSpecs = append(containerSpecs, fmt.Sprintf("%s:%s", cs.ContainerName, cs.ImageURI))
 	}
 	args := append([]string{snapshot.Status.SourcePodName, snapshot.Namespace}, containerSpecs...)
-	env := []corev1.EnvVar{
-		{Name: "IMAGE_COMMITTER_API_VERSION", Value: ImageCommitterAPIVersion},
-		{Name: "CONTAINERD_SOCKET", Value: ContainerdSocketPath},
-	}
+	env := []corev1.EnvVar{{Name: "CONTAINERD_SOCKET", Value: ContainerdSocketPath}}
 	if sourcePodUID != "" {
 		env = append(env, corev1.EnvVar{Name: "SOURCE_POD_UID", Value: sourcePodUID})
 	}
@@ -594,10 +591,7 @@ func (r *SandboxSnapshotReconciler) buildUnpauseJob(snapshot *sandboxv1alpha1.Sa
 		containerNames = append(containerNames, cs.ContainerName)
 	}
 	args := append([]string{"unpause", snapshot.Status.SourcePodName, snapshot.Namespace}, containerNames...)
-	env := []corev1.EnvVar{
-		{Name: "IMAGE_COMMITTER_API_VERSION", Value: ImageCommitterAPIVersion},
-		{Name: "CONTAINERD_SOCKET", Value: ContainerdSocketPath},
-	}
+	env := []corev1.EnvVar{{Name: "CONTAINERD_SOCKET", Value: ContainerdSocketPath}}
 	if sourcePodUID != "" {
 		env = append(env, corev1.EnvVar{Name: "SOURCE_POD_UID", Value: sourcePodUID})
 	}

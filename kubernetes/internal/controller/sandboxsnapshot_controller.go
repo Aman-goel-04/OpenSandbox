@@ -56,10 +56,6 @@ const (
 	// use containerd task exec with FIFO-backed process I/O.
 	ContainerdFIFODir = "/run/containerd/fifo"
 
-	// ImageCommitterAPIVersion is the executable contract passed to commit and
-	// unpause Jobs.
-	ImageCommitterAPIVersion = "v1"
-
 	// LabelSandboxSnapshotName is the label key for sandbox snapshot name
 	LabelSandboxSnapshotName = "sandbox.opensandbox.io/sandbox-snapshot-name"
 )

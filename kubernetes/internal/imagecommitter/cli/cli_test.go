@@ -74,18 +74,6 @@ func TestParseOperationRejectsInvalidInput(t *testing.T) {
 	}
 }
 
-func TestValidateAPIVersion(t *testing.T) {
-	if err := validateAPIVersion(""); err != nil {
-		t.Fatalf("empty version should use v1 compatibility: %v", err)
-	}
-	if err := validateAPIVersion("v1"); err != nil {
-		t.Fatalf("v1 should be supported: %v", err)
-	}
-	if err := validateAPIVersion("v2"); err == nil {
-		t.Fatal("unsupported version should fail")
-	}
-}
-
 func TestWriteResult(t *testing.T) {
 	terminationMessagePath := filepath.Join(t.TempDir(), "termination.log")
 

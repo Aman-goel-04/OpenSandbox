@@ -51,9 +51,6 @@ func Run(ctx context.Context, args []string, config Config) error {
 	if config.ErrorOutput == nil {
 		config.ErrorOutput = io.Discard
 	}
-	if err := validateAPIVersion(os.Getenv("IMAGE_COMMITTER_API_VERSION")); err != nil {
-		return err
-	}
 	operation, commitRequest, unpauseRequest, err := parseOperation(args)
 	if err != nil {
 		return err
@@ -152,14 +149,6 @@ func writeResult(path string, result imagecommitter.Result) error {
 		return err
 	}
 	return os.WriteFile(path, append(data, '\n'), 0o644)
-}
-
-func validateAPIVersion(version string) error {
-	version = strings.TrimSpace(version)
-	if version == "" || version == imagecommitter.APIVersion {
-		return nil
-	}
-	return fmt.Errorf("unsupported IMAGE_COMMITTER_API_VERSION %q", version)
 }
 
 func containerdSocket() string {
