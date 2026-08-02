@@ -138,8 +138,6 @@ The snapshot controller supports the following command-line flags:
 |------|---------|-------------|
 | `--snapshot-registry` | `""` | OCI registry prefix used for snapshot images |
 | `--snapshot-push-secret` | `""` | Secret name used by commit Jobs to push snapshots |
-| `--image-committer-service-account` | `""` | ServiceAccount assigned to image-committer commit Jobs |
-| `--image-committer-pod-labels` | `""` | JSON object of labels assigned to image-committer commit Job Pods |
 | `--image-committer-pod-template-file` | `""` | Path to a PodTemplateSpec overlay for image-committer commit Job Pods |
 | `--resume-pull-secret` | `""` | Secret name injected into resumed sandboxes for image pulls |
 | `--image-committer-image` | `image-committer:dev` | Image used for commit operations |
@@ -148,7 +146,7 @@ The snapshot controller supports the following command-line flags:
 
 These flags are configured at controller startup. The built-in image committer uses containerd APIs directly. Any custom `image-committer-image` must implement the documented commit and unpause command contract and must be trusted: commit Jobs mount the host containerd socket on the source node, so the image effectively has node-level runtime access. Pin the image by digest or enforce a trusted registry/admission policy in production.
 
-The optional Pod template is operator-controlled and can supply identity metadata, a ServiceAccount, resources, scheduling settings, and additional containers while the controller preserves the commit runtime invariants. The standalone ServiceAccount and label flags are convenient overlays.
+The optional Pod template is operator-controlled and can supply identity metadata, a ServiceAccount, resources, scheduling settings, and additional containers while the controller preserves the commit runtime invariants.
 
 ### Quick Setup
 

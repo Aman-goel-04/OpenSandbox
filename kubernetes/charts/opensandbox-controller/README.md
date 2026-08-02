@@ -79,8 +79,6 @@ kubectl delete crd sandboxsnapshots.sandbox.opensandbox.io
 | `controller.kubeClient.qps` | QPS for Kubernetes client rate limiter | `100` |
 | `controller.kubeClient.burst` | Burst for Kubernetes client rate limiter | `200` |
 | `controller.snapshot.imageCommitterImage` | Image used by snapshot commit Jobs | `image-committer:dev` |
-| `controller.snapshot.imageCommitterServiceAccount` | ServiceAccount assigned to snapshot commit Jobs | `""` |
-| `controller.snapshot.imageCommitterPodLabels` | Labels assigned to snapshot commit Job Pods | `{}` |
 | `controller.snapshot.imageCommitterPodTemplate` | PodTemplateSpec overlay for snapshot commit Job Pods | `{}` |
 | `controller.snapshot.commitJobTimeout` | Timeout duration for snapshot commit Jobs | `10m` |
 | `controller.snapshot.registry` | OCI registry prefix used for snapshot images | `""` |
@@ -195,8 +193,6 @@ controller:
 These values render directly to the controller flags:
 
 - `--image-committer-image`
-- `--image-committer-service-account`
-- `--image-committer-pod-labels`
 - `--image-committer-pod-template-file`
 - `--commit-job-timeout`
 - `--snapshot-registry`

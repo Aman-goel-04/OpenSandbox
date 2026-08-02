@@ -56,27 +56,3 @@ func TestLoadImageCommitterPodTemplateRejectsUnknownFields(t *testing.T) {
 	_, err := loadImageCommitterPodTemplate(path)
 	require.Error(t, err)
 }
-
-func TestParseImageCommitterPodLabels(t *testing.T) {
-	labels, err := parseImageCommitterPodLabels(`{"identity.example/use":"true","app":"committer"}`)
-	require.NoError(t, err)
-	assert.Equal(t, map[string]string{
-		"app":                  "committer",
-		"identity.example/use": "true",
-	}, labels)
-
-	labels, err = parseImageCommitterPodLabels("")
-	require.NoError(t, err)
-	assert.Nil(t, labels)
-}
-
-func TestParseImageCommitterPodLabelsRejectsInvalidInput(t *testing.T) {
-	for _, raw := range []string{
-		`{"label":`,
-		`{"not a label":"value"}`,
-		`{"label":"not a valid value!"}`,
-	} {
-		_, err := parseImageCommitterPodLabels(raw)
-		require.Error(t, err, raw)
-	}
-}

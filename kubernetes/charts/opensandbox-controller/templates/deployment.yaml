@@ -69,12 +69,6 @@ spec:
         {{- if .Values.controller.snapshot.imageCommitterImage }}
         - --image-committer-image={{ .Values.controller.snapshot.imageCommitterImage }}
         {{- end }}
-        {{- if .Values.controller.snapshot.imageCommitterServiceAccount }}
-        - --image-committer-service-account={{ .Values.controller.snapshot.imageCommitterServiceAccount }}
-        {{- end }}
-        {{- if .Values.controller.snapshot.imageCommitterPodLabels }}
-        - {{ printf "--image-committer-pod-labels=%s" (toJson .Values.controller.snapshot.imageCommitterPodLabels) | quote }}
-        {{- end }}
         {{- if .Values.controller.snapshot.imageCommitterPodTemplate }}
         - --image-committer-pod-template-file=/etc/opensandbox/image-committer/pod-template.yaml
         {{- end }}

@@ -92,13 +92,6 @@ type SandboxSnapshotReconciler struct {
 	// Required when imageCommitterImage lives in a private registry.
 	ImageCommitterPullSecret string
 
-	// ImageCommitterServiceAccount is assigned to commit Jobs so an
-	// implementation can consume admission-injected workload identity.
-	ImageCommitterServiceAccount string
-
-	// ImageCommitterPodLabels are assigned to commit Job Pods.
-	ImageCommitterPodLabels map[string]string
-
 	// ImageCommitterPodTemplate overlays operator-controlled commit Job Pod settings.
 	ImageCommitterPodTemplate *corev1.PodTemplateSpec
 

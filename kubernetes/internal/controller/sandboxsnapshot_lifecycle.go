@@ -400,11 +400,9 @@ func (r *SandboxSnapshotReconciler) buildCommitJob(snapshot *sandboxv1alpha1.San
 			TTLSecondsAfterFinished: ptrToInt32(int32(DefaultTTLSecondsAfterFinished)),
 			ActiveDeadlineSeconds:   ptrToInt64(int64(r.getCommitJobTimeout().Seconds())),
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: r.ImageCommitterPodLabels},
 				Spec: corev1.PodSpec{
-					RestartPolicy:      corev1.RestartPolicyNever,
-					ServiceAccountName: r.ImageCommitterServiceAccount,
-					ImagePullSecrets:   r.imageCommitterPullSecrets(),
+					RestartPolicy:    corev1.RestartPolicyNever,
+					ImagePullSecrets: r.imageCommitterPullSecrets(),
 					Containers: []corev1.Container{
 						{
 							Name:            CommitJobContainerName,
@@ -445,7 +443,7 @@ func (r *SandboxSnapshotReconciler) applyImageCommitterPodTemplate(generated *co
 		overlay = &corev1.PodTemplateSpec{}
 	}
 
-	generated.Labels = mergeStringMaps(overlay.Labels, generated.Labels, r.ImageCommitterPodLabels)
+	generated.Labels = mergeStringMaps(overlay.Labels, generated.Labels)
 	generated.Annotations = mergeStringMaps(overlay.Annotations, generated.Annotations)
 
 	generatedContainer := generated.Spec.Containers[0]
@@ -481,9 +479,6 @@ func (r *SandboxSnapshotReconciler) applyImageCommitterPodTemplate(generated *co
 	overlay.Spec.ImagePullSecrets = mergeLocalObjectReferences(overlay.Spec.ImagePullSecrets, generated.Spec.ImagePullSecrets)
 	overlay.Spec.RestartPolicy = generated.Spec.RestartPolicy
 	overlay.Spec.NodeName = generated.Spec.NodeName
-	if r.ImageCommitterServiceAccount != "" {
-		overlay.Spec.ServiceAccountName = r.ImageCommitterServiceAccount
-	}
 
 	generated.Spec = overlay.Spec
 	return nil
