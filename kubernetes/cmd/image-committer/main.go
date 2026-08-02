@@ -21,8 +21,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/imagecommitter"
-	imagecommittercli "github.com/alibaba/OpenSandbox/sandbox-k8s/internal/imagecommitter/cli"
+	"github.com/alibaba/OpenSandbox/sandbox-k8s/pkg/imagecommitter"
+	imagecommittercli "github.com/alibaba/OpenSandbox/sandbox-k8s/pkg/imagecommitter/cli"
 )
 
 const (

@@ -26,7 +26,7 @@ import (
 
 	containerd "github.com/containerd/containerd"
 
-	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/imagecommitter"
+	"github.com/alibaba/OpenSandbox/sandbox-k8s/pkg/imagecommitter"
 )
 
 const (

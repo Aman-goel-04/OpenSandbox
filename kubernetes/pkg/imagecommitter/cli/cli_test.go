@@ -20,7 +20,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/imagecommitter"
+	"github.com/alibaba/OpenSandbox/sandbox-k8s/pkg/imagecommitter"
 )
 
 func TestParseCommitOperation(t *testing.T) {
