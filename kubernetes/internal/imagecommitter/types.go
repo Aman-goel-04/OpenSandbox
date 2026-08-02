@@ -75,7 +75,6 @@ type ExecRequest struct {
 // ExecResult is the result of a successfully created exec process.
 type ExecResult struct {
 	ExitCode uint32
-	Output   []byte
 }
 
 // LocalImage identifies image content assembled in containerd.
