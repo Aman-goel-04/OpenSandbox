@@ -57,9 +57,15 @@ controller:
 
   # -- Pause/Resume snapshot configuration
   snapshot:
-    # -- Image used for commit operations (must contain nerdctl tool)
+    # -- Image used for commit operations
     # DockerHub: opensandbox/image-committer:v0.1.1
     imageCommitterImage: "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/image-committer:v0.1.1"
+    # -- ServiceAccount assigned to image-committer commit Jobs. The account must exist in each sandbox namespace.
+    imageCommitterServiceAccount: ""
+    # -- Labels assigned to image-committer commit Job Pods.
+    imageCommitterPodLabels: {}
+    # -- PodTemplateSpec overlay for image-committer commit Job Pods.
+    imageCommitterPodTemplate: {}
     # -- Containerd socket path of host
     containerdSocketPath: "/var/run/containerd/containerd.sock"
     # -- Timeout duration for commit jobs

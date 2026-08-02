@@ -98,8 +98,8 @@ SandboxSnapshot Controller
     │ creates commit Job on the same node
     ▼
 commit Job Pod (image-committer)
-    │ nerdctl: commit container rootfs → OCI image
-    │ nerdctl: push to registry
+    │ containerd API: commit container rootfs → OCI image
+    │ OCI registry resolver: push image
     ▼
 SandboxSnapshot.status.phase = Succeed
     │ BatchSandbox.status.phase = Paused
@@ -153,6 +153,9 @@ Configure the controller manager deployment with snapshot flags:
 | `--snapshot-registry` | string | `""` | **Required.** OCI registry prefix. Images are stored as `<registry>/<sandboxName>-<container>:snap-gen<N>`. |
 | `--snapshot-registry-insecure` | bool | `false` | Enables insecure registry mode for snapshot push operations. Use only for HTTP or self-signed local registries. |
 | `--snapshot-push-secret` | string | `""` | Kubernetes Secret name for pushing snapshots. Must be `kubernetes.io/dockerconfigjson` type. |
+| `--image-committer-service-account` | string | `""` | ServiceAccount assigned to commit Jobs. It must exist in every sandbox namespace where snapshots run. |
+| `--image-committer-pod-labels` | JSON object | `""` | Labels assigned to commit Job Pods, for example `{"identity.example/use":"true"}`. |
+| `--image-committer-pod-template-file` | string | `""` | Path to a PodTemplateSpec overlay for commit Job Pods. |
 | `--resume-pull-secret` | string | `""` | Kubernetes Secret name injected into resumed sandboxes for pulling snapshot images. Can be the same as push secret. |
 | `--image-committer-image` | string | `"image-committer:dev"` | Image used by commit Jobs. |
 | `--commit-job-timeout` | duration | `"10m"` | Timeout for commit Jobs. |
@@ -162,6 +165,9 @@ Configure the controller manager deployment with snapshot flags:
 The `opensandbox-controller` Helm chart now exposes the snapshot-related controller values directly:
 
 - `controller.snapshot.imageCommitterImage`
+- `controller.snapshot.imageCommitterServiceAccount`
+- `controller.snapshot.imageCommitterPodLabels`
+- `controller.snapshot.imageCommitterPodTemplate`
 - `controller.snapshot.commitJobTimeout`
 - `controller.snapshot.registry`
 - `controller.snapshot.registryInsecure`
@@ -314,7 +320,11 @@ The controller creates a short-lived Kubernetes `Job` for each pause:
 
 The commit Job mounts the host containerd socket from the source node and runs as UID 0. This gives the `image-committer` image node-level container runtime access. Use only a trusted image, preferably pinned by digest or controlled by an admission policy.
 
-Before pausing containers, `image-committer` attempts to run `sync` inside every running container included in the snapshot. This flushes guest filesystem caches for VM-isolated runtimes such as Kata Containers, where a host-side sync cannot flush the guest kernel. Guest sync is best effort: if it fails, the commit Job logs a warning and continues, so recent guest filesystem writes may be absent from the resulting snapshot. Containers that were already stopped cannot be targeted by `nerdctl exec` and continue through the stopped-container commit path. The Job mounts both the containerd socket and the host `/run/containerd/fifo` directory; the FIFO mount lets the host-side containerd shim access the I/O streams created by `nerdctl exec`.
+The built-in image committer uses containerd APIs directly for container lookup, task pause/unpause, writable-snapshot image creation, and registry push. The Job also retains the host `/run/containerd/fifo` mount so compatible implementations can use containerd task exec. Any preparation command used by the built-in implementation is best effort and does not change the commit interface.
+
+The operator-controlled Pod template can add labels, annotations, a ServiceAccount, scheduling settings, init containers, sidecars, and settings on the required `commit` container such as resources, `env`, and `envFrom`. The template is the merge base; controller-generated invariants override conflicting template values, and standalone controller settings override both. The controller reserves the source `nodeName`, restart policy, committer image, image pull policy, command, arguments, security context, termination-message settings, and required environment variables, mounts, and volumes. Environment variables, mounts, and volumes are merged by name, with required controller values winning conflicts. Additional regular sidecars must terminate for the Job to complete.
+
+The standalone `--image-committer-service-account` and `--image-committer-pod-labels` settings remain convenient overlays and take precedence over matching template fields. The ServiceAccount and required admission configuration must exist in every sandbox namespace. Unpause Jobs do not receive the commit Pod template because they do not access the registry.
 
 If the commit Job fails, the controller creates a best-effort `<snapshotName>-unpause` Job on the same node to unpause any source containers that may have been left paused by an abrupt committer exit.
 

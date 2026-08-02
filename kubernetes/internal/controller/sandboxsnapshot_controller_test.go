@@ -251,6 +251,12 @@ func TestSandboxSnapshotHandleCommitting_CreatesUnpauseJobWhenCommitJobFailed(t 
 			Name:      "test-snapshot-commit",
 			Namespace: "default",
 		},
+		Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name: CommitJobContainerName,
+				Env:  []corev1.EnvVar{{Name: "SOURCE_POD_UID", Value: "source-pod-uid"}},
+			}},
+		}}},
 		Status: batchv1.JobStatus{
 			Conditions: []batchv1.JobCondition{
 				{
@@ -275,6 +281,9 @@ func TestSandboxSnapshotHandleCommitting_CreatesUnpauseJobWhenCommitJobFailed(t 
 	cleanupContainer := cleanupJob.Spec.Template.Spec.Containers[0]
 	assert.Equal(t, []string{"/usr/local/bin/image-committer"}, cleanupContainer.Command)
 	assert.Equal(t, []string{"unpause", "source-pod", "default", "main", "sidecar"}, cleanupContainer.Args)
+	assert.Contains(t, cleanupContainer.Env, corev1.EnvVar{Name: "IMAGE_COMMITTER_API_VERSION", Value: ImageCommitterAPIVersion})
+	assert.Contains(t, cleanupContainer.Env, corev1.EnvVar{Name: "SOURCE_POD_UID", Value: "source-pod-uid"})
+	assert.Empty(t, cleanupJob.Spec.Template.Spec.ServiceAccountName)
 	assert.Equal(t, "node-a", cleanupJob.Spec.Template.Spec.NodeName)
 }
 
@@ -468,7 +477,7 @@ func TestBuildCommitJob_SetsBoundedBackoffLimit(t *testing.T) {
 	r := newTestSnapshotReconciler(snapshot)
 	r.SnapshotPushSecret = "registry-snapshot-push-secret"
 
-	job, err := r.buildCommitJob(snapshot)
+	job, err := r.buildCommitJob(snapshot, "")
 	require.NoError(t, err)
 	require.NotNil(t, job.Spec.BackoffLimit)
 	assert.Equal(t, DefaultCommitJobBackoffLimit, *job.Spec.BackoffLimit)
@@ -495,10 +504,34 @@ func TestBuildCommitJob_ExecutesImageCommitterDirectlyWithIsolatedArgs(t *testin
 
 	r := newTestSnapshotReconciler(snapshot)
 	r.SnapshotRegistryInsecure = true
+	r.ImageCommitterPodTemplate = &corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels:      map[string]string{"identity.example/use": "true"},
+			Annotations: map[string]string{"example.com/template": "enabled"},
+		},
+		Spec: corev1.PodSpec{
+			ServiceAccountName: "snapshot-committer",
+			NodeName:           "must-be-overridden",
+			RestartPolicy:      corev1.RestartPolicyAlways,
+			Tolerations:        []corev1.Toleration{{Key: "snapshot", Operator: corev1.TolerationOpExists}},
+			Containers: []corev1.Container{
+				{
+					Name:    CommitJobContainerName,
+					Image:   "must-be-overridden",
+					Command: []string{"must-be-overridden"},
+					Env: []corev1.EnvVar{
+						{Name: "CUSTOM_ENV", Value: "custom"},
+						{Name: "SOURCE_POD_UID", Value: "must-be-overridden"},
+					},
+				},
+				{Name: "audit-sidecar", Image: "example.com/audit:latest"},
+			},
+		},
+	}
 
-	job, err := r.buildCommitJob(snapshot)
+	job, err := r.buildCommitJob(snapshot, "pod-uid")
 	require.NoError(t, err)
-	require.Len(t, job.Spec.Template.Spec.Containers, 1)
+	require.Len(t, job.Spec.Template.Spec.Containers, 2)
 
 	container := job.Spec.Template.Spec.Containers[0]
 	assert.Equal(t, []string{"/usr/local/bin/image-committer"}, container.Command)
@@ -507,8 +540,20 @@ func TestBuildCommitJob_ExecutesImageCommitterDirectlyWithIsolatedArgs(t *testin
 		"default",
 		"main;echo nope:registry.example.com/test:tag",
 	}, container.Args)
+	assert.Contains(t, container.Env, corev1.EnvVar{Name: "IMAGE_COMMITTER_API_VERSION", Value: ImageCommitterAPIVersion})
+	assert.Contains(t, container.Env, corev1.EnvVar{Name: "SOURCE_POD_UID", Value: "pod-uid"})
 	assert.Contains(t, container.Env, corev1.EnvVar{Name: "SNAPSHOT_REGISTRY_INSECURE", Value: "true"})
+	assert.Equal(t, "snapshot-committer", job.Spec.Template.Spec.ServiceAccountName)
+	assert.Equal(t, "node-1", job.Spec.Template.Spec.NodeName)
+	assert.Equal(t, corev1.RestartPolicyNever, job.Spec.Template.Spec.RestartPolicy)
+	assert.Equal(t, map[string]string{"identity.example/use": "true"}, job.Spec.Template.Labels)
+	assert.Equal(t, map[string]string{"example.com/template": "enabled"}, job.Spec.Template.Annotations)
+	assert.Contains(t, container.Env, corev1.EnvVar{Name: "CUSTOM_ENV", Value: "custom"})
+	assert.Equal(t, r.imageCommitterImage(), container.Image)
+	assert.Equal(t, []string{"/usr/local/bin/image-committer"}, container.Command)
 	assert.Contains(t, container.VolumeMounts, corev1.VolumeMount{Name: "containerd-fifo", MountPath: ContainerdFIFODir})
+	assert.Contains(t, job.Spec.Template.Spec.Tolerations, corev1.Toleration{Key: "snapshot", Operator: corev1.TolerationOpExists})
+	assert.Equal(t, "audit-sidecar", job.Spec.Template.Spec.Containers[1].Name)
 
 	var fifoVolume *corev1.Volume
 	for i := range job.Spec.Template.Spec.Volumes {

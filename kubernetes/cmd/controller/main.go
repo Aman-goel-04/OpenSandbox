@@ -16,6 +16,7 @@ package main
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -28,8 +29,10 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/validation"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
@@ -38,6 +41,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
+	"sigs.k8s.io/yaml"
 
 	sandboxv1alpha1 "github.com/alibaba/OpenSandbox/sandbox-k8s/apis/sandbox/v1alpha1"
 	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/controller"
@@ -202,7 +206,16 @@ func main() {
 
 	// Image committer
 	var imageCommitterImage string
-	flag.StringVar(&imageCommitterImage, "image-committer-image", "image-committer:dev", "The image used for commit operations (contains nerdctl tool).")
+	flag.StringVar(&imageCommitterImage, "image-committer-image", "image-committer:dev", "The image used for commit operations.")
+
+	var imageCommitterServiceAccount string
+	flag.StringVar(&imageCommitterServiceAccount, "image-committer-service-account", "", "K8s ServiceAccount assigned to image-committer commit Jobs.")
+
+	var imageCommitterPodLabelsJSON string
+	flag.StringVar(&imageCommitterPodLabelsJSON, "image-committer-pod-labels", "", "JSON object of labels assigned to image-committer commit Job Pods.")
+
+	var imageCommitterPodTemplateFile string
+	flag.StringVar(&imageCommitterPodTemplateFile, "image-committer-pod-template-file", "", "Path to a PodTemplateSpec overlay for image-committer commit Job Pods.")
 
 	var containerdSocketPath string
 	flag.StringVar(&containerdSocketPath, "containerd-socket-path", controller.ContainerdSocketPath, "Containerd socket path")
@@ -247,6 +260,17 @@ func main() {
 	ctrl.SetLogger(logger)
 
 	setupLog.Info("Starting controller", "commitID", commitID, "buildDate", buildDate)
+
+	imageCommitterPodLabels, err := parseImageCommitterPodLabels(imageCommitterPodLabelsJSON)
+	if err != nil {
+		setupLog.Error(err, "invalid image committer Pod labels")
+		os.Exit(1)
+	}
+	imageCommitterPodTemplate, err := loadImageCommitterPodTemplate(imageCommitterPodTemplateFile)
+	if err != nil {
+		setupLog.Error(err, "invalid image committer Pod template")
+		os.Exit(1)
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -455,16 +479,19 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.SandboxSnapshotReconciler{
-		Client:                   mgr.GetClient(),
-		Scheme:                   mgr.GetScheme(),
-		Recorder:                 mgr.GetEventRecorderFor("sandboxsnapshot-controller"),
-		ImageCommitterImage:      imageCommitterImage,
-		ContainerdSocketPath:     containerdSocketPath,
-		CommitJobTimeout:         commitJobTimeout,
-		SnapshotRegistry:         snapshotRegistry,
-		SnapshotRegistryInsecure: snapshotRegistryInsecure,
-		SnapshotPushSecret:       snapshotPushSecret,
-		ImageCommitterPullSecret: imageCommitterPullSecret,
+		Client:                       mgr.GetClient(),
+		Scheme:                       mgr.GetScheme(),
+		Recorder:                     mgr.GetEventRecorderFor("sandboxsnapshot-controller"),
+		ImageCommitterImage:          imageCommitterImage,
+		ContainerdSocketPath:         containerdSocketPath,
+		CommitJobTimeout:             commitJobTimeout,
+		SnapshotRegistry:             snapshotRegistry,
+		SnapshotRegistryInsecure:     snapshotRegistryInsecure,
+		SnapshotPushSecret:           snapshotPushSecret,
+		ImageCommitterPullSecret:     imageCommitterPullSecret,
+		ImageCommitterServiceAccount: imageCommitterServiceAccount,
+		ImageCommitterPodLabels:      imageCommitterPodLabels,
+		ImageCommitterPodTemplate:    imageCommitterPodTemplate,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "SandboxSnapshot")
 		os.Exit(1)
@@ -501,4 +528,38 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+func loadImageCommitterPodTemplate(path string) (*corev1.PodTemplateSpec, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read Pod template: %w", err)
+	}
+	var template corev1.PodTemplateSpec
+	if err := yaml.UnmarshalStrict(data, &template); err != nil {
+		return nil, fmt.Errorf("parse Pod template: %w", err)
+	}
+	return &template, nil
+}
+
+func parseImageCommitterPodLabels(raw string) (map[string]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var labels map[string]string
+	if err := json.Unmarshal([]byte(raw), &labels); err != nil {
+		return nil, fmt.Errorf("parse labels JSON: %w", err)
+	}
+	for key, value := range labels {
+		if errors := validation.IsQualifiedName(key); len(errors) > 0 {
+			return nil, fmt.Errorf("invalid label key %q: %s", key, strings.Join(errors, "; "))
+		}
+		if errors := validation.IsValidLabelValue(value); len(errors) > 0 {
+			return nil, fmt.Errorf("invalid value for label %q: %s", key, strings.Join(errors, "; "))
+		}
+	}
+	return labels, nil
 }
