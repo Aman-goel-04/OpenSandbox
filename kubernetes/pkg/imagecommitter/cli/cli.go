@@ -80,10 +80,7 @@ func Run(ctx context.Context, args []string, config Config) error {
 	// Preserve the existing best-effort preparation behavior. It remains an
 	// implementation detail and is not part of the executable contract.
 	orchestrator.PreparationCommand = []string{"sync"}
-	orchestrator.Builder = imagecommitter.NewContainerdImageBuilder(
-		client,
-		imagecommitter.WithSourceCredentialProvider(config.SourceCredentialProvider),
-	)
+	orchestrator.Builder = imagecommitter.NewContainerdImageBuilder(client, config.SourceCredentialProvider)
 	orchestrator.Pusher = imagecommitter.NewContainerdImagePusher(
 		client,
 		config.CredentialProvider,

@@ -39,23 +39,11 @@ type ContainerdImageBuilder struct {
 	sourceCredentials CredentialProvider
 }
 
-// ContainerdImageBuilderOption configures source-image content recovery.
-type ContainerdImageBuilderOption func(*ContainerdImageBuilder)
-
-// WithSourceCredentialProvider supplies credentials used only when missing
-// source-image content must be fetched from its registry.
-func WithSourceCredentialProvider(provider CredentialProvider) ContainerdImageBuilderOption {
-	return func(builder *ContainerdImageBuilder) {
-		builder.sourceCredentials = provider
-	}
-}
-
-func NewContainerdImageBuilder(client *containerd.Client, options ...ContainerdImageBuilderOption) *ContainerdImageBuilder {
-	builder := &ContainerdImageBuilder{client: client}
-	for _, option := range options {
-		option(builder)
-	}
-	return builder
+// NewContainerdImageBuilder creates a builder with the credential provider
+// used to recover missing source-image content. The provider may return empty
+// credentials for registries that permit anonymous pulls.
+func NewContainerdImageBuilder(client *containerd.Client, sourceCredentials CredentialProvider) *ContainerdImageBuilder {
+	return &ContainerdImageBuilder{client: client, sourceCredentials: sourceCredentials}
 }
 
 func (b *ContainerdImageBuilder) Commit(ctx context.Context, container ResolvedContainer, target string) (LocalImage, error) {
