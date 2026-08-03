@@ -35,11 +35,27 @@ import (
 
 // ContainerdImageBuilder assembles OCI image content from writable snapshots.
 type ContainerdImageBuilder struct {
-	client *containerd.Client
+	client            *containerd.Client
+	sourceCredentials CredentialProvider
 }
 
-func NewContainerdImageBuilder(client *containerd.Client) *ContainerdImageBuilder {
-	return &ContainerdImageBuilder{client: client}
+// ContainerdImageBuilderOption configures source-image content recovery.
+type ContainerdImageBuilderOption func(*ContainerdImageBuilder)
+
+// WithSourceCredentialProvider supplies credentials used only when missing
+// source-image content must be fetched from its registry.
+func WithSourceCredentialProvider(provider CredentialProvider) ContainerdImageBuilderOption {
+	return func(builder *ContainerdImageBuilder) {
+		builder.sourceCredentials = provider
+	}
+}
+
+func NewContainerdImageBuilder(client *containerd.Client, options ...ContainerdImageBuilderOption) *ContainerdImageBuilder {
+	builder := &ContainerdImageBuilder{client: client}
+	for _, option := range options {
+		option(builder)
+	}
+	return builder
 }
 
 func (b *ContainerdImageBuilder) Commit(ctx context.Context, container ResolvedContainer, target string) (LocalImage, error) {
@@ -62,6 +78,9 @@ func (b *ContainerdImageBuilder) Commit(ctx context.Context, container ResolvedC
 		return LocalImage{}, fmt.Errorf("load source image for container %s: %w", container.ID, err)
 	}
 	store := b.client.ContentStore()
+	if err := b.ensureBaseImageContent(leaseCtx, baseImage); err != nil {
+		return LocalImage{}, fmt.Errorf("recover source image content for container %s: %w", container.ID, err)
+	}
 	baseManifest, err := images.Manifest(leaseCtx, store, baseImage.Target(), platforms.Default())
 	if err != nil {
 		return LocalImage{}, fmt.Errorf("read source manifest for container %s: %w", container.ID, err)
@@ -177,6 +196,63 @@ func (b *ContainerdImageBuilder) Commit(ctx context.Context, container ResolvedC
 	}
 
 	return LocalImage{Reference: target, Target: manifestDesc}, nil
+}
+
+func (b *ContainerdImageBuilder) ensureBaseImageContent(ctx context.Context, image containerd.Image) error {
+	return ensurePlatformContent(
+		ctx,
+		b.client.ContentStore(),
+		image.Target(),
+		platforms.Default(),
+		func(ctx context.Context) error {
+			host, err := registryHost(image.Name())
+			if err != nil {
+				return err
+			}
+			credential := RegistryCredential{}
+			if b.sourceCredentials != nil {
+				credential, err = b.sourceCredentials.Credential(ctx, host)
+				if err != nil {
+					return fmt.Errorf("resolve source credentials for %s: %w", host, err)
+				}
+			}
+			resolver := newDockerResolver(host, credential, "https", false)
+			_, err = b.client.Fetch(
+				ctx,
+				image.Name(),
+				containerd.WithResolver(resolver),
+				containerd.WithPlatform(platforms.DefaultString()),
+			)
+			return err
+		},
+	)
+}
+
+func ensurePlatformContent(
+	ctx context.Context,
+	store content.Store,
+	target ocispec.Descriptor,
+	platform platforms.MatchComparer,
+	fetch func(context.Context) error,
+) error {
+	_, _, _, missing, err := images.Check(ctx, store, target, platform)
+	if err != nil {
+		return fmt.Errorf("check source image content: %w", err)
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	if err := fetch(ctx); err != nil {
+		return fmt.Errorf("fetch %d missing source image blob(s): %w", len(missing), err)
+	}
+	_, _, _, missing, err = images.Check(ctx, store, target, platform)
+	if err != nil {
+		return fmt.Errorf("recheck source image content: %w", err)
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("source image still has %d missing blob(s) after fetch", len(missing))
+	}
+	return nil
 }
 
 type commitMediaTypeSet struct {

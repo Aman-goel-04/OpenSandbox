@@ -37,10 +37,11 @@ const (
 // Config supplies implementation-specific dependencies while preserving the
 // common commit and unpause CLI contract.
 type Config struct {
-	CredentialProvider     imagecommitter.CredentialProvider
-	TerminationMessagePath string
-	Output                 io.Writer
-	ErrorOutput            io.Writer
+	CredentialProvider       imagecommitter.CredentialProvider
+	SourceCredentialProvider imagecommitter.CredentialProvider
+	TerminationMessagePath   string
+	Output                   io.Writer
+	ErrorOutput              io.Writer
 }
 
 // Run executes a commit or unpause operation.
@@ -79,7 +80,10 @@ func Run(ctx context.Context, args []string, config Config) error {
 	// Preserve the existing best-effort preparation behavior. It remains an
 	// implementation detail and is not part of the executable contract.
 	orchestrator.PreparationCommand = []string{"sync"}
-	orchestrator.Builder = imagecommitter.NewContainerdImageBuilder(client)
+	orchestrator.Builder = imagecommitter.NewContainerdImageBuilder(
+		client,
+		imagecommitter.WithSourceCredentialProvider(config.SourceCredentialProvider),
+	)
 	orchestrator.Pusher = imagecommitter.NewContainerdImagePusher(
 		client,
 		config.CredentialProvider,

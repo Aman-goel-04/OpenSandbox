@@ -35,10 +35,11 @@ func main() {
 	defer stop()
 	provider := imagecommitter.DockerConfigCredentialProvider{Path: registryConfigPath, ErrorOutput: os.Stderr}
 	if err := imagecommittercli.Run(ctx, os.Args[1:], imagecommittercli.Config{
-		CredentialProvider:     provider,
-		TerminationMessagePath: terminationMessagePath,
-		Output:                 os.Stdout,
-		ErrorOutput:            os.Stderr,
+		CredentialProvider:       provider,
+		SourceCredentialProvider: provider,
+		TerminationMessagePath:   terminationMessagePath,
+		Output:                   os.Stdout,
+		ErrorOutput:              os.Stderr,
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 		os.Exit(1)
