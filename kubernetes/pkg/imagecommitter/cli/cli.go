@@ -80,7 +80,11 @@ func Run(ctx context.Context, args []string, config Config) error {
 	// Preserve the existing best-effort preparation behavior. It remains an
 	// implementation detail and is not part of the executable contract.
 	orchestrator.PreparationCommand = []string{"sync"}
-	orchestrator.Builder = imagecommitter.NewContainerdImageBuilder(client, config.SourceCredentialProvider)
+	orchestrator.Builder = imagecommitter.NewContainerdImageBuilder(
+		client,
+		config.SourceCredentialProvider,
+		func(source string) bool { return shouldUseInsecureSourceRegistry(source, config.ErrorOutput) },
+	)
 	orchestrator.Pusher = imagecommitter.NewContainerdImagePusher(
 		client,
 		config.CredentialProvider,
@@ -167,14 +171,22 @@ func containerdNamespace() string {
 }
 
 func shouldUseInsecureRegistry(targetImage string, errorOutput io.Writer) bool {
-	if raw := strings.TrimSpace(os.Getenv("SNAPSHOT_REGISTRY_INSECURE")); raw != "" {
+	return shouldUseInsecureRegistryEnv(targetImage, "SNAPSHOT_REGISTRY_INSECURE", errorOutput)
+}
+
+func shouldUseInsecureSourceRegistry(sourceImage string, errorOutput io.Writer) bool {
+	return shouldUseInsecureRegistryEnv(sourceImage, "SOURCE_IMAGE_REGISTRY_INSECURE", errorOutput)
+}
+
+func shouldUseInsecureRegistryEnv(imageReference, environmentVariable string, errorOutput io.Writer) bool {
+	if raw := strings.TrimSpace(os.Getenv(environmentVariable)); raw != "" {
 		value, err := strconv.ParseBool(raw)
 		if err == nil {
 			return value
 		}
-		fmt.Fprintf(errorOutput, "WARNING: invalid SNAPSHOT_REGISTRY_INSECURE=%q; using host compatibility heuristic\n", raw)
+		fmt.Fprintf(errorOutput, "WARNING: invalid %s=%q; using host compatibility heuristic\n", environmentVariable, raw)
 	}
-	registryHost := strings.SplitN(targetImage, "/", 2)[0]
+	registryHost := strings.SplitN(imageReference, "/", 2)[0]
 	return strings.Contains(registryHost, "local") ||
 		strings.HasPrefix(registryHost, "127.") ||
 		strings.HasPrefix(registryHost, "10.") ||

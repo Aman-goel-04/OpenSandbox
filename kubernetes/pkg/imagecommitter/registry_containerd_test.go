@@ -25,6 +25,9 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+
+	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 func TestDockerConfigCredentialProvider(t *testing.T) {
@@ -110,5 +113,17 @@ func TestRegistryHost(t *testing.T) {
 	}
 	if host != "registry.example.com:5000" {
 		t.Fatalf("host = %q", host)
+	}
+}
+
+func TestReferenceWithDigestReplacesMutableTag(t *testing.T) {
+	descriptor := ocispec.Descriptor{Digest: digest.FromString("source image")}
+	got, err := referenceWithDigest("registry.example.com/project/image:latest", descriptor)
+	if err != nil {
+		t.Fatalf("referenceWithDigest failed: %v", err)
+	}
+	want := "registry.example.com/project/image@" + descriptor.Digest.String()
+	if got != want {
+		t.Fatalf("reference = %q, want %q", got, want)
 	}
 }

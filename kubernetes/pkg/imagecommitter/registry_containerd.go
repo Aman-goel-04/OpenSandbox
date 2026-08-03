@@ -103,9 +103,9 @@ func (p DockerConfigCredentialProvider) warn(format string, args ...any) {
 	}
 }
 
-// InsecureRegistryFunc reports whether the target may skip TLS verification
-// and fall back to plain HTTP.
-type InsecureRegistryFunc func(targetReference string) bool
+// InsecureRegistryFunc reports whether a registry reference may skip TLS
+// verification and fall back to plain HTTP.
+type InsecureRegistryFunc func(imageReference string) bool
 
 // ContainerdImagePusher pushes image content through containerd's resolver.
 type ContainerdImagePusher struct {
@@ -204,9 +204,21 @@ func shouldFallbackToPlainHTTP(err error) bool {
 func registryHost(imageReference string) (string, error) {
 	named, err := reference.ParseNormalizedNamed(imageReference)
 	if err != nil {
-		return "", fmt.Errorf("parse target image %q: %w", imageReference, err)
+		return "", fmt.Errorf("parse image reference %q: %w", imageReference, err)
 	}
 	return reference.Domain(named), nil
+}
+
+func referenceWithDigest(imageReference string, descriptor ocispec.Descriptor) (string, error) {
+	named, err := reference.ParseNormalizedNamed(imageReference)
+	if err != nil {
+		return "", fmt.Errorf("parse source image %q: %w", imageReference, err)
+	}
+	canonical, err := reference.WithDigest(reference.TrimNamed(named), descriptor.Digest)
+	if err != nil {
+		return "", fmt.Errorf("pin source image %q to digest %s: %w", imageReference, descriptor.Digest, err)
+	}
+	return canonical.String(), nil
 }
 
 func normalizeRegistryHost(value string) string {

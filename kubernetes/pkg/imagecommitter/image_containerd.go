@@ -37,13 +37,18 @@ import (
 type ContainerdImageBuilder struct {
 	client            *containerd.Client
 	sourceCredentials CredentialProvider
+	sourceInsecure    InsecureRegistryFunc
 }
 
-// NewContainerdImageBuilder creates a builder with the credential provider
-// used to recover missing source-image content. The provider may return empty
-// credentials for registries that permit anonymous pulls.
-func NewContainerdImageBuilder(client *containerd.Client, sourceCredentials CredentialProvider) *ContainerdImageBuilder {
-	return &ContainerdImageBuilder{client: client, sourceCredentials: sourceCredentials}
+// NewContainerdImageBuilder creates a builder with the credential and transport
+// policies used to recover missing source-image content. The provider may
+// return empty credentials for registries that permit anonymous pulls.
+func NewContainerdImageBuilder(client *containerd.Client, sourceCredentials CredentialProvider, sourceInsecure InsecureRegistryFunc) *ContainerdImageBuilder {
+	return &ContainerdImageBuilder{
+		client:            client,
+		sourceCredentials: sourceCredentials,
+		sourceInsecure:    sourceInsecure,
+	}
 }
 
 func (b *ContainerdImageBuilder) Commit(ctx context.Context, container ResolvedContainer, target string) (LocalImage, error) {
@@ -193,27 +198,55 @@ func (b *ContainerdImageBuilder) ensureBaseImageContent(ctx context.Context, ima
 		image.Target(),
 		platforms.Default(),
 		func(ctx context.Context) error {
-			host, err := registryHost(image.Name())
-			if err != nil {
-				return err
-			}
-			credential := RegistryCredential{}
-			if b.sourceCredentials != nil {
-				credential, err = b.sourceCredentials.Credential(ctx, host)
-				if err != nil {
-					return fmt.Errorf("resolve source credentials for %s: %w", host, err)
-				}
-			}
-			resolver := newDockerResolver(host, credential, "https", false)
-			_, err = b.client.Fetch(
-				ctx,
-				image.Name(),
-				containerd.WithResolver(resolver),
-				containerd.WithPlatform(platforms.DefaultString()),
-			)
-			return err
+			return b.fetchBaseImageContent(ctx, image)
 		},
 	)
+}
+
+func (b *ContainerdImageBuilder) fetchBaseImageContent(ctx context.Context, image containerd.Image) error {
+	sourceReference, err := referenceWithDigest(image.Name(), image.Target())
+	if err != nil {
+		return err
+	}
+	host, err := registryHost(sourceReference)
+	if err != nil {
+		return err
+	}
+	credential := RegistryCredential{}
+	if b.sourceCredentials != nil {
+		credential, err = b.sourceCredentials.Credential(ctx, host)
+		if err != nil {
+			return fmt.Errorf("resolve source credentials for %s: %w", host, err)
+		}
+	}
+	insecure := b.sourceInsecure != nil && b.sourceInsecure(sourceReference)
+	if err := b.fetchBaseImageContentWithTransport(ctx, sourceReference, host, credential, "https", insecure); err != nil {
+		if !insecure || !shouldFallbackToPlainHTTP(err) {
+			return fmt.Errorf("fetch source image %s: %w", sourceReference, err)
+		}
+		if err := b.fetchBaseImageContentWithTransport(ctx, sourceReference, host, credential, "http", false); err != nil {
+			return fmt.Errorf("fetch source image %s over plain HTTP: %w", sourceReference, err)
+		}
+	}
+	return nil
+}
+
+func (b *ContainerdImageBuilder) fetchBaseImageContentWithTransport(
+	ctx context.Context,
+	sourceReference string,
+	host string,
+	credential RegistryCredential,
+	scheme string,
+	skipVerify bool,
+) error {
+	resolver := newDockerResolver(host, credential, scheme, skipVerify)
+	_, err := b.client.Fetch(
+		ctx,
+		sourceReference,
+		containerd.WithResolver(resolver),
+		containerd.WithPlatform(platforms.DefaultString()),
+	)
+	return err
 }
 
 func ensurePlatformContent(

@@ -110,4 +110,17 @@ func TestShouldUseInsecureRegistry(t *testing.T) {
 			t.Fatal("private registry should use compatibility heuristic")
 		}
 	})
+	t.Run("source policy is independent from snapshot target", func(t *testing.T) {
+		t.Setenv("SNAPSHOT_REGISTRY_INSECURE", "true")
+		t.Setenv("SOURCE_IMAGE_REGISTRY_INSECURE", "false")
+		if shouldUseInsecureSourceRegistry("registry.example.com/source:test", os.Stderr) {
+			t.Fatal("source registry must not inherit the snapshot target policy")
+		}
+	})
+	t.Run("explicit source insecure", func(t *testing.T) {
+		t.Setenv("SOURCE_IMAGE_REGISTRY_INSECURE", "true")
+		if !shouldUseInsecureSourceRegistry("registry.example.com/source:test", os.Stderr) {
+			t.Fatal("explicit source policy should enable insecure transport")
+		}
+	})
 }
