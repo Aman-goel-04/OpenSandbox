@@ -39,7 +39,7 @@ image_tags=(
   -t "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/nodeagent:${TAG}"
 )
 if [[ -n "$GHCR_REPO" ]]; then image_tags+=(-t "${GHCR_REPO}/nodeagent:${TAG}"); fi
-if [[ "$TAG" == v* ]]; then
+if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   image_tags+=(
     -t "opensandbox/nodeagent:latest"
     -t "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/nodeagent:latest"

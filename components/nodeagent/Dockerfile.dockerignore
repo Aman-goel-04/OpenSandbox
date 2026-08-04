@@ -1,3 +1,3 @@
-bin/
-coverage.out
-*.test
+components/nodeagent/bin/
+components/nodeagent/coverage.out
+components/nodeagent/*.test
