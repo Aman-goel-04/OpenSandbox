@@ -36,6 +36,17 @@ from opensandbox_server.logging_config import configure_logging
 from opensandbox_server.startup_guard import api_key_confirm
 from opensandbox_server.tenants import validate_tenant_config, TenantProvider
 
+# Resolve the package version from installed metadata at runtime instead of
+# hardcoding it, so /openapi.json and /docs reflect the deployed release.
+# Mirrors cli/src/opensandbox_cli/__init__.py; falls back when the package
+# metadata is unavailable (e.g. running from a source checkout without install).
+try:
+    from importlib.metadata import version as _pkg_version
+
+    __version__ = _pkg_version("opensandbox-server")
+except Exception:
+    __version__ = "0.0.0-dev"
+
 # Load configuration before initializing routers/middleware
 app_config = load_config()
 _log_config = configure_logging(app_config.log)
@@ -159,7 +170,7 @@ async def lifespan(app: FastAPI):
 # Initialize FastAPI application
 app = FastAPI(
     title="OpenSandbox Lifecycle API",
-    version="0.1.0",
+    version=__version__,
     description="The Sandbox Lifecycle API coordinates how untrusted workloads are created, "
                 "executed, paused, resumed, and finally disposed.",
     docs_url="/docs",
