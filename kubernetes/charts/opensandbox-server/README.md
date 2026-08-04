@@ -7,6 +7,7 @@ OpenSandbox Lifecycle API server: provides sandbox create/delete and other lifec
 - Kubernetes 1.21.1+
 - Helm 3.0+
 - OpenSandbox CRDs installed (deploy opensandbox-controller first)
+- A sandbox workload namespace matching `[kubernetes].namespace` in `configToml` (default: `opensandbox`)
 
 ## Install from a GitHub Release
 
@@ -24,6 +25,7 @@ By default, the server requires an API key for non-interactive startup. Create a
 
 ```bash
 kubectl create namespace opensandbox-system --dry-run=client -o yaml | kubectl apply -f -
+kubectl create namespace opensandbox --dry-run=client -o yaml | kubectl apply -f -
 
 read -s OPENSANDBOX_API_KEY
 kubectl create secret generic opensandbox-api-key \
@@ -57,6 +59,9 @@ See the [Kubernetes deployment guide](../../../docs/kubernetes/deployment.md) fo
 ## Install from local source
 
 ```bash
+# Create the default sandbox workload namespace
+kubectl create namespace opensandbox --dry-run=client -o yaml | kubectl apply -f -
+
 # Server only (default namespace opensandbox-system)
 helm install opensandbox-server ./kubernetes/charts/opensandbox-server \
   --namespace opensandbox-system \
@@ -113,7 +118,7 @@ Versioning note:
 
 **Gateway**: When `server.gateway.enabled=true`, the chart writes `[ingress] mode = "gateway"` in config.toml and deploys **components/ingress** Deployment/Service/RBAC; gateway `--mode` matches config. External access must be configured separately.
 
-Set `[kubernetes].namespace` in config for the sandbox workload namespace. Configure `OPENSANDBOX_SERVER_API_KEY` from a Secret in production. The container and `ClusterIP` Service use port `80`; keep `[server].port = 80` when replacing `configToml`.
+Set `[kubernetes].namespace` in config for the sandbox workload namespace and create that namespace before submitting workloads. Configure `OPENSANDBOX_SERVER_API_KEY` from a Secret in production. The container and `ClusterIP` Service use port `80`; keep `[server].port = 80` when replacing `configToml`.
 
 ## Upgrade and uninstall
 

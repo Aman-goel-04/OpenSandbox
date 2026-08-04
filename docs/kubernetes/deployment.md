@@ -37,10 +37,11 @@ The release tag identifies the server application version, while the `.tgz` file
 
 ### Configure API authentication
 
-By default, the server refuses to start without an API key in a non-interactive container. Create the namespace and store the key in a Kubernetes `Secret`:
+By default, the server refuses to start without an API key in a non-interactive container. Create both the control-plane namespace and the default sandbox workload namespace, then store the key in a Kubernetes `Secret`:
 
 ```bash
 kubectl create namespace opensandbox-system --dry-run=client -o yaml | kubectl apply -f -
+kubectl create namespace opensandbox --dry-run=client -o yaml | kubectl apply -f -
 
 read -s OPENSANDBOX_API_KEY
 kubectl create secret generic opensandbox-api-key \
@@ -65,6 +66,8 @@ server:
 ```
 
 Use an external secret manager instead of creating the Secret manually in production environments.
+
+The chart installs the server into `opensandbox-system`, while the default `configToml` creates sandbox and pool resources in `opensandbox`. If you change `[kubernetes].namespace` in `configToml`, create that namespace instead of `opensandbox` before submitting workloads.
 
 ### Install and verify
 
@@ -108,7 +111,7 @@ curl --fail http://127.0.0.1:8080/health
 | `server.image.tag` | Server image version | Pin explicitly when it must differ from the chart default. |
 | `server.replicaCount` | Number of server Pods | Defaults to `2`. |
 | `server.env` | Additional container environment variables | Use it with `secretKeyRef` for `OPENSANDBOX_SERVER_API_KEY`. |
-| `configToml` | Complete server configuration | Mounted at `/etc/opensandbox/config.toml`; overriding it replaces the complete default TOML. |
+| `configToml` | Complete server configuration | Mounted at `/etc/opensandbox/config.toml`; overriding it replaces the complete default TOML, including the workload namespace. |
 | `server.gateway.enabled` | Deploy the ingress gateway with the server | Defaults to `false`. |
 | `namespaceOverride` | Namespace used by chart resources | Defaults to `opensandbox-system`. |
 
