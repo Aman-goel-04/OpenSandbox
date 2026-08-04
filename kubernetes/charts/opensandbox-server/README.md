@@ -8,7 +8,53 @@ OpenSandbox Lifecycle API server: provides sandbox create/delete and other lifec
 - Helm 3.0+
 - OpenSandbox CRDs installed (deploy opensandbox-controller first)
 
-## Install
+## Install from a GitHub Release
+
+Choose a published `opensandbox-server` chart from [GitHub Releases](https://github.com/opensandbox-group/OpenSandbox/releases?q=helm%2Fopensandbox-server&expanded=true). The release tag uses the application version, while the package filename uses the chart version shown in the release notes.
+
+```bash
+APP_VERSION="<app-version>"
+CHART_VERSION="<chart-version>"
+CHART_URL="https://github.com/opensandbox-group/OpenSandbox/releases/download/helm/opensandbox-server/${APP_VERSION}/opensandbox-server-${CHART_VERSION}.tgz"
+
+helm show values "${CHART_URL}"
+```
+
+By default, the server requires an API key for non-interactive startup. Create a Kubernetes Secret and reference it from a values file:
+
+```bash
+kubectl create namespace opensandbox-system --dry-run=client -o yaml | kubectl apply -f -
+
+read -s OPENSANDBOX_API_KEY
+kubectl create secret generic opensandbox-api-key \
+  --namespace opensandbox-system \
+  --from-literal=api-key="${OPENSANDBOX_API_KEY}" \
+  --dry-run=client -o yaml | kubectl apply -f -
+unset OPENSANDBOX_API_KEY
+```
+
+```yaml
+# values-server.yaml
+server:
+  env:
+    - name: OPENSANDBOX_SERVER_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: opensandbox-api-key
+          key: api-key
+```
+
+Install the versioned package:
+
+```bash
+helm install opensandbox-server "${CHART_URL}" \
+  --namespace opensandbox-system \
+  --values values-server.yaml
+```
+
+See the [Kubernetes deployment guide](../../../docs/kubernetes/deployment.md) for production configuration, verification, and upgrades.
+
+## Install from local source
 
 ```bash
 # Server only (default namespace opensandbox-system)
@@ -43,11 +89,12 @@ Optional: override gateway image, replicas, or resources (see `server.gateway.*`
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `server.image.repository` | Server image repository | `sandbox-registry.../opensandbox/server` |
-| `server.image.tag` | Server image tag | Chart `appVersion` |
+| `server.image.tag` | Server image tag | See `values.yaml` |
 | `server.replicaCount` | Server replicas | `2` |
+| `server.env` | Additional environment variables, including Secret-backed API key configuration | `[]` |
 | `server.resources` | CPU/memory requests and limits | See values.yaml |
 | `namespaceOverride` | Deployment namespace | `opensandbox-system` |
-| `configToml` | config.toml content ([ingress] block generated from server.gateway) | See values.yaml |
+| `configToml` | Complete config.toml content, mounted at `/etc/opensandbox/config.toml` | See values.yaml |
 | `server.gateway.enabled` | When true: set server config to gateway and deploy components/ingress gateway | `false` |
 | `server.gateway.host` | config `gateway.address` (address returned to clients) | `opensandbox.example.com` |
 | `server.gateway.gatewayRouteMode` | server config and gateway route mode (header/uri) | `header` |
@@ -66,12 +113,14 @@ Versioning note:
 
 **Gateway**: When `server.gateway.enabled=true`, the chart writes `[ingress] mode = "gateway"` in config.toml and deploys **components/ingress** Deployment/Service/RBAC; gateway `--mode` matches config. External access must be configured separately.
 
-Set `[kubernetes].namespace` in config for the sandbox workload namespace. Override `api_key` via Secret or values in production.
+Set `[kubernetes].namespace` in config for the sandbox workload namespace. Configure `OPENSANDBOX_SERVER_API_KEY` from a Secret in production. The container and `ClusterIP` Service use port `80`; keep `[server].port = 80` when replacing `configToml`.
 
 ## Upgrade and uninstall
 
 ```bash
-helm upgrade opensandbox-server ./kubernetes/charts/opensandbox-server -n opensandbox-system
+helm upgrade opensandbox-server "${CHART_URL}" \
+  --namespace opensandbox-system \
+  --values values-server.yaml
 helm uninstall opensandbox-server -n opensandbox-system
 ```
 
