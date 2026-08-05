@@ -84,7 +84,8 @@ data class RetryEvent(
 /**
  * Retry configuration for non-streaming requests.
  *
- * Defaults retry idempotent methods only. Use [disabled] for fast-fail. Extend
+ * Defaults retry idempotent methods only. Use [disabled] to disable SDK-policy
+ * retries and fall back to OkHttp's built-in connection recovery. Extend
  * [retryableStatusCodesNonIdempotent] to opt `POST`/`PATCH` in on specific status
  * codes; the SDK never does this on the caller's behalf.
  *
@@ -94,7 +95,7 @@ data class RetryEvent(
 class RetryPolicy
     @JvmOverloads
     constructor(
-        /** Retries after the initial attempt. `0` disables retry. */
+        /** Retries after the initial attempt. `0` disables SDK-policy retries. */
         val maxRetries: Int = DEFAULT_MAX_RETRIES,
         val initialBackoff: Duration = Duration.ofMillis(500),
         val maxBackoff: Duration = Duration.ofSeconds(30),
@@ -160,7 +161,7 @@ class RetryPolicy
                     StatusCode.SERVICE_UNAVAILABLE,
                 )
 
-            /** Never retry. Also suppresses fresh-connection recovery. */
+            /** Disable SDK-policy retries and fall back to OkHttp's built-in connection recovery. */
             @JvmStatic
             fun disabled(): RetryPolicy = RetryPolicy(maxRetries = 0)
         }

@@ -61,8 +61,9 @@ class ConnectionConfig private constructor(
     val disableMetrics: Boolean = false,
     /**
      * Retry policy applied to non-streaming requests. Enabled by default; pass
-     * [RetryPolicy.disabled] for fast-fail. SSE / streaming requests always
-     * bypass retry regardless of this value.
+     * [RetryPolicy.disabled] to disable SDK-policy retries and fall back to
+     * OkHttp's built-in connection recovery. SSE / streaming requests always
+     * bypass the SDK retry policy regardless of this value.
      */
     val retryPolicy: RetryPolicy = RetryPolicy(),
 ) {
@@ -296,8 +297,9 @@ class ConnectionConfig private constructor(
          * Set the retry policy applied to non-streaming requests.
          *
          * Retries are enabled by default (idempotent methods only). Pass
-         * [RetryPolicy.disabled] for fast-fail semantics. SSE / streaming
-         * requests always bypass retry.
+         * [RetryPolicy.disabled] to disable SDK-policy retries and fall back to
+         * OkHttp's built-in connection recovery. SSE / streaming requests always
+         * bypass the SDK retry policy.
          */
         fun retryPolicy(retryPolicy: RetryPolicy): Builder {
             this.retryPolicy = retryPolicy

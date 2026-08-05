@@ -372,12 +372,14 @@ Default behavior:
   (before any byte is written) are still retried for these methods.
 - Up to `3` retries with decorrelated-jitter exponential backoff, honoring a server
   `Retry-After` header (capped at 60s).
-- **SSE / streaming requests bypass retry** entirely (bodies are not replayable).
+- **SSE / streaming requests bypass the SDK retry policy** because their bodies
+  are not safely replayable. They retain OkHttp's built-in connection recovery.
 
 ::: warning Behavior change
-Retries are on by default. This can increase the number of HTTP attempts and tail
-latency compared to earlier SDK versions. If you rely on fast-fail semantics, opt
-out explicitly with `RetryPolicy.disabled()`.
+SDK-policy retries are on by default. This can increase the number of HTTP attempts
+and tail latency compared to earlier SDK versions. To disable the new SDK-policy
+retries, use `RetryPolicy.disabled()`; non-streaming requests then fall back to
+OkHttp's pre-existing built-in connection recovery.
 :::
 
 ```java
@@ -386,7 +388,7 @@ import com.alibaba.opensandbox.sandbox.transport.StatusCode;
 import java.time.Duration;
 import java.util.Set;
 
-// Fast-fail: never retry.
+// Disable SDK-policy retries and retain OkHttp's built-in connection recovery.
 ConnectionConfig config = ConnectionConfig.builder()
     .apiKey("your-key")
     .domain("api.opensandbox.io")
