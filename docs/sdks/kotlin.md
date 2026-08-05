@@ -372,8 +372,9 @@ Default behavior:
   (before any byte is written) are still retried for these methods.
 - Up to `3` retries with decorrelated-jitter exponential backoff, honoring a server
   `Retry-After` header (capped at 60s).
-- **SSE / streaming requests bypass the SDK retry policy** because their bodies
-  are not safely replayable. They retain OkHttp's built-in connection recovery.
+- **SSE / streaming requests bypass all automatic retry** because their bodies
+  are not safely replayable. The SSE client also disables OkHttp's built-in
+  connection recovery to prevent a streaming command POST from being replayed.
 
 ::: warning Behavior change
 SDK-policy retries are on by default. This can increase the number of HTTP attempts

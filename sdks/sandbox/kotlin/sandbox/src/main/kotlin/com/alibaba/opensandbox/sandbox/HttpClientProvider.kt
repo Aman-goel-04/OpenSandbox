@@ -78,10 +78,9 @@ class HttpClientProvider(
 
     // 3. Explicit lazy definition for SSE client
     //
-    // The SSE client deliberately does NOT install the retry interceptor: SSE
-    // bootstraps hold the response body open and their request bodies are not
-    // safely replayable for a non-idempotent status opt-in. It retains OkHttp's
-    // built-in connection recovery regardless of RetryPolicy.
+    // The SSE client deliberately disables all automatic retries: streaming
+    // command POSTs are not safely replayable and could start a command twice
+    // if the connection fails after the server accepts the request.
     private val sseClientLazy =
         lazy {
             baseBuilder
@@ -89,6 +88,7 @@ class HttpClientProvider(
                 .readTimeout(0, TimeUnit.MILLISECONDS)
                 .writeTimeout(config.requestTimeout.toMillis(), TimeUnit.MILLISECONDS)
                 .callTimeout(0, TimeUnit.MILLISECONDS)
+                .retryOnConnectionFailure(false)
                 .addInterceptor(ExtraHeadersInterceptor(getSseHeaders()))
                 .addLoggingInterceptor()
                 .build()
