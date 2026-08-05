@@ -98,6 +98,9 @@ server:
       # (server: OPENSANDBOX_SECURE_ACCESS_*; gateway: $(...) expansion in the
       # --secure-access-keys arg), so key material never appears in values,
       # the server ConfigMap, or pod args.
+      # Env-sourced Secrets are read once at container start: after updating
+      # the Secret in place, `kubectl rollout restart` the server and gateway
+      # Deployments (or version the Secret name to get a spec-driven rollout).
       existingSecret: ""
     # -- Node selector for the ingress gateway pod.
     nodeSelector: {}
