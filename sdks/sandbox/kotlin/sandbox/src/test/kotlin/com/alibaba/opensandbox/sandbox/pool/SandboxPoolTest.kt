@@ -30,6 +30,7 @@ import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.PlatformSpec
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.Volume
 import com.alibaba.opensandbox.sandbox.domain.pool.AcquirePolicy
 import com.alibaba.opensandbox.sandbox.domain.pool.IdleEntry
+import com.alibaba.opensandbox.sandbox.domain.pool.PoolConfig
 import com.alibaba.opensandbox.sandbox.domain.pool.PoolCreationSpec
 import com.alibaba.opensandbox.sandbox.domain.pool.PoolDestroyState
 import com.alibaba.opensandbox.sandbox.domain.pool.PoolLifecycleState
@@ -38,6 +39,7 @@ import com.alibaba.opensandbox.sandbox.domain.pool.PoolStateStore
 import com.alibaba.opensandbox.sandbox.domain.pool.PooledSandboxCreator
 import com.alibaba.opensandbox.sandbox.domain.pool.SandboxPreparer
 import com.alibaba.opensandbox.sandbox.domain.pool.StoreCounters
+import com.alibaba.opensandbox.sandbox.domain.pool.TakeIdleResult
 import com.alibaba.opensandbox.sandbox.infrastructure.pool.InMemoryPoolStateStore
 import io.mockk.every
 import io.mockk.just
@@ -49,13 +51,17 @@ import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import java.io.InterruptedIOException
 import java.time.Duration
 import java.time.Instant
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 class SandboxPoolTest {
     @Test
@@ -90,10 +96,16 @@ class SandboxPoolTest {
     @Test
     fun `snapshot reports in flight operations`() {
         val pool = buildPool()
-        val inFlight = AtomicInteger(3)
-        setPrivateField(pool, "inFlightOperations", inFlight)
-
-        val snap = pool.snapshot()
+        pool.start()
+        val inFlight = currentRunInFlight(pool)
+        inFlight.set(3)
+        val snap =
+            try {
+                pool.snapshot()
+            } finally {
+                inFlight.set(0)
+                pool.shutdown(graceful = false)
+            }
 
         assertEquals(3, snap.inFlightOperations)
     }
@@ -120,6 +132,719 @@ class SandboxPoolTest {
         val snap = pool.snapshot()
         assertEquals(PoolState.STOPPED, snap.state)
         assertEquals(PoolLifecycleState.STOPPED, snap.lifecycleState)
+    }
+
+    @Test
+    fun `rolling warmup fills a released slot without waiting for slow tail`() {
+        val store = InMemoryPoolStateStore()
+        val created = AtomicInteger(0)
+        val active = AtomicInteger(0)
+        val maxActive = AtomicInteger(0)
+        val slowWarmupStarted = CountDownLatch(1)
+        val releaseSlowWarmup = CountDownLatch(1)
+        val thirdWarmupStarted = CountDownLatch(1)
+
+        val pool =
+            SandboxPool.builder()
+                .poolName("rolling-pool")
+                .ownerId("rolling-owner")
+                .maxIdle(4)
+                .warmupConcurrency(2)
+                .stateStore(store)
+                .connectionConfig(ConnectionConfig.builder().build())
+                .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
+                .sandboxCreator(
+                    PooledSandboxCreator {
+                        val index = created.incrementAndGet()
+                        mockk<Sandbox>(relaxed = true).also { sandbox ->
+                            every { sandbox.id } returns "rolling-$index"
+                        }
+                    },
+                ).warmupSkipHealthCheck()
+                .warmupSandboxPreparer(
+                    SandboxPreparer { sandbox ->
+                        val currentActive = active.incrementAndGet()
+                        maxActive.updateAndGet { current -> maxOf(current, currentActive) }
+                        try {
+                            when (sandbox.id) {
+                                "rolling-1" -> {
+                                    slowWarmupStarted.countDown()
+                                    releaseSlowWarmup.await()
+                                }
+                                "rolling-3" -> thirdWarmupStarted.countDown()
+                            }
+                        } finally {
+                            active.decrementAndGet()
+                        }
+                    },
+                ).reconcileInterval(Duration.ofSeconds(30))
+                .drainTimeout(Duration.ofSeconds(2))
+                .build()
+
+        pool.start()
+        try {
+            assertTrue(slowWarmupStarted.await(5, TimeUnit.SECONDS))
+            assertTrue(
+                thirdWarmupStarted.await(5, TimeUnit.SECONDS),
+                "a fast completion should refill its slot before the slow first warmup finishes",
+            )
+            assertEquals(1L, releaseSlowWarmup.count, "slow warmup must still be blocked")
+            assertTrue(maxActive.get() <= 2, "rolling warmup must respect warmupConcurrency")
+
+            releaseSlowWarmup.countDown()
+            awaitCondition { store.snapshotCounters("rolling-pool").idleCount == 4 }
+            assertEquals(4, created.get())
+        } finally {
+            releaseSlowWarmup.countDown()
+            pool.shutdown(graceful = false)
+        }
+    }
+
+    @Test
+    fun `primary heartbeat continues while warmup is blocked`() {
+        val store = HeartbeatRecordingStore()
+        val sandbox = mockk<Sandbox>(relaxed = true)
+        val warmupStarted = CountDownLatch(1)
+        val releaseWarmup = CountDownLatch(1)
+        every { sandbox.id } returns "heartbeat-warmup"
+
+        val pool =
+            SandboxPool.builder()
+                .poolName("heartbeat-pool")
+                .ownerId("heartbeat-owner")
+                .maxIdle(1)
+                .warmupConcurrency(1)
+                .primaryLockTtl(Duration.ofMillis(300))
+                .reconcileInterval(Duration.ofSeconds(30))
+                .stateStore(store)
+                .connectionConfig(ConnectionConfig.builder().build())
+                .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
+                .sandboxCreator(PooledSandboxCreator { sandbox })
+                .warmupSkipHealthCheck()
+                .warmupSandboxPreparer(
+                    SandboxPreparer {
+                        warmupStarted.countDown()
+                        releaseWarmup.await()
+                    },
+                ).drainTimeout(Duration.ofSeconds(2))
+                .build()
+
+        pool.start()
+        try {
+            assertTrue(warmupStarted.await(5, TimeUnit.SECONDS))
+            awaitCondition { store.renewCalls.get() >= 3 }
+            assertEquals(1L, releaseWarmup.count, "warmup must remain blocked while heartbeat renews")
+        } finally {
+            releaseWarmup.countDown()
+            pool.shutdown(graceful = true)
+        }
+    }
+
+    @Test
+    fun `warmup result is killed instead of entering idle after primary lock loss`() {
+        val store = RenewFailsAfterAdmissionStore()
+        val manager = mockk<SandboxManager>(relaxed = true)
+        val sandbox = mockk<Sandbox>(relaxed = true)
+        val killed = CountDownLatch(1)
+        every { sandbox.id } returns "lost-lock-warmup"
+        every { manager.killSandbox("lost-lock-warmup") } answers {
+            killed.countDown()
+        }
+        val pool =
+            SandboxPool(
+                config =
+                    PoolConfig.builder()
+                        .poolName("lost-lock-pool")
+                        .ownerId("lost-lock-owner")
+                        .maxIdle(1)
+                        .warmupConcurrency(1)
+                        .stateStore(store)
+                        .connectionConfig(ConnectionConfig.builder().build())
+                        .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
+                        .sandboxCreator(PooledSandboxCreator { sandbox })
+                        .warmupSkipHealthCheck()
+                        .reconcileInterval(Duration.ofSeconds(30))
+                        .build(),
+                sandboxManagerFactory = { manager },
+            )
+
+        pool.start()
+        try {
+            assertTrue(killed.await(5, TimeUnit.SECONDS))
+            assertEquals(0, store.snapshotCounters("lost-lock-pool").idleCount)
+            verify(exactly = 1) { manager.killSandbox("lost-lock-warmup") }
+        } finally {
+            pool.shutdown(graceful = false)
+        }
+    }
+
+    @Test
+    fun `warmup put failure records backoff and cleans remote sandbox`() {
+        val store = PutIdleFailureStore()
+        val manager = mockk<SandboxManager>(relaxed = true)
+        val sandbox = mockk<Sandbox>(relaxed = true)
+        val killed = CountDownLatch(1)
+        every { sandbox.id } returns "put-failed-warmup"
+        every { manager.killSandbox("put-failed-warmup") } answers {
+            killed.countDown()
+        }
+        val pool =
+            SandboxPool(
+                config =
+                    PoolConfig.builder()
+                        .poolName("put-failed-pool")
+                        .ownerId("put-failed-owner")
+                        .maxIdle(1)
+                        .warmupConcurrency(1)
+                        .degradedThreshold(1)
+                        .stateStore(store)
+                        .connectionConfig(ConnectionConfig.builder().build())
+                        .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
+                        .sandboxCreator(PooledSandboxCreator { sandbox })
+                        .warmupSkipHealthCheck()
+                        .reconcileInterval(Duration.ofSeconds(30))
+                        .build(),
+                sandboxManagerFactory = { manager },
+            )
+
+        pool.start()
+        try {
+            assertTrue(killed.await(5, TimeUnit.SECONDS))
+            awaitCondition { pool.snapshot().backoffActive }
+            assertEquals(PoolState.DEGRADED, pool.snapshot().state)
+            assertEquals(0, store.snapshotCounters("put-failed-pool").idleCount)
+            verify(exactly = 1) { manager.killSandbox("put-failed-warmup") }
+        } finally {
+            pool.shutdown(graceful = false)
+        }
+    }
+
+    @Test
+    fun `shutdown graceful waits for in-flight warmup without interrupting it`() {
+        val store = InMemoryPoolStateStore()
+        val sandbox = mockk<Sandbox>(relaxed = true)
+        val warmupStarted = CountDownLatch(1)
+        val releaseWarmup = CountDownLatch(1)
+        val warmupInterrupted = AtomicBoolean(false)
+        every { sandbox.id } returns "warmup-id"
+
+        val pool =
+            SandboxPool.builder()
+                .poolName("test-pool")
+                .ownerId("test-owner")
+                .maxIdle(1)
+                .warmupConcurrency(1)
+                .stateStore(store)
+                .connectionConfig(ConnectionConfig.builder().build())
+                .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
+                .sandboxCreator(PooledSandboxCreator { sandbox })
+                .warmupSkipHealthCheck()
+                .warmupSandboxPreparer(
+                    SandboxPreparer {
+                        warmupStarted.countDown()
+                        try {
+                            releaseWarmup.await()
+                        } catch (e: InterruptedException) {
+                            warmupInterrupted.set(true)
+                            throw e
+                        }
+                    },
+                ).drainTimeout(Duration.ofSeconds(2))
+                .reconcileInterval(Duration.ofSeconds(30))
+                .build()
+
+        var releaser: Thread? = null
+        pool.start()
+        try {
+            assertTrue(warmupStarted.await(5, TimeUnit.SECONDS))
+            releaser =
+                Thread {
+                    Thread.sleep(250)
+                    releaseWarmup.countDown()
+                }.apply { start() }
+
+            pool.shutdown(graceful = true)
+
+            assertEquals(false, warmupInterrupted.get())
+            assertEquals(1, store.snapshotCounters("test-pool").idleCount)
+            verify(exactly = 0) { sandbox.kill() }
+            verify(exactly = 1) { sandbox.close() }
+        } finally {
+            releaseWarmup.countDown()
+            releaser?.join(5_000)
+            pool.shutdown(graceful = false)
+        }
+    }
+
+    @Test
+    fun `shutdown graceful force interrupts warmup after drain timeout`() {
+        val store = InMemoryPoolStateStore()
+        val sandbox = mockk<Sandbox>(relaxed = true)
+        val warmupStarted = CountDownLatch(1)
+        val blockWarmup = CountDownLatch(1)
+        val warmupInterrupted = AtomicBoolean(false)
+        val killSawInterrupt = AtomicBoolean(false)
+        val closeSawInterrupt = AtomicBoolean(false)
+        every { sandbox.id } returns "timed-out-warmup-id"
+        every { sandbox.kill() } answers {
+            killSawInterrupt.set(Thread.currentThread().isInterrupted)
+            if (killSawInterrupt.get()) {
+                throw InterruptedIOException("interrupted")
+            }
+        }
+        every { sandbox.close() } answers {
+            closeSawInterrupt.set(Thread.currentThread().isInterrupted)
+        }
+
+        val pool =
+            SandboxPool.builder()
+                .poolName("test-pool")
+                .ownerId("test-owner")
+                .maxIdle(1)
+                .warmupConcurrency(1)
+                .stateStore(store)
+                .connectionConfig(ConnectionConfig.builder().build())
+                .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
+                .sandboxCreator(PooledSandboxCreator { sandbox })
+                .warmupSkipHealthCheck()
+                .warmupSandboxPreparer(
+                    SandboxPreparer {
+                        warmupStarted.countDown()
+                        try {
+                            blockWarmup.await()
+                        } catch (e: InterruptedException) {
+                            warmupInterrupted.set(true)
+                            Thread.currentThread().interrupt()
+                            throw e
+                        }
+                    },
+                ).drainTimeout(Duration.ofMillis(200))
+                .reconcileInterval(Duration.ofSeconds(30))
+                .build()
+
+        pool.start()
+        try {
+            assertTrue(warmupStarted.await(5, TimeUnit.SECONDS))
+            val shutdownStartedAt = System.nanoTime()
+
+            pool.shutdown(graceful = true)
+
+            val shutdownElapsedMs = Duration.ofNanos(System.nanoTime() - shutdownStartedAt).toMillis()
+            assertTrue(shutdownElapsedMs >= 150, "graceful shutdown should wait for drain timeout before forcing stop")
+            assertEquals(true, warmupInterrupted.get())
+            assertEquals(false, killSawInterrupt.get(), "cleanup kill must not inherit the worker interrupt state")
+            assertEquals(true, closeSawInterrupt.get(), "worker interrupt state must be restored after cleanup kill")
+            assertEquals(0, store.snapshotCounters("test-pool").idleCount)
+            verify(exactly = 1) { sandbox.kill() }
+            verify(exactly = 1) { sandbox.close() }
+        } finally {
+            blockWarmup.countDown()
+            pool.shutdown(graceful = false)
+        }
+    }
+
+    @Test
+    fun `warmup success from retired run is killed and cannot enter restarted pool`() {
+        val store = InMemoryPoolStateStore()
+        val manager = mockk<SandboxManager>(relaxed = true)
+        val oldSandbox = mockk<Sandbox>(relaxed = true)
+        val newSandbox = mockk<Sandbox>(relaxed = true)
+        val createCount = AtomicInteger(0)
+        val oldWarmupStarted = CountDownLatch(1)
+        val releaseOldWarmup = CountDownLatch(1)
+        val oldSandboxKilled = CountDownLatch(1)
+        every { oldSandbox.id } returns "old-run-sandbox"
+        every { newSandbox.id } returns "new-run-sandbox"
+        every { manager.killSandbox("old-run-sandbox") } answers {
+            oldSandboxKilled.countDown()
+        }
+
+        val pool =
+            SandboxPool(
+                config =
+                    PoolConfig.builder()
+                        .poolName("restart-pool")
+                        .ownerId("test-owner")
+                        .maxIdle(1)
+                        .warmupConcurrency(1)
+                        .stateStore(store)
+                        .connectionConfig(ConnectionConfig.builder().build())
+                        .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
+                        .sandboxCreator(
+                            PooledSandboxCreator {
+                                if (createCount.getAndIncrement() == 0) oldSandbox else newSandbox
+                            },
+                        ).warmupSkipHealthCheck()
+                        .warmupSandboxPreparer(
+                            SandboxPreparer { sandbox ->
+                                if (sandbox === oldSandbox) {
+                                    oldWarmupStarted.countDown()
+                                    awaitIgnoringInterrupt(releaseOldWarmup)
+                                }
+                            },
+                        ).drainTimeout(Duration.ofMillis(50))
+                        .reconcileInterval(Duration.ofSeconds(30))
+                        .build(),
+                sandboxManagerFactory = { manager },
+            )
+
+        pool.start()
+        try {
+            assertTrue(oldWarmupStarted.await(5, TimeUnit.SECONDS))
+            val retiredRunInFlight = currentRunInFlight(pool)
+            shutdownWithoutWaitingForUncooperativeWorker(pool)
+
+            pool.start()
+            awaitCondition {
+                pool.snapshotIdleEntries().map { it.sandboxId } == listOf("new-run-sandbox")
+            }
+            awaitCondition { pool.snapshot().inFlightOperations == 0 }
+
+            releaseOldWarmup.countDown()
+            assertTrue(oldSandboxKilled.await(5, TimeUnit.SECONDS))
+            awaitCondition { retiredRunInFlight.get() == 0 }
+
+            assertEquals(listOf("new-run-sandbox"), pool.snapshotIdleEntries().map { it.sandboxId })
+            verify(exactly = 1) { manager.killSandbox("old-run-sandbox") }
+        } finally {
+            releaseOldWarmup.countDown()
+            pool.shutdown(graceful = false)
+        }
+    }
+
+    @Test
+    fun `warmup success after shutdown uses temporary manager for cleanup`() {
+        val store = InMemoryPoolStateStore()
+        val runningManager = mockk<SandboxManager>(relaxed = true)
+        val cleanupManager = mockk<SandboxManager>(relaxed = true)
+        val managerCount = AtomicInteger(0)
+        val sandbox = mockk<Sandbox>(relaxed = true)
+        val warmupStarted = CountDownLatch(1)
+        val releaseWarmup = CountDownLatch(1)
+        val sandboxKilled = CountDownLatch(1)
+        every { sandbox.id } returns "late-warmup-sandbox"
+        every { cleanupManager.killSandbox("late-warmup-sandbox") } answers {
+            sandboxKilled.countDown()
+        }
+
+        val pool =
+            SandboxPool(
+                config =
+                    PoolConfig.builder()
+                        .poolName("shutdown-cleanup-pool")
+                        .ownerId("test-owner")
+                        .maxIdle(1)
+                        .warmupConcurrency(1)
+                        .stateStore(store)
+                        .connectionConfig(ConnectionConfig.builder().build())
+                        .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
+                        .sandboxCreator(PooledSandboxCreator { sandbox })
+                        .warmupSkipHealthCheck()
+                        .warmupSandboxPreparer(
+                            SandboxPreparer {
+                                warmupStarted.countDown()
+                                awaitIgnoringInterrupt(releaseWarmup)
+                            },
+                        ).drainTimeout(Duration.ofMillis(50))
+                        .reconcileInterval(Duration.ofSeconds(30))
+                        .build(),
+                sandboxManagerFactory = {
+                    if (managerCount.getAndIncrement() == 0) runningManager else cleanupManager
+                },
+            )
+
+        pool.start()
+        try {
+            assertTrue(warmupStarted.await(5, TimeUnit.SECONDS))
+            val retiredRunInFlight = currentRunInFlight(pool)
+            shutdownWithoutWaitingForUncooperativeWorker(pool)
+            awaitCondition { pool.snapshot().inFlightOperations == 0 }
+
+            releaseWarmup.countDown()
+            assertTrue(sandboxKilled.await(5, TimeUnit.SECONDS))
+            awaitCondition { retiredRunInFlight.get() == 0 }
+
+            assertEquals(emptyList<String>(), pool.snapshotIdleEntries().map { it.sandboxId })
+            verify(exactly = 1) { cleanupManager.killSandbox("late-warmup-sandbox") }
+            verify(exactly = 1) { cleanupManager.close() }
+        } finally {
+            releaseWarmup.countDown()
+            pool.shutdown(graceful = false)
+        }
+    }
+
+    @Test
+    fun `warmup failure from retired run cannot degrade restarted pool`() {
+        val store = InMemoryPoolStateStore()
+        val oldSandbox = mockk<Sandbox>(relaxed = true)
+        val newSandbox = mockk<Sandbox>(relaxed = true)
+        val createCount = AtomicInteger(0)
+        val oldWarmupStarted = CountDownLatch(1)
+        val releaseOldWarmup = CountDownLatch(1)
+        every { oldSandbox.id } returns "old-failed-sandbox"
+        every { newSandbox.id } returns "new-run-sandbox"
+
+        val pool =
+            SandboxPool.builder()
+                .poolName("restart-failure-pool")
+                .ownerId("test-owner")
+                .maxIdle(1)
+                .warmupConcurrency(1)
+                .stateStore(store)
+                .connectionConfig(ConnectionConfig.builder().build())
+                .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
+                .sandboxCreator(
+                    PooledSandboxCreator {
+                        if (createCount.getAndIncrement() == 0) oldSandbox else newSandbox
+                    },
+                ).warmupSkipHealthCheck()
+                .warmupSandboxPreparer(
+                    SandboxPreparer { sandbox ->
+                        if (sandbox === oldSandbox) {
+                            oldWarmupStarted.countDown()
+                            awaitIgnoringInterrupt(releaseOldWarmup)
+                            throw RuntimeException("retired run warmup failed")
+                        }
+                    },
+                ).degradedThreshold(1)
+                .drainTimeout(Duration.ofMillis(50))
+                .reconcileInterval(Duration.ofSeconds(30))
+                .build()
+
+        pool.start()
+        try {
+            assertTrue(oldWarmupStarted.await(5, TimeUnit.SECONDS))
+            val retiredRunInFlight = currentRunInFlight(pool)
+            shutdownWithoutWaitingForUncooperativeWorker(pool)
+
+            pool.start()
+            awaitCondition {
+                pool.snapshotIdleEntries().map { it.sandboxId } == listOf("new-run-sandbox")
+            }
+            awaitCondition { pool.snapshot().inFlightOperations == 0 }
+
+            releaseOldWarmup.countDown()
+            awaitCondition { retiredRunInFlight.get() == 0 }
+
+            assertEquals(0, pool.snapshot().failureCount)
+            assertEquals(false, pool.snapshot().backoffActive)
+            assertEquals(PoolState.HEALTHY, pool.snapshot().state)
+            verify(exactly = 1) { oldSandbox.kill() }
+        } finally {
+            releaseOldWarmup.countDown()
+            pool.shutdown(graceful = false)
+        }
+    }
+
+    @Test
+    fun `forced scheduler shutdown completes queued warmup outcome and cleans sandbox`() {
+        val store = InMemoryPoolStateStore()
+        val manager = mockk<SandboxManager>(relaxed = true)
+        val sandbox = mockk<Sandbox>(relaxed = true)
+        val warmupStarted = CountDownLatch(1)
+        val releaseWarmup = CountDownLatch(1)
+        val warmupClosed = CountDownLatch(1)
+        val controllerBlocked = CountDownLatch(1)
+        val releaseController = CountDownLatch(1)
+        val sandboxKilled = CountDownLatch(1)
+        every { sandbox.id } returns "queued-completion-sandbox"
+        every { sandbox.close() } answers {
+            warmupClosed.countDown()
+        }
+        every { manager.killSandbox("queued-completion-sandbox") } answers {
+            sandboxKilled.countDown()
+        }
+
+        val pool =
+            SandboxPool(
+                config =
+                    PoolConfig.builder()
+                        .poolName("queued-completion-pool")
+                        .ownerId("test-owner")
+                        .maxIdle(1)
+                        .warmupConcurrency(1)
+                        .stateStore(store)
+                        .connectionConfig(ConnectionConfig.builder().build())
+                        .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
+                        .sandboxCreator(PooledSandboxCreator { sandbox })
+                        .warmupSkipHealthCheck()
+                        .warmupSandboxPreparer(
+                            SandboxPreparer {
+                                warmupStarted.countDown()
+                                releaseWarmup.await()
+                            },
+                        ).drainTimeout(Duration.ofMillis(50))
+                        .reconcileInterval(Duration.ofSeconds(30))
+                        .build(),
+                sandboxManagerFactory = { manager },
+            )
+
+        pool.start()
+        try {
+            assertTrue(warmupStarted.await(5, TimeUnit.SECONDS))
+            val retiredRunInFlight = currentRunInFlight(pool)
+            val pendingCompletions = currentRunPendingWarmupCompletions(pool)
+            val controller = getPrivateField<ScheduledExecutorService>(pool, "scheduler")
+            controller.execute {
+                controllerBlocked.countDown()
+                awaitIgnoringInterrupt(releaseController)
+            }
+            assertTrue(controllerBlocked.await(5, TimeUnit.SECONDS))
+
+            releaseWarmup.countDown()
+            assertTrue(warmupClosed.await(5, TimeUnit.SECONDS))
+            awaitCondition { pendingCompletions.size == 1 }
+            assertEquals(1, retiredRunInFlight.get())
+            assertEquals(0, store.snapshotCounters("queued-completion-pool").idleCount)
+
+            shutdownWithoutWaitingForUncooperativeWorker(pool)
+
+            assertTrue(sandboxKilled.await(5, TimeUnit.SECONDS))
+            awaitCondition { retiredRunInFlight.get() == 0 }
+            assertEquals(0, store.snapshotCounters("queued-completion-pool").idleCount)
+            verify(exactly = 1) { manager.killSandbox("queued-completion-sandbox") }
+        } finally {
+            releaseWarmup.countDown()
+            releaseController.countDown()
+            pool.shutdown(graceful = false)
+        }
+    }
+
+    @Test
+    fun `shutdown graceful waits for asynchronous discarded sandbox cleanup`() {
+        val store = DiscardingPoolStateStore()
+        val manager = mockk<SandboxManager>(relaxed = true)
+        val directSandbox = mockk<Sandbox>(relaxed = true)
+        val cleanupStarted = CountDownLatch(1)
+        val releaseCleanup = CountDownLatch(1)
+        val cleanupInterrupted = AtomicBoolean(false)
+        val shutdownCompleted = CountDownLatch(1)
+        val shutdownFailure = AtomicReference<Throwable?>()
+        every { manager.killSandbox("near-expiry-id") } answers {
+            cleanupStarted.countDown()
+            try {
+                releaseCleanup.await()
+            } catch (e: InterruptedException) {
+                cleanupInterrupted.set(true)
+                throw e
+            }
+        }
+        val pool =
+            buildDiscardedCleanupPool(
+                store = store,
+                manager = manager,
+                directSandbox = directSandbox,
+                drainTimeout = Duration.ofSeconds(2),
+            )
+
+        var shutdownThread: Thread? = null
+        pool.start()
+        try {
+            assertSame(directSandbox, pool.acquire(policy = AcquirePolicy.DIRECT_CREATE))
+            assertTrue(cleanupStarted.await(5, TimeUnit.SECONDS))
+            assertEquals(1, pool.snapshot().inFlightOperations)
+
+            shutdownThread =
+                Thread {
+                    try {
+                        pool.shutdown(graceful = true)
+                    } catch (t: Throwable) {
+                        shutdownFailure.set(t)
+                    } finally {
+                        shutdownCompleted.countDown()
+                    }
+                }.apply { start() }
+
+            assertEquals(
+                false,
+                shutdownCompleted.await(200, TimeUnit.MILLISECONDS),
+                "graceful shutdown must keep waiting while asynchronous cleanup is running",
+            )
+            releaseCleanup.countDown()
+            assertTrue(shutdownCompleted.await(5, TimeUnit.SECONDS))
+
+            assertEquals(null, shutdownFailure.get())
+            assertEquals(false, cleanupInterrupted.get())
+            assertEquals(0, pool.snapshot().inFlightOperations)
+            assertEquals(PoolLifecycleState.STOPPED, pool.snapshot().lifecycleState)
+            verify(exactly = 1) { manager.killSandbox("near-expiry-id") }
+        } finally {
+            releaseCleanup.countDown()
+            shutdownThread?.join(5_000)
+            pool.shutdown(graceful = false)
+        }
+    }
+
+    @Test
+    fun `shutdown timeout completes drain count for queued discarded sandbox cleanup`() {
+        val store = DiscardingPoolStateStore()
+        val manager = mockk<SandboxManager>(relaxed = true)
+        val directSandbox = mockk<Sandbox>(relaxed = true)
+        val blockerStarted = CountDownLatch(1)
+        val releaseBlocker = CountDownLatch(1)
+        val blockerInterrupted = AtomicBoolean(false)
+        val pool =
+            buildDiscardedCleanupPool(
+                store = store,
+                manager = manager,
+                directSandbox = directSandbox,
+                drainTimeout = Duration.ofMillis(200),
+            )
+
+        pool.start()
+        try {
+            val warmupExecutor = getPrivateField<ExecutorService>(pool, "warmupExecutor")
+            warmupExecutor.execute {
+                blockerStarted.countDown()
+                try {
+                    releaseBlocker.await()
+                } catch (_: InterruptedException) {
+                    blockerInterrupted.set(true)
+                }
+            }
+            assertTrue(blockerStarted.await(5, TimeUnit.SECONDS))
+            assertSame(directSandbox, pool.acquire(policy = AcquirePolicy.DIRECT_CREATE))
+            assertEquals(1, pool.snapshot().inFlightOperations)
+            val shutdownStartedAt = System.nanoTime()
+
+            pool.shutdown(graceful = true)
+
+            val shutdownElapsedMs = Duration.ofNanos(System.nanoTime() - shutdownStartedAt).toMillis()
+            assertTrue(shutdownElapsedMs >= 150, "shutdown should wait for drain timeout before dropping queued cleanup")
+            assertEquals(true, blockerInterrupted.get())
+            assertEquals(0, pool.snapshot().inFlightOperations)
+            verify(exactly = 0) { manager.killSandbox("near-expiry-id") }
+        } finally {
+            releaseBlocker.countDown()
+            pool.shutdown(graceful = false)
+        }
+    }
+
+    @Test
+    fun `rejected discarded sandbox cleanup runs inline without leaking drain count`() {
+        val store = DiscardingPoolStateStore()
+        val manager = mockk<SandboxManager>(relaxed = true)
+        val directSandbox = mockk<Sandbox>(relaxed = true)
+        every { manager.killSandbox("near-expiry-id") } throws RuntimeException("kill failed")
+        val pool =
+            buildDiscardedCleanupPool(
+                store = store,
+                manager = manager,
+                directSandbox = directSandbox,
+                drainTimeout = Duration.ofSeconds(2),
+            )
+
+        pool.start()
+        try {
+            getPrivateField<ExecutorService>(pool, "warmupExecutor").shutdownNow()
+
+            assertSame(directSandbox, pool.acquire(policy = AcquirePolicy.DIRECT_CREATE))
+
+            assertEquals(0, pool.snapshot().inFlightOperations)
+            verify(exactly = 1) { manager.killSandbox("near-expiry-id") }
+        } finally {
+            pool.shutdown(graceful = true)
+        }
     }
 
     @Test
@@ -919,6 +1644,51 @@ class SandboxPoolTest {
             .build()
     }
 
+    private fun buildDiscardedCleanupPool(
+        store: PoolStateStore,
+        manager: SandboxManager,
+        directSandbox: Sandbox,
+        drainTimeout: Duration,
+    ): SandboxPool =
+        SandboxPool(
+            config =
+                PoolConfig.builder()
+                    .poolName("test-pool")
+                    .ownerId("test-owner")
+                    .maxIdle(0)
+                    .stateStore(store)
+                    .connectionConfig(ConnectionConfig.builder().build())
+                    .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
+                    .sandboxCreator(PooledSandboxCreator { directSandbox })
+                    .acquireMinRemainingTtl(Duration.ofMinutes(1))
+                    .idleTimeout(Duration.ofMinutes(10))
+                    .drainTimeout(drainTimeout)
+                    .reconcileInterval(Duration.ofSeconds(30))
+                    .build(),
+            sandboxManagerFactory = { manager },
+        )
+
+    private class DiscardingPoolStateStore : PoolStateStore by InMemoryPoolStateStore() {
+        override fun tryTakeIdle(
+            poolName: String,
+            minRemainingTtl: Duration,
+        ): TakeIdleResult =
+            TakeIdleResult(
+                sandboxId = null,
+                discardedAliveSandboxIds = listOf("near-expiry-id"),
+            )
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun <T> getPrivateField(
+        target: Any,
+        fieldName: String,
+    ): T {
+        val field = target.javaClass.getDeclaredField(fieldName)
+        field.isAccessible = true
+        return field.get(target) as T
+    }
+
     private fun setPrivateField(
         target: Any,
         fieldName: String,
@@ -927,6 +1697,81 @@ class SandboxPoolTest {
         val field = target.javaClass.getDeclaredField(fieldName)
         field.isAccessible = true
         field.set(target, value)
+    }
+
+    private fun currentRunInFlight(pool: SandboxPool): AtomicInteger {
+        val run = getPrivateField<Any>(pool, "currentRun")
+        return getPrivateField(run, "inFlightOperations")
+    }
+
+    private fun currentRunPendingWarmupCompletions(pool: SandboxPool): Set<*> {
+        val run = getPrivateField<Any>(pool, "currentRun")
+        return getPrivateField(run, "pendingWarmupCompletions")
+    }
+
+    private fun awaitCondition(
+        timeout: Duration = Duration.ofSeconds(5),
+        condition: () -> Boolean,
+    ) {
+        val deadline = System.nanoTime() + timeout.toNanos()
+        while (!condition()) {
+            if (System.nanoTime() >= deadline) {
+                throw AssertionError("Condition was not satisfied within $timeout")
+            }
+            Thread.sleep(10)
+        }
+    }
+
+    private fun awaitIgnoringInterrupt(latch: CountDownLatch) {
+        while (true) {
+            try {
+                latch.await()
+                return
+            } catch (_: InterruptedException) {
+                // Simulates an external preparer that does not cooperate with executor cancellation.
+            }
+        }
+    }
+
+    private fun shutdownWithoutWaitingForUncooperativeWorker(pool: SandboxPool) {
+        Thread.currentThread().interrupt()
+        try {
+            pool.shutdown(graceful = false)
+        } finally {
+            Thread.interrupted()
+        }
+    }
+
+    private class HeartbeatRecordingStore : PoolStateStore by InMemoryPoolStateStore() {
+        val renewCalls = AtomicInteger(0)
+
+        override fun renewPrimaryLock(
+            poolName: String,
+            ownerId: String,
+            ttl: Duration,
+        ): Boolean {
+            renewCalls.incrementAndGet()
+            return true
+        }
+    }
+
+    private class RenewFailsAfterAdmissionStore : PoolStateStore by InMemoryPoolStateStore() {
+        private val renewCalls = AtomicInteger(0)
+
+        override fun renewPrimaryLock(
+            poolName: String,
+            ownerId: String,
+            ttl: Duration,
+        ): Boolean = renewCalls.incrementAndGet() == 1
+    }
+
+    private class PutIdleFailureStore : PoolStateStore by InMemoryPoolStateStore() {
+        override fun putIdle(
+            poolName: String,
+            sandboxId: String,
+        ) {
+            throw RuntimeException("put failed")
+        }
     }
 
     /**
