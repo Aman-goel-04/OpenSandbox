@@ -51,6 +51,7 @@ Install the versioned package:
 ```bash
 helm install opensandbox-server "${CHART_URL}" \
   --namespace opensandbox-system \
+  --set-string server.image.tag="${APP_VERSION}" \
   --values values-server.yaml
 ```
 
@@ -108,7 +109,7 @@ Optional: override gateway image, replicas, or resources (see `server.gateway.*`
 
 Versioning note:
 
-- `server.image.tag` defaults to the chart `appVersion`.
+- The release install and upgrade examples pin `server.image.tag` to `APP_VERSION` so the selected chart release deploys the matching server image.
 - The chart package `version` and the image/app `appVersion` are intentionally
   separate. A server release branch or tag does not automatically imply a new
   Helm chart package version.
@@ -125,6 +126,7 @@ Set `[kubernetes].namespace` in config for the sandbox workload namespace and cr
 ```bash
 helm upgrade opensandbox-server "${CHART_URL}" \
   --namespace opensandbox-system \
+  --set-string server.image.tag="${APP_VERSION}" \
   --values values-server.yaml
 helm uninstall opensandbox-server -n opensandbox-system
 ```

@@ -82,6 +82,7 @@ Install the server from the versioned chart artifact:
 ```sh
 helm install opensandbox-server "${CHART_URL}" \
   --namespace opensandbox-system \
+  --set-string server.image.tag="${APP_VERSION}" \
   --values values-server.yaml
 ```
 
@@ -108,7 +109,7 @@ curl --fail http://127.0.0.1:8080/health
 | Value | Purpose | Notes |
 |-------|---------|-------|
 | `server.image.repository` | Server image registry and repository | Override for a private mirror or custom build. |
-| `server.image.tag` | Server image version | Pin explicitly when it must differ from the chart default. |
+| `server.image.tag` | Server image version | The release install command pins it to `APP_VERSION`. |
 | `server.replicaCount` | Number of server Pods | Defaults to `2`. |
 | `server.env` | Additional container environment variables | Use it with `secretKeyRef` for `OPENSANDBOX_SERVER_API_KEY`. |
 | `configToml` | Complete server configuration | Mounted at `/etc/opensandbox/config.toml`; overriding it replaces the complete default TOML, including the workload namespace. |
@@ -124,6 +125,7 @@ Select the application and chart versions from the target GitHub Release, update
 ```sh
 helm upgrade opensandbox-server "${CHART_URL}" \
   --namespace opensandbox-system \
+  --set-string server.image.tag="${APP_VERSION}" \
   --values values-server.yaml
 ```
 
