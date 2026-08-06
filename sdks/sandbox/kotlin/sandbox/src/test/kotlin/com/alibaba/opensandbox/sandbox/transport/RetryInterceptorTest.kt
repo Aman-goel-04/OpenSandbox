@@ -29,6 +29,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import java.io.IOException
+import java.io.InterruptedIOException
 import java.time.Duration
 import java.util.Random
 import java.util.concurrent.TimeUnit
@@ -259,6 +260,40 @@ class RetryInterceptorTest {
             assertSame(original, thrown)
             assertTrue(Thread.currentThread().isInterrupted)
             assertEquals(1, attempts.get())
+        } finally {
+            Thread.interrupted()
+        }
+    }
+
+    @Test
+    fun `IO interruption is terminal and preserves thread interrupt flag`() {
+        val original = InterruptedIOException("interrupted")
+        val attempts = AtomicInteger()
+        val retries = AtomicInteger()
+        val c =
+            OkHttpClient.Builder()
+                .retryOnConnectionFailure(false)
+                .addInterceptor(
+                    RetryInterceptor(
+                        RetryPolicy(onRetry = { retries.incrementAndGet() }),
+                        rng = Random(0),
+                        sleeper = {},
+                    ),
+                )
+                .addInterceptor {
+                    attempts.incrementAndGet()
+                    Thread.currentThread().interrupt()
+                    throw original
+                }
+                .build()
+
+        Thread.interrupted()
+        try {
+            val thrown = assertThrows(InterruptedIOException::class.java) { get(c) }
+            assertSame(original, thrown)
+            assertTrue(Thread.currentThread().isInterrupted)
+            assertEquals(1, attempts.get())
+            assertEquals(0, retries.get())
         } finally {
             Thread.interrupted()
         }

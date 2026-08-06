@@ -110,6 +110,12 @@ class RetryInterceptor
                         response = effectiveChain.proceed(request)
                         outcomeForResponse(response.code)
                     } catch (e: InterruptedIOException) {
+                        // A caller interrupt is cancellation, not a retryable
+                        // timeout. Preserve the flag and surface the original
+                        // exception before the retry decision can schedule work.
+                        if (Thread.currentThread().isInterrupted) {
+                            throw e
+                        }
                         exception = e
                         classifyIoException(e)
                     } catch (e: IOException) {
