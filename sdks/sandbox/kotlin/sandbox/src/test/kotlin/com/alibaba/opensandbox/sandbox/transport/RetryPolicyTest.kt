@@ -70,6 +70,32 @@ class RetryPolicyTest {
     }
 
     @Test
+    fun `status sets are defensive immutable copies`() {
+        val idempotentStatuses = mutableSetOf(StatusCode.TOO_MANY_REQUESTS)
+        val nonIdempotentStatuses = mutableSetOf(StatusCode.BAD_GATEWAY)
+        val policy =
+            RetryPolicy(
+                retryableStatusCodesIdempotent = idempotentStatuses,
+                retryableStatusCodesNonIdempotent = nonIdempotentStatuses,
+            )
+
+        idempotentStatuses.add(StatusCode.SERVICE_UNAVAILABLE)
+        nonIdempotentStatuses.add(StatusCode.SERVICE_UNAVAILABLE)
+
+        assertEquals(setOf(StatusCode.TOO_MANY_REQUESTS), policy.retryableStatusCodesIdempotent)
+        assertEquals(setOf(StatusCode.BAD_GATEWAY), policy.retryableStatusCodesNonIdempotent)
+        assertThrows(UnsupportedOperationException::class.java) {
+            (policy.retryableStatusCodesIdempotent as MutableSet<Int>).add(StatusCode.SERVICE_UNAVAILABLE)
+        }
+        assertThrows(UnsupportedOperationException::class.java) {
+            (policy.retryableStatusCodesNonIdempotent as MutableSet<Int>).add(StatusCode.SERVICE_UNAVAILABLE)
+        }
+        assertThrows(UnsupportedOperationException::class.java) {
+            (RetryPolicy.DEFAULT_IDEMPOTENT_STATUS as MutableSet<Int>).add(StatusCode.GATEWAY_TIMEOUT)
+        }
+    }
+
+    @Test
     fun `validation rejects invalid values`() {
         assertThrows(IllegalArgumentException::class.java) { RetryPolicy(maxRetries = -1) }
         assertThrows(IllegalArgumentException::class.java) { RetryPolicy(backoffMultiplier = 0.5) }

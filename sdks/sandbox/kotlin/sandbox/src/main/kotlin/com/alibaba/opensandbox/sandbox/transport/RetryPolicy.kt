@@ -17,6 +17,9 @@
 package com.alibaba.opensandbox.sandbox.transport
 
 import java.time.Duration
+import java.util.Collections
+
+private fun immutableStatusSetCopy(statuses: Set<Int>): Set<Int> = Collections.unmodifiableSet(LinkedHashSet(statuses))
 
 /** RFC 9110 §9.2.2 idempotent methods. */
 private val IDEMPOTENT_METHODS: Set<String> = setOf("GET", "HEAD", "PUT", "DELETE", "OPTIONS")
@@ -101,16 +104,22 @@ class RetryPolicy
         val maxBackoff: Duration = Duration.ofSeconds(30),
         val backoffMultiplier: Double = 2.0,
         val jitter: JitterMode = JitterMode.DECORRELATED,
-        /** Statuses that trigger retry for `GET/HEAD/PUT/DELETE/OPTIONS`. */
-        val retryableStatusCodesIdempotent: Set<Int> = DEFAULT_IDEMPOTENT_STATUS,
-        /** Statuses that trigger retry for `POST/PATCH`. Empty by default. */
-        val retryableStatusCodesNonIdempotent: Set<Int> = emptySet(),
+        retryableStatusCodesIdempotent: Set<Int> = DEFAULT_IDEMPOTENT_STATUS,
+        retryableStatusCodesNonIdempotent: Set<Int> = emptySet(),
         val perAttemptTimeout: Duration? = null,
         /** Wall-clock cap across all attempts of one logical request. */
         val overallDeadline: Duration? = null,
         /** Non-blocking hook fired synchronously before each backoff sleep. */
         val onRetry: ((RetryEvent) -> Unit)? = null,
     ) {
+        /** Statuses that trigger retry for `GET/HEAD/PUT/DELETE/OPTIONS`. */
+        val retryableStatusCodesIdempotent: Set<Int> =
+            immutableStatusSetCopy(retryableStatusCodesIdempotent)
+
+        /** Statuses that trigger retry for `POST/PATCH`. Empty by default. */
+        val retryableStatusCodesNonIdempotent: Set<Int> =
+            immutableStatusSetCopy(retryableStatusCodesNonIdempotent)
+
         init {
             require(maxRetries >= 0) { "maxRetries must be >= 0, got $maxRetries" }
             require(!initialBackoff.isNegative) { "initialBackoff must be >= 0, got $initialBackoff" }
@@ -155,10 +164,12 @@ class RetryPolicy
              */
             @JvmField
             val DEFAULT_IDEMPOTENT_STATUS: Set<Int> =
-                setOf(
-                    StatusCode.TOO_MANY_REQUESTS,
-                    StatusCode.BAD_GATEWAY,
-                    StatusCode.SERVICE_UNAVAILABLE,
+                immutableStatusSetCopy(
+                    setOf(
+                        StatusCode.TOO_MANY_REQUESTS,
+                        StatusCode.BAD_GATEWAY,
+                        StatusCode.SERVICE_UNAVAILABLE,
+                    ),
                 )
 
             /** Disable SDK-policy retries and fall back to OkHttp's built-in connection recovery. */
