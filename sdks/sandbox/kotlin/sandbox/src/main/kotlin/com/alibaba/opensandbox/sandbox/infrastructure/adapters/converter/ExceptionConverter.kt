@@ -78,10 +78,10 @@ private fun buildSandboxApiException(
     retryAfter: Duration? = null,
 ): SandboxApiException {
     val sandboxError =
-        parseSandboxError(errorBody) ?: if (errorBody is String) {
-            SandboxError(UNEXPECTED_RESPONSE, errorBody)
-        } else {
-            SandboxError(UNEXPECTED_RESPONSE)
+        parseSandboxError(errorBody) ?: when {
+            statusCode == 429 -> SandboxError(SandboxError.RATE_LIMIT, message)
+            errorBody is String -> SandboxError(UNEXPECTED_RESPONSE, errorBody)
+            else -> SandboxError(UNEXPECTED_RESPONSE)
         }
     val responseBody = errorBody as? String
     val isRetryable = statusCode in RetryPolicy.DEFAULT_IDEMPOTENT_STATUS
@@ -117,7 +117,7 @@ private fun buildSandboxApiException(
  * must expose the same raw body, request metadata, rate-limit subtype, and
  * retryability signal.
  */
-internal fun Response.toSandboxApiException(
+fun Response.toSandboxApiException(
     responseBody: String? = body?.string(),
     message: (statusCode: Int, responseBody: String?) -> String,
 ): SandboxApiException =

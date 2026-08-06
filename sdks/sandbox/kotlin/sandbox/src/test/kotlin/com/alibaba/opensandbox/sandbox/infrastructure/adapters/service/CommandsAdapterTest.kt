@@ -297,8 +297,8 @@ class CommandsAdapterTest {
     }
 
     @Test
-    fun `run should map rate limit response metadata`() {
-        val responseBody = """{"code":"RATE_LIMIT","message":"slow down"}"""
+    fun `run should map unstructured rate limit response metadata`() {
+        val responseBody = "slow down"
         mockWebServer.enqueue(
             MockResponse()
                 .setResponseCode(429)
@@ -311,6 +311,7 @@ class CommandsAdapterTest {
         val ex = assertThrows(SandboxRateLimitException::class.java) { commandsAdapter.run(request) }
 
         assertEquals(429, ex.statusCode)
+        assertEquals("RATE_LIMIT", ex.error.code)
         assertEquals("req-rate-limit", ex.requestId)
         assertEquals(Duration.ofSeconds(2), ex.retryAfter)
         assertEquals(responseBody, ex.responseBody)
