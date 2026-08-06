@@ -201,12 +201,11 @@ class RetryInterceptor
                 retriesUsed += 1
                 previousSleep = sleepFor
                 sleeper(sleepFor)
-                // If a thread interruption woke the sleeper, propagate:
-                // Thread.interrupted() clears the flag and returns true iff we
-                // were interrupted. The next loop iteration's isCanceled()
-                // check handles OkHttp cancellations; this covers JVM-level
-                // thread interruption.
-                if (Thread.interrupted()) {
+                // If a thread interruption woke the sleeper, propagate it without
+                // clearing the flag so callers can continue to observe cancellation.
+                // The next loop iteration's isCanceled() check handles OkHttp
+                // cancellations; this covers JVM-level thread interruption.
+                if (Thread.currentThread().isInterrupted) {
                     lastException?.let { throw it }
                     throw IOException("call interrupted during backoff")
                 }
@@ -280,11 +279,15 @@ class RetryInterceptor
             if (e is SSLHandshakeException) {
                 return Outcome(isTransportError = true, isPreSend = true, cause = RetryCause.PRE_SEND)
             }
-            // Generic mid-stream SSL failures (e.g. TLS alerts, protocol errors
-            // after bytes were already written) are not retryable: they indicate
-            // a permanent connection-level issue, not a transient one.
+            // Generic SSL failures do not reveal whether request bytes were sent.
+            // Treat them as opaque transport failures so only idempotent methods
+            // are eligible for retry.
             if (e is SSLException) {
-                return Outcome(isTransportError = false)
+                return Outcome(
+                    isTransportError = true,
+                    isOpaqueTransport = true,
+                    cause = RetryCause.OPAQUE_TRANSPORT,
+                )
             }
             // Generic InterruptedIOException that is not a socket timeout: treat as
             // a post-send read timeout for observability.

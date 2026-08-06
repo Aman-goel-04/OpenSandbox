@@ -23,6 +23,7 @@ import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
@@ -31,6 +32,8 @@ import java.io.IOException
 import java.time.Duration
 import java.util.Random
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import javax.net.ssl.SSLException
 
 class RetryInterceptorTest {
     private lateinit var server: MockWebServer
@@ -182,6 +185,83 @@ class RetryInterceptorTest {
         assertThrows(IOException::class.java) { c.newCall(req).execute() }
         // initial + 3 retries => 3 onRetry events
         assertEquals(3, attempts)
+    }
+
+    @Test
+    fun `GET retries opaque SSL failure`() {
+        server.enqueue(MockResponse().setResponseCode(200))
+        val attempts = AtomicInteger()
+        val c =
+            OkHttpClient.Builder()
+                .retryOnConnectionFailure(false)
+                .addInterceptor(RetryInterceptor(RetryPolicy(), rng = Random(0), sleeper = {}))
+                .addInterceptor { chain ->
+                    if (attempts.incrementAndGet() == 1) {
+                        throw SSLException("mid-stream TLS failure")
+                    }
+                    chain.proceed(chain.request())
+                }
+                .build()
+
+        assertEquals(200, get(c))
+        assertEquals(2, attempts.get())
+        assertEquals(1, server.requestCount)
+    }
+
+    @Test
+    fun `POST does not retry opaque SSL failure`() {
+        val attempts = AtomicInteger()
+        val c =
+            OkHttpClient.Builder()
+                .retryOnConnectionFailure(false)
+                .addInterceptor(RetryInterceptor(RetryPolicy(), rng = Random(0), sleeper = {}))
+                .addInterceptor { chain ->
+                    attempts.incrementAndGet()
+                    throw SSLException("mid-stream TLS failure")
+                }
+                .build()
+
+        val req =
+            Request.Builder()
+                .url(server.url("/"))
+                .post("x".toRequestBody())
+                .build()
+        assertThrows(SSLException::class.java) { c.newCall(req).execute() }
+        assertEquals(1, attempts.get())
+        assertEquals(0, server.requestCount)
+    }
+
+    @Test
+    fun `backoff interruption preserves thread interrupt flag`() {
+        val original = IOException("connection reset")
+        val attempts = AtomicInteger()
+        val c =
+            OkHttpClient.Builder()
+                .retryOnConnectionFailure(false)
+                .addInterceptor(
+                    RetryInterceptor(
+                        RetryPolicy(maxRetries = 1),
+                        rng = Random(0),
+                        sleeper = { Thread.currentThread().interrupt() },
+                    ),
+                )
+                .addInterceptor {
+                    attempts.incrementAndGet()
+                    throw original
+                }
+                .build()
+
+        // Avoid inheriting a stale interrupt from another test, then clean it up
+        // after asserting so this test does not affect the JUnit worker thread.
+        Thread.interrupted()
+        try {
+            val thrown = assertThrows(IOException::class.java) { get(c) }
+            assertSame(original, thrown)
+            assertTrue(Thread.currentThread().isInterrupted)
+            assertEquals(1, attempts.get())
+        } finally {
+            Thread.interrupted()
+        }
     }
 
     @Test
