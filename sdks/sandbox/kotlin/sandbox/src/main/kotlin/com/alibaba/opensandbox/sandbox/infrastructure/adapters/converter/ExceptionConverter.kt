@@ -35,17 +35,20 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.encodeToJsonElement
+import okhttp3.Response
 import java.io.IOException
 import java.io.InterruptedIOException
 import java.net.ConnectException
 import java.net.NoRouteToHostException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
+import java.time.Duration
 import javax.net.ssl.SSLException
 import com.alibaba.opensandbox.sandbox.api.diagnostic.infrastructure.ClientError as DiagnosticClientError
 import com.alibaba.opensandbox.sandbox.api.diagnostic.infrastructure.ClientException as DiagnosticClientException
 import com.alibaba.opensandbox.sandbox.api.diagnostic.infrastructure.ServerError as DiagnosticServerError
 import com.alibaba.opensandbox.sandbox.api.diagnostic.infrastructure.ServerException as DiagnosticServerException
+import com.alibaba.opensandbox.sandbox.api.execd.infrastructure.ApiResponse as ExecdApiResponse
 import com.alibaba.opensandbox.sandbox.api.execd.infrastructure.ClientError as ExecdClientError
 import com.alibaba.opensandbox.sandbox.api.execd.infrastructure.ClientException as ExecdClientException
 import com.alibaba.opensandbox.sandbox.api.execd.infrastructure.ServerError as ExecdServerError
@@ -65,6 +68,84 @@ import com.alibaba.opensandbox.sandbox.api.execd.infrastructure.ServerException 
  * normal control-flow case such as polling for a not-yet-created file.
  */
 fun Throwable.isFileNotFound(): Boolean = this is SandboxApiException && error.code == SandboxError.FILE_NOT_FOUND
+
+private fun buildSandboxApiException(
+    message: String?,
+    statusCode: Int,
+    cause: Throwable? = null,
+    errorBody: Any? = null,
+    requestId: String? = null,
+    retryAfter: Duration? = null,
+): SandboxApiException {
+    val sandboxError =
+        parseSandboxError(errorBody) ?: if (errorBody is String) {
+            SandboxError(UNEXPECTED_RESPONSE, errorBody)
+        } else {
+            SandboxError(UNEXPECTED_RESPONSE)
+        }
+    val responseBody = errorBody as? String
+    val isRetryable = statusCode in RetryPolicy.DEFAULT_IDEMPOTENT_STATUS
+
+    if (statusCode == 429) {
+        return SandboxRateLimitException(
+            message = message,
+            statusCode = statusCode,
+            cause = cause,
+            error = sandboxError,
+            requestId = requestId,
+            retryAfter = retryAfter,
+            responseBody = responseBody,
+            isRetryable = isRetryable,
+        )
+    }
+
+    return SandboxApiException(
+        message = message,
+        statusCode = statusCode,
+        cause = cause,
+        error = sandboxError,
+        requestId = requestId,
+        responseBody = responseBody,
+        isRetryable = isRetryable,
+    )
+}
+
+/**
+ * Build the public API exception surface for handwritten OkHttp adapter paths.
+ *
+ * The generated clients flow through [toSandboxException]; direct OkHttp calls
+ * must expose the same raw body, request metadata, rate-limit subtype, and
+ * retryability signal.
+ */
+internal fun Response.toSandboxApiException(
+    responseBody: String? = body?.string(),
+    message: (statusCode: Int, responseBody: String?) -> String,
+): SandboxApiException =
+    buildSandboxApiException(
+        message = message(code, responseBody),
+        statusCode = code,
+        errorBody = responseBody,
+        requestId = header("X-Request-ID"),
+        retryAfter = parseRetryAfter(header("Retry-After")),
+    )
+
+/** Build the same error surface from an execd generated-client HTTP response. */
+internal fun ExecdApiResponse<*>.toSandboxApiException(message: (statusCode: Int, responseBody: String?) -> String): SandboxApiException {
+    val errorBody: Any? =
+        when (this) {
+            is ExecdClientError<*> -> body
+            is ExecdServerError<*> -> body
+            else -> null
+        }
+    val responseBody = errorBody as? String
+    return buildSandboxApiException(
+        message = message(statusCode, responseBody),
+        statusCode = statusCode,
+        errorBody = errorBody,
+        requestId = headers.extractRequestId(),
+        retryAfter = headers.extractRetryAfter(),
+    )
+}
 
 fun Exception.toSandboxException(): SandboxException {
     return when (this) {
@@ -169,42 +250,13 @@ private fun Exception.toApiException(): SandboxApiException {
             else -> null
         }
 
-    val sandboxError =
-        parseSandboxError(errorBody) ?: if (errorBody is String) {
-            SandboxError(UNEXPECTED_RESPONSE, errorBody)
-        } else {
-            SandboxError(UNEXPECTED_RESPONSE)
-        }
-
-    val responseBody = errorBody as? String
-    // Status-code-based transient indicator. Matches the Python SDK behavior:
-    // flags {429,502,503} as retryable regardless of HTTP method or budget state.
-    // In practice, the retry interceptor has already exhausted retries before the
-    // exception surfaces here, so the boundary value is almost always false.
-    // The flag is a transient-status signal, not a "we retried this" signal.
-    val isRetryable = statusCode in RetryPolicy.DEFAULT_IDEMPOTENT_STATUS
-
-    if (statusCode == 429) {
-        return SandboxRateLimitException(
-            message = this.message,
-            statusCode = statusCode,
-            cause = this,
-            error = sandboxError,
-            requestId = requestId,
-            retryAfter = headers?.extractRetryAfter(),
-            responseBody = responseBody,
-            isRetryable = isRetryable,
-        )
-    }
-
-    return SandboxApiException(
+    return buildSandboxApiException(
         message = this.message,
         statusCode = statusCode,
         cause = this,
-        error = sandboxError,
+        errorBody = errorBody,
         requestId = requestId,
-        responseBody = responseBody,
-        isRetryable = isRetryable,
+        retryAfter = headers?.extractRetryAfter(),
     )
 }
 
