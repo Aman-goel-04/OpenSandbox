@@ -229,15 +229,24 @@ func (c *Client) handleExecuteResult(msg *Message, state *streamExecutionState, 
 		return
 	}
 
-	state.resultMutex.Lock()
-	defer state.resultMutex.Unlock()
-	state.result.ExecutionCount = execResult.ExecutionCount
-
+	// resultChan send happens outside the lock, and *before* ExecutionCount is recorded below:
+	// sending can block indefinitely on a full, undrained channel, and holding resultMutex
+	// across that block would starve any other goroutine that needs the mutex -- including
+	// finalizeExecution's poll loop, which is the only thing that ever closes resultChan. That
+	// combination permanently wedges this connection's single receiveMessages() goroutine, since
+	// it dispatches every handler (including this one) synchronously. Sending before recording
+	// ExecutionCount (finalizeExecution's completion signal) additionally guarantees
+	// finalizeExecution can never observe "done" and close resultChan while this send is still
+	// in flight -- which would otherwise race the close and could panic.
 	notify := &ExecutionResult{
 		ExecutionCount: execResult.ExecutionCount,
 		ExecutionData:  execResult.Data,
 	}
 	resultChan <- notify
+
+	state.resultMutex.Lock()
+	state.result.ExecutionCount = execResult.ExecutionCount
+	state.resultMutex.Unlock()
 }
 
 func (c *Client) handleStreamOutput(msg *Message, state *streamExecutionState, resultChan chan *ExecutionResult) {
@@ -246,9 +255,11 @@ func (c *Client) handleStreamOutput(msg *Message, state *streamExecutionState, r
 		return
 	}
 
+	// See handleExecuteResult: resultChan send must stay outside the lock.
 	state.resultMutex.Lock()
-	defer state.resultMutex.Unlock()
 	state.result.Stream = append(state.result.Stream, &stream)
+	state.resultMutex.Unlock()
+
 	notify := &ExecutionResult{
 		Stream: []*StreamOutput{&stream},
 	}
@@ -261,15 +272,19 @@ func (c *Client) handleExecutionError(msg *Message, state *streamExecutionState,
 		return
 	}
 
-	state.resultMutex.Lock()
-	defer state.resultMutex.Unlock()
-	state.result.Status = "error"
-	state.result.Error = &errOutput
+	// See handleExecuteResult: resultChan send must stay outside the lock, and before Error is
+	// recorded below, so finalizeExecution can never observe "done" (via state.result.Error) and
+	// close resultChan while this send is still in flight.
 	notify := &ExecutionResult{
 		Error:  &errOutput,
 		Status: "error",
 	}
 	resultChan <- notify
+
+	state.resultMutex.Lock()
+	state.result.Status = "error"
+	state.result.Error = &errOutput
+	state.resultMutex.Unlock()
 }
 
 func (c *Client) handleExecutionStatus(msg *Message, state *streamExecutionState, resultChan chan *ExecutionResult) {
@@ -291,13 +306,16 @@ func (c *Client) handleExecutionStatus(msg *Message, state *streamExecutionState
 }
 
 func (c *Client) finalizeExecution(state *streamExecutionState, resultChan chan *ExecutionResult) {
+	// See handleExecuteResult: resultChan send must stay outside the lock.
 	state.resultMutex.Lock()
 	state.result.ExecutionTime = time.Since(state.startTime)
+	executionTime := state.result.ExecutionTime
+	state.resultMutex.Unlock()
+
 	notify := &ExecutionResult{
-		ExecutionTime: state.result.ExecutionTime,
+		ExecutionTime: executionTime,
 	}
 	resultChan <- notify
-	state.resultMutex.Unlock()
 
 	pollInterval := execdflag.JupyterIdlePollInterval
 	if pollInterval <= 0 {
