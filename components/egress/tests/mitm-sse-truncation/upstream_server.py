@@ -19,10 +19,14 @@ Serves a single large SSE event over HTTP/1.1 and closes the connection,
 optionally after a delay. TLS and plain-TCP variants are supported.
 
 By default the response is sent immediately after the TLS handshake without
-waiting for the request ("server speaks first"). This is the reliable repro:
-with mitmproxy 11.x the event-loop race hits consistently for payloads >= 4 MiB
-and the client receives a truncated body. The realistic --read-request variant
-(server reads the request first) triggers the same race but only under load.
+waiting for the request ("server speaks first"). Closing the connection while
+the client's request is still unread in the receive buffer makes the kernel
+send TCP RST instead of a clean FIN; the RST discards the receiver's kernel
+receive buffer, so the tail of the response is lost and the client's SSE
+stream is truncated (mitmproxy reports "incomplete chunked read"). This is
+standard TCP behavior, not a mitmproxy bug — a server that reads the request
+and closes cleanly (--read-request) never truncates.
+
 See docs/components/egress-mitmproxy-sse-truncation.md.
 """
 

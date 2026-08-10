@@ -1,6 +1,6 @@
 ---
 title: Egress Mitmproxy SSE Truncation
-description: Known mitmproxy bug where large SSE / streamed bodies are truncated at the tail when the TLS HTTP/1.1 upstream closes the connection right after the body, with reproduction scripts and status.
+description: Why large SSE / streamed bodies can be truncated at the tail when an HTTP/1.1 upstream closes its connection with unread request data (TCP RST flushes the receiver's kernel buffer), with reproduction scripts and status.
 ---
 
 # Egress Mitmproxy: Large SSE Chunks Truncated at the Tail
@@ -13,50 +13,42 @@ The truncation point is nondeterministic (anywhere in the last few hundred KB), 
 
 ## Root Cause
 
-This is a bug in mitmproxy's pure-asyncio TLS read path (upstream report: [mitmproxy/mitmproxy#8364](https://github.com/mitmproxy/mitmproxy/issues/8364)), not in OpenSandbox code:
+Byte-level instrumentation of the full data path (transport read loop, TLS layer, h11 parser) shows this is **standard TCP RST semantics**, not a mitmproxy or OpenSandbox bug:
 
-1. When the upstream serves the response over **TLS + HTTP/1.1** and **closes the connection immediately after the last byte**, mitmproxy's `asyncio.StreamReader`/`sslproto` read loop can deliver the connection EOF while plaintext for the tail of the body is still pending.
-2. mitmproxy's HTTP/1 client then calls h11 `ChunkedReader.read_eof()`, which hard-errors on an incomplete chunk:
+1. The upstream closes its connection while **unread data is still in its own receive buffer** (for example a gateway that responds without ever consuming the client's request body). The kernel then sends **TCP RST** instead of a clean FIN.
+2. Per [RFC 793](https://www.rfc-editor.org/rfc/rfc793), a RST **discards the receiver's unread kernel receive buffer**. mitmproxy has typically consumed ~90% of the body by then, but the tail (last tens to hundreds of KB) is still sitting in mitmproxy's kernel receive buffer and is flushed by the RST — the application never sees those bytes.
+3. h11's `ChunkedReader.read_eof()` then hard-errors with `incomplete chunked read`, the flow is killed, and the client connection is closed — so the sandbox sees a truncated SSE stream.
 
-   ```
-   HTTP/1 protocol error: peer closed connection without sending complete message body (incomplete chunked read)
-   ```
+An earlier analysis pointed at an asyncio/sslproto race; that was wrong (mitmproxy 11 terminates TLS with its own pyOpenSSL memory-BIO layer, and the loss happens before any userspace code sees the bytes). The mitmproxy upstream issue was closed as not-a-bug after the corrected analysis.
 
-3. The flow is killed (`error` hook) and the client connection is closed, so the client sees a body cut mid-chunk.
-
-The race window widens with body size — payloads of 4 MiB and up reproduce it reliably, which matches the field report that only chunks larger than ~1 MB truncate.
-
-::: warning Not the `stream_large_bodies` option
-`stream_large_bodies: 1m` (config.yaml) is **not** the cause. The truncation reproduces with that option removed, and it also affects non-SSE responses (the buffered path fails with a 502). The "1 MB" figure in reports is an empirical threshold of the race, not a proxy buffer limit.
-:::
-
-## Scope (verified empirically, mitmproxy 11.0.2)
+## Verification (mitmproxy 11.0.2, 4–8 MiB SSE events)
 
 | Upstream behavior | Result |
 |---|---|
-| TLS HTTP/1.1, closes immediately after body (≥ 4 MiB) | Truncated, reliable |
-| TLS HTTP/1.1, closes immediately after body (≤ 2 MiB) | Truncated, timing-dependent |
-| TLS HTTP/1.1, keeps connection open ~1 s after body | Complete |
-| Plain TCP (no TLS) HTTP/1.1, closes immediately | Complete |
+| TLS HTTP/1.1, reads the request, closes cleanly (FIN) right after the body | Complete, 14/14 |
+| TLS HTTP/1.1, closes with unread request data (→ RST) | Truncated, reliable |
+| Plain TCP, closes with unread request data (→ RST) | Truncated |
+| TLS HTTP/1.1, keeps the connection open ~1 s after the body | Complete |
 | HTTP/2 upstream (h2 client) | Complete |
 
-HTTP/2 upstreams (e.g. OpenAI, Anthropic) are **not** affected. The bug only hits TLS HTTP/1.1 upstream connections that close right after the body — a common pattern for `Connection: close` responses and self-hosted gateways.
+No userspace change helps: raising the read chunk size and `asyncio.open_connection(limit=1 MiB)` still lost data (10/10 truncated) because the RST flush happens in the kernel before the application can read. A direct (non-proxied) client loses less only because it consumes the kernel buffer faster; a client with a slow read loop loses data against such a server too.
 
 ## Reproducing
 
-Repro scripts live in [`components/egress/tests/mitm-sse-truncation/`](https://github.com/opensandbox-group/OpenSandbox/blob/main/components/egress/tests/mitm-sse-truncation/run.sh). They drive a local `mitmdump` in regular mode (same options as the egress transparent mode) against a synthetic SSE upstream and verify whether the full body arrives.
+Repro scripts live in [`components/egress/tests/mitm-sse-truncation/`](https://github.com/opensandbox-group/OpenSandbox/blob/main/components/egress/tests/mitm-sse-truncation/run.sh). They drive a local `mitmdump` in regular mode (same options as the egress transparent mode) against a synthetic SSE upstream that closes with unread request data, and verify whether the full body arrives.
 
 Prerequisites: `python3`, `openssl`, and `mitmdump` on `PATH` (or pass `--mitmdump /path/to/mitmdump`).
 
 ```bash
 cd components/egress
 
-# Reproduce the bug (default: TLS upstream, 4 MiB SSE event, immediate close)
+# Reproduce the truncation (default: TLS upstream, 4 MiB SSE event, RST close)
 ./tests/mitm-sse-truncation/run.sh
 
 # Controls that must pass (no truncation)
 ./tests/mitm-sse-truncation/run.sh --plain
 ./tests/mitm-sse-truncation/run.sh --delay-close 1
+./tests/mitm-sse-truncation/run.sh --read-request
 
 # Show the error hook in the mitmdump log (root-cause evidence)
 ./tests/mitm-sse-truncation/run.sh --probe --keep-workdir
@@ -74,15 +66,16 @@ With `--probe`, the mitmdump log contains:
 PROBE error hook fired: HTTP/1 protocol error: peer closed connection without sending complete message body (incomplete chunked read)
 ```
 
-Options: `--size BYTES`, `--iterations N`, `--delay-close SECONDS`, `--plain`, `--read-request` (realistic upstream; the race then triggers only under load), `--probe`, `--mitmdump PATH`, `--port N`, `--upstream-port N`, `--keep-workdir`.
+Options: `--size BYTES`, `--iterations N`, `--delay-close SECONDS`, `--plain`, `--read-request` (clean-FIN control), `--probe`, `--mitmdump PATH`, `--port N`, `--upstream-port N`, `--keep-workdir`.
 
-## Status and Workarounds
+## Status and Action
 
-- Upstream bug: [mitmproxy/mitmproxy#8364](https://github.com/mitmproxy/mitmproxy/issues/8364) — the affected read loop is unchanged through v12.2.3.
-- OpenSandbox tracking: [opensandbox-group/OpenSandbox#1461](https://github.com/opensandbox-group/OpenSandbox/issues/1461).
+- mitmproxy upstream: [mitmproxy/mitmproxy#8364](https://github.com/mitmproxy/mitmproxy/issues/8364) — closed as not-a-bug (TCP RST semantics).
+- OpenSandbox tracking: [opensandbox-group/OpenSandbox#1461](https://github.com/opensandbox-group/OpenSandbox/issues/1461) — awaiting field confirmation.
 
-Until mitmproxy fixes the transport race, options are:
+There is no code fix in mitmproxy or OpenSandbox that prevents this — the bytes are discarded by the kernel. The fix belongs to the **upstream server**:
 
-- **Use HTTP/2 upstreams** for large streaming responses (h2 negotiation avoids the bug entirely).
-- **Pin/fix mitmproxy version** in the egress image once an upstream fix lands; re-run the repro to confirm.
-- **Report affected endpoints**: if your LLM gateway serves over TLS HTTP/1.1 with `Connection: close`, large SSE events are at risk.
+- **Consume the request before closing**: a gateway that streams a response but never reads the client's request body (or closes mid-request) will RST and truncate every client, proxied or not. Read the full request, then close cleanly.
+- **Prefer keep-alive**: complete the chunked body with `0\r\n\r\n` and keep the connection open instead of closing after every response.
+- **Verify in the field**: if sandboxes still truncate, capture the connection state / packets at the gateway (`ss -t` for `RST` states, tcpdump for RST flags) to confirm the upstream is resetting.
+- **Use HTTP/2 upstreams** for large streaming responses where possible (h2 framing is not close-delimited and is unaffected).
