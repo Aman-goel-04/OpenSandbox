@@ -73,12 +73,79 @@ Options: `--size BYTES`, `--iterations N`, `--delay-close SECONDS`, `--plain`, `
 - mitmproxy upstream: [mitmproxy/mitmproxy#8364](https://github.com/mitmproxy/mitmproxy/issues/8364) — closed as not-a-bug (TCP RST semantics).
 - OpenSandbox tracking: [opensandbox-group/OpenSandbox#1461](https://github.com/opensandbox-group/OpenSandbox/issues/1461) — awaiting field confirmation.
 
-There is no code fix in mitmproxy or OpenSandbox that prevents this — the bytes are discarded by the kernel. The fix belongs to the **upstream server**:
+There is no code fix in mitmproxy or OpenSandbox that prevents this — the bytes are discarded by the kernel. The fix belongs to the **upstream server**. The rest of this section is a practical guide for the gateway owner: how to confirm the gateway is the problem, and what to change.
 
-- **Consume the request before closing**: a gateway that streams a response but never reads the client's request body (or closes mid-request) will RST and truncate every client, proxied or not. Read the full request, then close cleanly.
-- **Prefer keep-alive**: complete the chunked body with `0\r\n\r\n` and keep the connection open instead of closing after every response.
-- **Verify in the field**: if sandboxes still truncate, capture the connection state / packets at the gateway (`ss -t` for `RST` states, tcpdump for RST flags) to confirm the upstream is resetting.
-- **Use HTTP/2 upstreams** for large streaming responses where possible (h2 framing is not close-delimited and is unaffected).
+### 1. Confirm the gateway is sending RST
+
+Run these on (or in front of) the gateway while a sandbox reproduces the truncation:
+
+```bash
+# 1) Watch for RST flags on the gateway's port (the definitive check)
+tcpdump -ni any 'tcp port 443 and tcp[tcpflags] & (tcp-rst) != 0'
+
+# 2) Counter check: total resets sent/received by the host
+netstat -s | grep -i reset
+
+# 3) From a client, the difference between a clean close and a reset:
+curl -v https://gateway.example/v1/chat/completions   # ...
+# clean close:  "Empty reply from server" or normal EOF
+# reset:        "Recv failure: Connection reset by peer"  / curl: (56)
+```
+
+Typical signature of this bug: the RST appears **immediately after the last response byte**, and `tcpdump` shows no FIN for that connection. A client-side symptom that *also* points at the gateway: a non-proxied client that reads slowly (e.g. `curl --limit-rate 1m`) loses the tail too, while a fast client gets everything.
+
+The root trigger is almost always: **the gateway closes the connection while the request body (or the client's trailing data) is still unread in its receive buffer**. LLM prompts are large bodies, so a gateway that stops reading mid-request and then closes after streaming is exactly the profile that produces this.
+
+### 2. Fix per gateway type
+
+The rule is simple: **before closing a connection, consume whatever the client sent; for SSE, prefer not closing at all.**
+
+- **nginx (reverse proxy / front for the LLM service)**
+  ```nginx
+  # Defaults are safe for buffered requests. Only these matter if you had
+  # proxy_request_buffering off (streaming request bodies):
+  lingering_close on;        # drain client data before closing (default on — make sure it was not disabled)
+  lingering_time 30s;
+  lingering_timeout 5s;
+  ```
+  With `proxy_request_buffering on` (default), nginx consumes the request body before proxying and is not the source of the RST.
+
+- **Python: FastAPI / Starlette / uvicorn (very common for LLM gateways)**
+  ```python
+  @app.post("/v1/chat/completions")
+  async def chat(request: Request):
+      body = await request.body()      # consume the full request body BEFORE streaming
+      async def gen():
+          ...
+      return StreamingResponse(gen(), media_type="text/event-stream")
+  ```
+  If the handler never reads `request.body()`/`request.stream()` and the app closes the connection after the streaming response, uvicorn can close with unread request data → RST. Reading the body first (or enabling keep-alive) fixes it.
+
+- **Go: net/http server**
+  ```go
+  // read the full body before writing the streamed response:
+  body, _ := io.ReadAll(r.Body)
+  // or drain it explicitly if you only need the head:
+  // io.Copy(io.Discard, r.Body)
+  ```
+  Go does not drain the request body for you on close; an unread body + `Connection: close` produces a RST. Also make sure nothing sets `SO_LINGER` to 0 (which forces RST on close):
+  ```go
+  // never do this for streaming responses:
+  // l := &net.TCPListener{}; (tcpConn).SetLinger(0)  // forces RST on close
+  ```
+
+- **Generic guidance (all servers / LBs / ingress controllers)**
+  - Prefer **keep-alive**: end chunked bodies with `0\r\n\r\n` and keep the connection open; close only on idle timeout (clean FIN).
+  - Never close with `SO_LINGER` 0 after streaming a response.
+  - If a connection must be closed, first drain the socket until the request is fully consumed (or at least until the receive buffer is empty).
+
+- **HTTP/2**: connections over h2 are not close-delimited per response; upgrading the endpoint (or fronting it with an h2-capable proxy) removes the whole class of failure.
+
+### 3. If the gateway cannot be changed
+
+- Switch the sandbox to an **HTTP/2** path to the gateway (verified unaffected).
+- Front the gateway with a small reverse proxy that reads the request body and forwards keep-alive (e.g. nginx per above).
+- Track it in the OpenSandbox issue so the truncation reports stay attributable until the gateway is fixed.
 
 ### Why not a bigger read buffer on the egress side?
 
