@@ -314,6 +314,23 @@ func TestPTYWS_ViewerClosesAfterReadOnlyViolationLimit(t *testing.T) {
 	require.Error(t, err, "viewer should close after repeated read-only violations")
 }
 
+func TestPTYWS_ViewerFlushesOutputBeforeExit(t *testing.T) {
+	requireBash(t)
+	srv := newPTYTestServer(t)
+	defer srv.Close()
+
+	id := ptyCreateSession(t, srv)
+	holder := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "pty=0")
+	ptyWaitFrame(t, holder, "connected", 10*time.Second)
+	viewer := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "mode=viewer")
+	ptyWaitFrame(t, viewer, "connected", 8*time.Second)
+
+	ptyWriteStdin(t, holder, "printf viewer_exit_marker; exit\n")
+	ptyOutputContains(t, viewer, "viewer_exit_marker", 8*time.Second)
+	f := ptyWaitFrame(t, viewer, "exit", 8*time.Second)
+	require.Equal(t, "exit", f.Type)
+}
+
 func TestPTYWS_ViewerDisconnectDoesNotAffectSessionOrOtherViewers(t *testing.T) {
 	requireBash(t)
 	srv := newPTYTestServer(t)

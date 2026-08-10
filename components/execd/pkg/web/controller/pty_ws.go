@@ -286,7 +286,7 @@ func PTYSessionWebSocket(ctx *gin.Context) {
 
 	// 10d. Exit watcher: waits for the process to exit, then sends exit frame
 	// and closes the WS connection immediately (unblocks ReadJSON in the read loop).
-	safego.Go(func() { ptyExitWatcher(session, writeJSON, closeConn, cancelCh, cancelOnce) })
+	safego.Go(func() { ptyExitWatcher(session, writeJSON, closeConn, nil, cancelCh, cancelOnce) })
 
 	// 11. Client read loop.
 	ptyClientReadLoop(conn, session, id, writeJSON, cancelCh, cancelOnce)
@@ -375,6 +375,10 @@ func ptyViewerWebSocket(ctx *gin.Context, session runtime.PTYSession, id string)
 		return
 	}
 
+	// The exit watcher waits for the viewer pump to flush its final replay
+	// snapshot. Without this handoff, a short-lived shell can close doneCh before
+	// the pump handles its last changed notification, dropping trailing output.
+	viewerOutputDrained := make(chan struct{})
 	workerWg.Add(3)
 	safego.Go(func() {
 		defer workerWg.Done()
@@ -382,11 +386,11 @@ func ptyViewerWebSocket(ctx *gin.Context, session runtime.PTYSession, id string)
 	})
 	safego.Go(func() {
 		defer workerWg.Done()
-		ptyViewerStreamPump(session, nextOffset, changed, id, conn, &connMu, cancelCh, cancelOnce)
+		ptyViewerStreamPump(session, nextOffset, changed, session.Done(), viewerOutputDrained, id, conn, &connMu, cancelCh, cancelOnce)
 	})
 	safego.Go(func() {
 		defer workerWg.Done()
-		ptyExitWatcher(session, writeJSON, closeConn, cancelCh, cancelOnce)
+		ptyExitWatcher(session, writeJSON, closeConn, viewerOutputDrained, cancelCh, cancelOnce)
 	})
 
 	ptyViewerClientReadLoop(conn, writeJSON, cancelCh, cancelOnce)
@@ -399,24 +403,20 @@ func ptyViewerStreamPump(
 	session runtime.PTYSession,
 	nextOffset int64,
 	changed <-chan struct{},
+	doneCh <-chan struct{},
+	outputDrained chan<- struct{},
 	id string,
 	conn *websocket.Conn,
 	connMu *sync.Mutex,
 	cancelCh <-chan struct{},
 	cancelOnce func(),
 ) {
-	for {
-		select {
-		case <-cancelCh:
-			return
-		case <-changed:
-		}
-
+	drain := func() bool {
 		data, actualOffset, nextChanged := session.ReadOutput(nextOffset)
 		changed = nextChanged
 		nextOffset = actualOffset + int64(len(data))
 		if len(data) == 0 {
-			continue
+			return true
 		}
 
 		connMu.Lock()
@@ -426,6 +426,24 @@ func ptyViewerStreamPump(
 		if writeErr != nil {
 			log.Warn("pty viewer ws write output for session %s: %v", id, writeErr)
 			cancelOnce()
+			return false
+		}
+		return true
+	}
+
+	for {
+		select {
+		case <-cancelCh:
+			return
+		case <-changed:
+			if !drain() {
+				return
+			}
+		case <-doneCh:
+			if !drain() {
+				return
+			}
+			close(outputDrained)
 			return
 		}
 	}
@@ -568,9 +586,10 @@ func ptyStreamPump(r io.Reader, typeByte byte, name, id string, conn *websocket.
 	}
 }
 
-// ptyExitWatcher waits for the session process to exit, then sends an exit frame
-// and closes the WS connection.
-func ptyExitWatcher(session runtime.PTYSession, writeJSON func(any) error, closeConn func(int, string), cancelCh <-chan struct{}, cancelOnce func()) {
+// ptyExitWatcher waits for the session process to exit, optionally waits for a
+// viewer output pump to flush the final replay snapshot, then sends an exit
+// frame and closes the WS connection.
+func ptyExitWatcher(session runtime.PTYSession, writeJSON func(any) error, closeConn func(int, string), outputDrained <-chan struct{}, cancelCh <-chan struct{}, cancelOnce func()) {
 	doneCh := session.Done()
 	if doneCh == nil {
 		return
@@ -579,6 +598,13 @@ func ptyExitWatcher(session runtime.PTYSession, writeJSON func(any) error, close
 	case <-doneCh:
 	case <-cancelCh:
 		return
+	}
+	if outputDrained != nil {
+		select {
+		case <-outputDrained:
+		case <-cancelCh:
+			return
+		}
 	}
 	exitCode := session.ExitCode()
 	_ = writeJSON(model.ServerFrame{
