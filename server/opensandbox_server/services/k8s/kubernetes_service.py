@@ -20,7 +20,6 @@ using Kubernetes resources for sandbox lifecycle management.
 """
 
 import asyncio
-import json
 import logging
 import time
 from datetime import datetime, timezone
@@ -1423,7 +1422,8 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         Args:
             sandbox_id: Unique sandbox identifier
             port: Port number
-            resolve_internal: Ignored for Kubernetes (always returns Pod IP)
+            resolve_internal: If True, bypass ingress and return the provider's
+                internal workload endpoint for use by the server-side proxy.
             expires: Unix epoch seconds for a signed route token.
                 Requires ingress gateway mode with secure_access keys configured.
 
@@ -1473,19 +1473,9 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
             if expires is not None:
                 endpoint = self._build_signed_endpoint(sandbox_id, port, expires)
             elif resolve_internal:
-                annotations = workload.get("metadata", {}).get("annotations", {})
-                raw_endpoints = annotations.get("sandbox.opensandbox.io/endpoints")
-                pod_ip = None
-                if raw_endpoints:
-                    try:
-                        endpoints = json.loads(raw_endpoints)
-                        if isinstance(endpoints, list) and endpoints:
-                            first_endpoint = endpoints[0]
-                            if isinstance(first_endpoint, str) and first_endpoint:
-                                pod_ip = first_endpoint
-                    except (TypeError, ValueError, json.JSONDecodeError):
-                        pod_ip = None
-                endpoint = Endpoint(endpoint=f"{pod_ip}:{port}") if pod_ip else None
+                endpoint = self.workload_provider.get_internal_endpoint(
+                    workload, port, sandbox_id
+                )
             else:
                 endpoint = self.workload_provider.get_endpoint_info(workload, port, sandbox_id)
 

@@ -544,13 +544,11 @@ class TestKubernetesSandboxServiceCreate:
     def test_get_endpoint_resolve_internal_uses_pod_ip_even_in_gateway_mode(
         self, k8s_service
     ):
-        k8s_service.workload_provider.get_workload.return_value = {
-            "metadata": {
-                "annotations": {
-                    "sandbox.opensandbox.io/endpoints": '["10.0.0.1"]',
-                }
-            }
-        }
+        workload = {"metadata": {"annotations": {}}}
+        k8s_service.workload_provider.get_workload.return_value = workload
+        k8s_service.workload_provider.get_internal_endpoint.return_value = Endpoint(
+            endpoint="10.0.0.1:44772"
+        )
         k8s_service.workload_provider.get_endpoint_info.return_value = Endpoint(
             endpoint="gateway.example.com",
             headers={"OpenSandbox-Ingress-To": "sbx-123-44772"},
@@ -560,7 +558,10 @@ class TestKubernetesSandboxServiceCreate:
 
         assert endpoint.endpoint == "10.0.0.1:44772"
         assert endpoint.headers is None
-
+        k8s_service.workload_provider.get_internal_endpoint.assert_called_once_with(
+            workload, 44772, "sbx-123"
+        )
+        k8s_service.workload_provider.get_endpoint_info.assert_not_called()
 
     def test_get_endpoint_keeps_instance_egress_auth_header_private_for_workload_ports(
         self, k8s_service
