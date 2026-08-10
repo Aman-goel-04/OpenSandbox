@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+
+	"github.com/alibaba/opensandbox/nodeagent/pkg/api"
 )
 
-var errUnsupportedPlatform = permanent(errors.New("durable file sink is supported only on Linux"))
+var errUnsupportedPlatform = api.Permanent(errors.New("durable file sink is supported only on Linux"))
 
 func openNoFollow(path string) (*os.File, error) {
 	return nil, errUnsupportedPlatform
@@ -28,7 +30,7 @@ func createNoFollowExclusive(path string) (*os.File, error) {
 func mkdirAllNoFollow(string, os.FileMode) error {
 	return errUnsupportedPlatform
 }
-func syncData(f *os.File) error            { return f.Sync() }
+func syncData(*os.File) error              { return errUnsupportedPlatform }
 func renameNoReplace(string, string) error { return errUnsupportedPlatform }
 func syncDir(string) error                 { return errUnsupportedPlatform }
 func fileIdentity(os.FileInfo) (uint64, uint64, error) {
@@ -37,7 +39,7 @@ func fileIdentity(os.FileInfo) (uint64, uint64, error) {
 func classifyPathError(operation, path string, err error) error {
 	wrapped := fmt.Errorf("%s %q: %w", operation, path, err)
 	if errors.Is(err, os.ErrPermission) {
-		return permanent(wrapped)
+		return api.Permanent(wrapped)
 	}
 	return wrapped
 }

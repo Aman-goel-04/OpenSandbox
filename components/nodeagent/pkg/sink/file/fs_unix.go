@@ -13,6 +13,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/alibaba/opensandbox/nodeagent/pkg/api"
 	"golang.org/x/sys/unix"
 )
 
@@ -50,7 +51,7 @@ func openNoFollowWithFlags(path string, flags int, mode uint32) (*os.File, error
 	}
 	if !info.Mode().IsRegular() {
 		_ = f.Close()
-		return nil, permanent(fmt.Errorf("durable file target %q is not a regular file", clean))
+		return nil, api.Permanent(fmt.Errorf("durable file target %q is not a regular file", clean))
 	}
 	return f, nil
 }
@@ -58,11 +59,11 @@ func openNoFollowWithFlags(path string, flags int, mode uint32) (*os.File, error
 func openParentNoFollow(path string) (int, string, string, error) {
 	clean := filepath.Clean(path)
 	if !filepath.IsAbs(clean) {
-		return -1, "", clean, permanent(fmt.Errorf("durable file path %q must be absolute", path))
+		return -1, "", clean, api.Permanent(fmt.Errorf("durable file path %q must be absolute", path))
 	}
 	name := filepath.Base(clean)
 	if clean == string(filepath.Separator) || name == "" || name == "." || name == ".." {
-		return -1, "", clean, permanent(fmt.Errorf("durable file path %q has no filename", path))
+		return -1, "", clean, api.Permanent(fmt.Errorf("durable file path %q has no filename", path))
 	}
 	dirFD, err := openDirNoFollowAs(filepath.Dir(clean), "open durable file directory", clean)
 	if err != nil {
@@ -74,7 +75,7 @@ func openParentNoFollow(path string) (int, string, string, error) {
 func openDirNoFollowAs(path, operation, errorPath string) (int, error) {
 	clean := filepath.Clean(path)
 	if !filepath.IsAbs(clean) {
-		return -1, permanent(fmt.Errorf("durable directory path %q must be absolute", path))
+		return -1, api.Permanent(fmt.Errorf("durable directory path %q must be absolute", path))
 	}
 	dirFD, err := unix.Open(string(filepath.Separator), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -87,7 +88,7 @@ func openDirNoFollowAs(path, operation, errorPath string) (int, error) {
 		}
 		if part == "." || part == ".." {
 			_ = unix.Close(dirFD)
-			return -1, permanent(fmt.Errorf("durable directory path %q has an unsafe component", clean))
+			return -1, api.Permanent(fmt.Errorf("durable directory path %q has an unsafe component", clean))
 		}
 		nextFD, openErr := unix.Openat(dirFD, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 		_ = unix.Close(dirFD)
@@ -106,7 +107,7 @@ func mkdirAllNoFollow(path string, mode os.FileMode) error {
 func mkdirAllNoFollowWithSync(path string, mode os.FileMode, syncFD func(int) error) error {
 	clean := filepath.Clean(path)
 	if !filepath.IsAbs(clean) {
-		return permanent(fmt.Errorf("durable directory path %q must be absolute", path))
+		return api.Permanent(fmt.Errorf("durable directory path %q must be absolute", path))
 	}
 	parts := strings.Split(strings.TrimPrefix(clean, string(filepath.Separator)), string(filepath.Separator))
 	dirFD, err := unix.Open(string(filepath.Separator), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
@@ -119,7 +120,7 @@ func mkdirAllNoFollowWithSync(path string, mode os.FileMode, syncFD func(int) er
 			continue
 		}
 		if part == "." || part == ".." {
-			return permanent(fmt.Errorf("durable directory path %q has an unsafe component", clean))
+			return api.Permanent(fmt.Errorf("durable directory path %q has an unsafe component", clean))
 		}
 		created := false
 		if err := unix.Mkdirat(dirFD, part, uint32(mode.Perm())); err == nil {
@@ -209,7 +210,7 @@ func syncDirectoryFD(fd int, path string, syncFD func(int) error) error {
 func fileIdentity(info os.FileInfo) (uint64, uint64, error) {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
-		return 0, 0, permanent(errors.New("unsupported durable file identity"))
+		return 0, 0, api.Permanent(errors.New("unsupported durable file identity"))
 	}
 	return uint64(stat.Dev), uint64(stat.Ino), nil
 }
@@ -219,7 +220,7 @@ func classifyPathError(operation, path string, err error) error {
 	if errors.Is(err, unix.EEXIST) || errors.Is(err, unix.ELOOP) || errors.Is(err, unix.ENOTDIR) || errors.Is(err, unix.EACCES) ||
 		errors.Is(err, unix.EPERM) || errors.Is(err, unix.EISDIR) || errors.Is(err, unix.EROFS) ||
 		errors.Is(err, unix.ENAMETOOLONG) || errors.Is(err, unix.EINVAL) {
-		return permanent(wrapped)
+		return api.Permanent(wrapped)
 	}
 	return wrapped
 }

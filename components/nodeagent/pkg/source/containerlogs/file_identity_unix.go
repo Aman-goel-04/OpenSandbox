@@ -9,12 +9,14 @@ import (
 	"fmt"
 	"os"
 	"syscall"
+
+	"github.com/alibaba/opensandbox/nodeagent/pkg/api"
 )
 
 func sourceFileIdentity(info os.FileInfo) (uint64, uint64, error) {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
-		return 0, 0, permanent(fmt.Errorf("unsupported stat type %T for %q", info.Sys(), info.Name()))
+		return 0, 0, api.Permanent(fmt.Errorf("unsupported stat type %T for %q", info.Sys(), info.Name()))
 	}
 	return uint64(stat.Dev), uint64(stat.Ino), nil
 }

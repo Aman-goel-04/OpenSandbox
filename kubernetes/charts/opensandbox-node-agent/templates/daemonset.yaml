@@ -1,4 +1,5 @@
 {{- if .Values.enabled }}
+{{- $nodeSelector := mergeOverwrite (deepCopy (default dict .Values.nodeSelector)) (dict "kubernetes.io/os" "linux") }}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -71,8 +72,6 @@ spec:
               value: {{ .Values.config.sinkTimeout | quote }}
             - name: NODEAGENT_RETRY_MAX_INTERVAL
               value: {{ .Values.config.retryMaxInterval | quote }}
-            - name: NODEAGENT_RECONCILE_INTERVAL
-              value: {{ .Values.config.reconcileInterval | quote }}
             - name: NODEAGENT_ENDED_STATE_RETENTION
               value: {{ .Values.config.endedStateRetention | quote }}
             - name: NODEAGENT_SERVER_ADDR
@@ -99,8 +98,6 @@ spec:
               value: {{ .Values.sink.oss.bucket | quote }}
             - name: NODEAGENT_OSS_KEY_PREFIX
               value: {{ .Values.sink.oss.keyPrefix | quote }}
-            - name: NODEAGENT_FILE_MAX_BYTES
-              value: {{ .Values.sink.oss.maxObjectBytes | int64 | quote }}
             - name: OSS_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
@@ -136,34 +133,31 @@ spec:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
             - name: pod-logs
-              mountPath: {{ required "hostPaths.logs is required" .Values.hostPaths.logs }}
+              mountPath: {{ required "hostPaths.logs is required" .Values.hostPaths.logs | quote }}
               readOnly: true
             - name: state
-              mountPath: {{ .Values.config.stateDir }}
+              mountPath: {{ .Values.config.stateDir | quote }}
             {{- if and (eq .Values.sink.type "file") .Values.sink.file.path }}
             - name: file-data
-              mountPath: {{ .Values.sink.file.path }}
+              mountPath: {{ .Values.sink.file.path | quote }}
             {{- end }}
       volumes:
         - name: pod-logs
           hostPath:
-            path: {{ required "hostPaths.logs is required" .Values.hostPaths.logs }}
+            path: {{ required "hostPaths.logs is required" .Values.hostPaths.logs | quote }}
             type: Directory
         - name: state
           hostPath:
-            path: {{ required "hostPaths.state is required" .Values.hostPaths.state }}
+            path: {{ required "hostPaths.state is required" .Values.hostPaths.state | quote }}
             type: DirectoryOrCreate
         {{- if and (eq .Values.sink.type "file") .Values.sink.file.path }}
         - name: file-data
           hostPath:
-            path: {{ required "hostPaths.fileData is required when the file sink is enabled" .Values.hostPaths.fileData }}
+            path: {{ required "hostPaths.fileData is required when the file sink is enabled" .Values.hostPaths.fileData | quote }}
             type: DirectoryOrCreate
         {{- end }}
       nodeSelector:
-        kubernetes.io/os: linux
-        {{- with .Values.nodeSelector }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
+        {{- toYaml $nodeSelector | nindent 8 }}
       {{- with .Values.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}

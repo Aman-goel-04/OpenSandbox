@@ -128,7 +128,7 @@ Examples:
 - `js/sandbox` -> `sdks/sandbox/javascript` + `specs/sandbox-lifecycle.yml`
 - `server` -> `server` + `specs/sandbox-lifecycle.yml`
 - `docker/egress` -> `components/egress`
-- `docker/nodeagent` -> `components/nodeagent` + `components/internal` + `kubernetes/charts/opensandbox-node-agent`
+- `docker/nodeagent` -> `components/nodeagent` + `components/internal`
 - `helm/opensandbox` -> `kubernetes/charts/opensandbox`
 - `helm/opensandbox-node-agent` -> `kubernetes/charts/opensandbox-node-agent`
 

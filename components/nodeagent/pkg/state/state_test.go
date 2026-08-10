@@ -18,6 +18,19 @@ import (
 	berrors "go.etcd.io/bbolt/errors"
 )
 
+func putFileCheckpointForTest(db *DB, checkpoint FileCheckpoint) error {
+	if err := validateFileCheckpoint(checkpoint); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(checkpoint)
+	if err != nil {
+		return err
+	}
+	return db.db.Update(func(tx *bolt.Tx) error {
+		return putFileCheckpoint(tx.Bucket(bucketSource), tx.Bucket(bucketSourceFileIndex), checkpoint, raw)
+	})
+}
+
 func TestCheckpointPersistsAndTargetIsBound(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, "target-a", 1<<20)
@@ -25,8 +38,8 @@ func TestCheckpointPersistsAndTargetIsBound(t *testing.T) {
 		t.Fatal(err)
 	}
 	writerID := db.WriterID()
-	want := FileCheckpoint{StreamRef: "stream", Path: "/logs/0.log", Offset: 42, Revision: 1}
-	if err := db.PutFileCheckpoint(want); err != nil {
+	want := FileCheckpoint{StreamRef: "stream", FileID: "file", Path: "/logs/0.log", Offset: 42, Revision: 1}
+	if err := putFileCheckpointForTest(db, want); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -106,62 +119,28 @@ func TestOpenRejectsCorruptCheckpointHashLength(t *testing.T) {
 	}
 }
 
-func TestSourceFileIndexRebuildsAndTracksRenames(t *testing.T) {
-	dir := t.TempDir()
-	db, err := Open(dir, "target", 1<<20)
+func TestSourceFileIndexTracksRenames(t *testing.T) {
+	db, err := Open(t.TempDir(), "target", 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer db.Close()
 	stream := SourceStream{StreamRef: "stream", Resource: validFrozenResource("uid"), Revision: 1}
 	old := FileCheckpoint{StreamRef: stream.StreamRef, FileID: "file", Path: "/logs/0.log", Offset: 10, ObservedSize: 10, Revision: 1}
 	if err := db.CommitSource([]FileCheckpoint{old}, stream); err != nil {
 		t.Fatal(err)
 	}
-	legacy := old
-	legacy.Path = "/logs/0.log.20260723"
-	legacy.Offset = 20
-	legacy.ObservedSize = 20
-	legacy.Revision = 2
-	raw, err := json.Marshal(legacy)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := db.db.Update(func(tx *bolt.Tx) error {
-		if err := tx.Bucket(bucketSource).Put(stateKey(legacy.StreamRef, legacy.Path), raw); err != nil {
-			return err
-		}
-		index := tx.Bucket(bucketSourceFileIndex)
-		if err := index.Put(stateKey("stale-a", "file-a"), []byte("missing-a")); err != nil {
-			return err
-		}
-		return index.Put(stateKey("stale-b", "file-b"), []byte("missing-b"))
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	db, err = Open(dir, "target", 1<<20)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	checkpoints, err := db.ListFileCheckpoints(stream.StreamRef)
-	if err != nil || len(checkpoints) != 1 || checkpoints[0].Path != legacy.Path {
-		t.Fatalf("rebuilt checkpoints=%+v err=%v", checkpoints, err)
-	}
-	latest := legacy
+	latest := old
 	latest.Path = "/logs/0.log.20260724"
 	latest.Offset = 30
 	latest.ObservedSize = 30
-	latest.Revision = 3
-	stream.Revision = 3
-	stream.AcknowledgedRevision = 2
+	latest.Revision = 2
+	stream.Revision = 2
+	stream.AcknowledgedRevision = 1
 	if err := db.CommitSource([]FileCheckpoint{latest}, stream); err != nil {
 		t.Fatal(err)
 	}
-	if _, found, err := db.GetFileCheckpoint(stream.StreamRef, legacy.Path); err != nil || found {
+	if _, found, err := db.GetFileCheckpoint(stream.StreamRef, old.Path); err != nil || found {
 		t.Fatalf("stale checkpoint found=%v err=%v", found, err)
 	}
 	if err := db.db.View(func(tx *bolt.Tx) error {
@@ -178,7 +157,7 @@ func TestSourceFileIndexRebuildsAndTracksRenames(t *testing.T) {
 			return err
 		}
 		if count != 1 {
-			t.Fatalf("rebuilt index retained %d entries, want 1", count)
+			t.Fatalf("index retained %d entries, want 1", count)
 		}
 		return nil
 	}); err != nil {
@@ -197,13 +176,14 @@ func TestSourceFileIndexRebuildsAndTracksRenames(t *testing.T) {
 	}
 }
 
-func TestSourceFileIndexRebuildRejectsNonCanonicalCheckpointKey(t *testing.T) {
+func TestOpenRejectsNonCanonicalSourceCheckpointKey(t *testing.T) {
 	for _, test := range []struct {
 		name   string
 		fileID string
+		want   string
 	}{
-		{name: "indexed checkpoint", fileID: "file"},
-		{name: "legacy checkpoint without file ID"},
+		{name: "indexed checkpoint", fileID: "file", want: "non-canonical key"},
+		{name: "checkpoint without file ID", want: "file_id"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -224,14 +204,59 @@ func TestSourceFileIndexRebuildRejectsNonCanonicalCheckpointKey(t *testing.T) {
 			if err := db.Close(); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := Open(dir, "target", 1<<20); err == nil || !strings.Contains(err.Error(), "non-canonical key") {
+			if _, err := Open(dir, "target", 1<<20); err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("Open() error=%v", err)
 			}
 		})
 	}
 }
 
-func TestPutFileCheckpointRejectsMisdirectedSourceFileIndex(t *testing.T) {
+func TestOpenRejectsSourceFileIndexDrift(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*bolt.Tx, FileCheckpoint) error
+		want   string
+	}{
+		{
+			name: "misdirected entry",
+			mutate: func(tx *bolt.Tx, checkpoint FileCheckpoint) error {
+				return tx.Bucket(bucketSourceFileIndex).Put(sourceFileIndexKey(checkpoint.StreamRef, checkpoint.FileID), []byte("missing"))
+			},
+			want: "does not match checkpoint",
+		},
+		{
+			name: "orphan entry",
+			mutate: func(tx *bolt.Tx, _ FileCheckpoint) error {
+				return tx.Bucket(bucketSourceFileIndex).Put(stateKey("orphan", "file"), []byte("missing"))
+			},
+			want: "has no checkpoint",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			db, err := Open(dir, "target", 1<<20)
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkpoint := FileCheckpoint{StreamRef: "stream", FileID: "file", Path: "/logs/0.log", Revision: 1}
+			stream := SourceStream{StreamRef: checkpoint.StreamRef, Resource: validFrozenResource("uid"), Revision: 1}
+			if err := db.CommitSource([]FileCheckpoint{checkpoint}, stream); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.db.Update(func(tx *bolt.Tx) error { return test.mutate(tx, checkpoint) }); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Open(dir, "target", 1<<20); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Open() error=%v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestFileCheckpointRejectsMisdirectedSourceFileIndex(t *testing.T) {
 	db, err := Open(t.TempDir(), "target", 1<<20)
 	if err != nil {
 		t.Fatal(err)
@@ -240,10 +265,10 @@ func TestPutFileCheckpointRejectsMisdirectedSourceFileIndex(t *testing.T) {
 
 	original := FileCheckpoint{StreamRef: "stream", FileID: "file", Path: "/logs/0.log", Offset: 10, Revision: 1}
 	unrelated := FileCheckpoint{StreamRef: "other-stream", FileID: "other-file", Path: "/logs/other.log", Offset: 20, Revision: 1}
-	if err := db.PutFileCheckpoint(original); err != nil {
+	if err := putFileCheckpointForTest(db, original); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.PutFileCheckpoint(unrelated); err != nil {
+	if err := putFileCheckpointForTest(db, unrelated); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.db.Update(func(tx *bolt.Tx) error {
@@ -259,8 +284,8 @@ func TestPutFileCheckpointRejectsMisdirectedSourceFileIndex(t *testing.T) {
 	renamed.Path = "/logs/0.log.1"
 	renamed.Offset = 30
 	renamed.Revision = 2
-	if err := db.PutFileCheckpoint(renamed); err == nil || !strings.Contains(err.Error(), "source file index") {
-		t.Fatalf("PutFileCheckpoint() error=%v, want invalid source file index error", err)
+	if err := putFileCheckpointForTest(db, renamed); err == nil || !strings.Contains(err.Error(), "source file index") {
+		t.Fatalf("file checkpoint write error=%v, want invalid source file index error", err)
 	}
 	if got, found, err := db.GetFileCheckpoint(unrelated.StreamRef, unrelated.Path); err != nil || !found || got != unrelated {
 		t.Fatalf("unrelated checkpoint=%+v found=%v err=%v, want %+v", got, found, err, unrelated)
@@ -273,7 +298,7 @@ func TestPutFileCheckpointRejectsMisdirectedSourceFileIndex(t *testing.T) {
 	}
 }
 
-func TestPutFileCheckpointRejectsSourceFileIndexToNonCheckpoint(t *testing.T) {
+func TestFileCheckpointRejectsSourceFileIndexToNonCheckpoint(t *testing.T) {
 	db, err := Open(t.TempDir(), "target", 1<<20)
 	if err != nil {
 		t.Fatal(err)
@@ -282,7 +307,7 @@ func TestPutFileCheckpointRejectsSourceFileIndexToNonCheckpoint(t *testing.T) {
 
 	original := FileCheckpoint{StreamRef: "stream", FileID: "file", Path: "/logs/0.log", Offset: 10, Revision: 1}
 	unrelated := SourceStream{StreamRef: "unrelated-stream", Resource: validFrozenResource("uid"), Revision: 1}
-	if err := db.PutFileCheckpoint(original); err != nil {
+	if err := putFileCheckpointForTest(db, original); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.PutSourceStream(unrelated); err != nil {
@@ -301,8 +326,8 @@ func TestPutFileCheckpointRejectsSourceFileIndexToNonCheckpoint(t *testing.T) {
 	renamed.Path = "/logs/0.log.1"
 	renamed.Offset = 30
 	renamed.Revision = 2
-	if err := db.PutFileCheckpoint(renamed); err == nil || !strings.Contains(err.Error(), "non-checkpoint") {
-		t.Fatalf("PutFileCheckpoint() error=%v, want non-checkpoint index target error", err)
+	if err := putFileCheckpointForTest(db, renamed); err == nil || !strings.Contains(err.Error(), "non-checkpoint") {
+		t.Fatalf("file checkpoint write error=%v, want non-checkpoint index target error", err)
 	}
 	if got, found, err := db.GetSourceStream(unrelated.StreamRef); err != nil || !found || got.StreamRef != unrelated.StreamRef {
 		t.Fatalf("unrelated stream=%+v found=%v err=%v, want it preserved", got, found, err)
@@ -344,7 +369,7 @@ func TestCommitSourceChoosesSameFileCheckpointRegardlessOfBatchOrder(t *testing.
 	}
 }
 
-func TestPutFileCheckpointReportsSupersededCandidate(t *testing.T) {
+func TestFileCheckpointReportsSupersededCandidate(t *testing.T) {
 	db, err := Open(t.TempDir(), "target", 1<<20)
 	if err != nil {
 		t.Fatal(err)
@@ -352,15 +377,15 @@ func TestPutFileCheckpointReportsSupersededCandidate(t *testing.T) {
 	defer db.Close()
 
 	newer := FileCheckpoint{StreamRef: "stream", FileID: "file", Path: "/logs/0.log.1", Offset: 20, ObservedSize: 20, Revision: 2}
-	if err := db.PutFileCheckpoint(newer); err != nil {
+	if err := putFileCheckpointForTest(db, newer); err != nil {
 		t.Fatal(err)
 	}
 	for _, older := range []FileCheckpoint{
 		{StreamRef: "stream", FileID: "file", Path: "/logs/0.log", Offset: 10, ObservedSize: 10, Revision: 1},
 		{StreamRef: "stream", FileID: "file", Path: newer.Path, Offset: 10, ObservedSize: 10, Revision: 1},
 	} {
-		if err := db.PutFileCheckpoint(older); !errors.Is(err, ErrFileCheckpointSuperseded) {
-			t.Fatalf("PutFileCheckpoint(%+v) error=%v, want ErrFileCheckpointSuperseded", older, err)
+		if err := putFileCheckpointForTest(db, older); !errors.Is(err, ErrFileCheckpointSuperseded) {
+			t.Fatalf("file checkpoint write(%+v) error=%v, want ErrFileCheckpointSuperseded", older, err)
 		}
 	}
 	got, err := db.ListFileCheckpoints("stream")
@@ -372,7 +397,7 @@ func TestPutFileCheckpointReportsSupersededCandidate(t *testing.T) {
 	}
 }
 
-func TestPutFileCheckpointAllowsSameCursorMetadataRefresh(t *testing.T) {
+func TestFileCheckpointAllowsSameCursorMetadataRefresh(t *testing.T) {
 	db, err := Open(t.TempDir(), "target", 1<<20)
 	if err != nil {
 		t.Fatal(err)
@@ -380,13 +405,13 @@ func TestPutFileCheckpointAllowsSameCursorMetadataRefresh(t *testing.T) {
 	defer db.Close()
 
 	original := FileCheckpoint{StreamRef: "stream", FileID: "file", Path: "/logs/0.log", Offset: 10, ObservedSize: 30, ModTimeUnixNano: 30, Revision: 1}
-	if err := db.PutFileCheckpoint(original); err != nil {
+	if err := putFileCheckpointForTest(db, original); err != nil {
 		t.Fatal(err)
 	}
 	refreshed := original
 	refreshed.ObservedSize = 20
 	refreshed.ModTimeUnixNano = 20
-	if err := db.PutFileCheckpoint(refreshed); err != nil {
+	if err := putFileCheckpointForTest(db, refreshed); err != nil {
 		t.Fatal(err)
 	}
 	got, found, err := db.GetFileCheckpoint(refreshed.StreamRef, refreshed.Path)
@@ -566,7 +591,7 @@ func TestCommitSourceRollsBackWhenCheckpointIsSuperseded(t *testing.T) {
 	defer db.Close()
 
 	newer := FileCheckpoint{StreamRef: "stream", FileID: "file", Path: "/logs/0.log.1", Offset: 20, ObservedSize: 20, Revision: 2}
-	if err := db.PutFileCheckpoint(newer); err != nil {
+	if err := putFileCheckpointForTest(db, newer); err != nil {
 		t.Fatal(err)
 	}
 	older := FileCheckpoint{StreamRef: "stream", FileID: "file", Path: "/logs/0.log", Offset: 10, ObservedSize: 10, Revision: 1}

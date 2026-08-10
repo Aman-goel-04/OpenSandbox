@@ -57,6 +57,9 @@ not include object deletion. The Agent refuses to start Sources when bucket
 versioning or WORM is enabled, or when a lifecycle rule overlaps the managed
 cluster prefix.
 
+Restart the Node Agent DaemonSet after rotating this Secret. Kubernetes does
+not update Secret-backed environment variables in running containers.
+
 ## Storage layout
 
 Both durable targets use one object family per container stream:
@@ -205,6 +208,13 @@ After draining the target and reviewing the plan, repeat the command with
 `--apply --confirm-target-drained='<printed-target-id>'`. The durable state file
 allows an interrupted cleanup to resume. Published Node Agent images also
 contain this binary at `/usr/local/bin/nodeagent-oss-cleanup`.
+
+If an interrupted, unfinished cleanup reports a data object that was not in
+the persisted plan, verify that the target is still fully drained. Then rerun
+the command with `--extend-data-plan` and the same drain confirmation, but
+without `--apply`. This persists and prints the expanded plan without deleting
+data. Review every key, then run the separate `--apply` step. Completed cleanup
+tasks are terminal and cannot be reopened.
 
 Without OSS credentials, the integration test can still be compiled with
 `go test -tags=integration -run '^$' ./pkg/sink/oss`. This checks build

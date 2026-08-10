@@ -47,11 +47,21 @@ if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   if [[ -n "$GHCR_REPO" ]]; then image_tags+=(-t "${GHCR_REPO}/nodeagent:latest"); fi
 fi
 
-docker buildx rm nodeagent-builder >/dev/null 2>&1 || true
-docker buildx create --use --name nodeagent-builder
-docker buildx inspect --bootstrap
+builder_name="nodeagent-builder-$$-${RANDOM}"
+builder_created=false
+cleanup_builder() {
+  if [[ "$builder_created" == true ]]; then
+    docker buildx rm "$builder_name" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup_builder EXIT
+
+docker buildx create --name "$builder_name"
+builder_created=true
+docker buildx inspect "$builder_name" --bootstrap
 
 docker buildx build \
+  --builder "$builder_name" \
   "${image_tags[@]}" \
   -f components/nodeagent/Dockerfile \
   ${build_args[@]+"${build_args[@]}"} \

@@ -49,6 +49,8 @@ pool_stderr="$(mktemp)"
 temp_files+=("${pool_stderr}")
 agent_uid_stderr="$(mktemp)"
 temp_files+=("${agent_uid_stderr}")
+logs_stderr="$(mktemp)"
+temp_files+=("${logs_stderr}")
 pool_family_stderr="$(mktemp)"
 temp_files+=("${pool_family_stderr}")
 export KUBECONFIG="${kubeconfig}"
@@ -77,18 +79,17 @@ kind load docker-image --name "${cluster_name}" "${image}"
 helm install nodeagent "${repo_root}/kubernetes/charts/opensandbox-node-agent" \
   --namespace opensandbox-system \
   --create-namespace \
-  --set image.repository=opensandbox/nodeagent \
-  --set image.tag=kind-smoke \
+  --set-string image.repository="${image%:*}" \
+  --set-string image.tag="${image##*:}" \
   --set image.pullPolicy=Never \
   --set config.clusterID=kind-test \
-  --set config.reconcileInterval=2s \
   --set config.partialTimeout=1s \
   --set config.endedStateRetention=1m \
   --set sink.type=file \
   --wait --timeout 180s
 
 kubectl create namespace workloads
-kubectl apply -f - <<'YAML'
+sed "s|NODEAGENT_SMOKE_IMAGE|${image}|g" <<'YAML' | kubectl apply -f -
 apiVersion: v1
 kind: Pod
 metadata:
@@ -100,7 +101,7 @@ spec:
   restartPolicy: Never
   containers:
     - name: sandbox
-      image: opensandbox/nodeagent:kind-smoke
+      image: NODEAGENT_SMOKE_IMAGE
       imagePullPolicy: Never
       command: ["sh", "-c", "echo before-restart; while [ ! -f /tmp/emit-during-restart ]; do sleep 1; done; echo during-agent-restart; while [ ! -f /tmp/release ]; do sleep 1; done; echo after-restart"]
 ---
@@ -116,7 +117,7 @@ spec:
   restartPolicy: Never
   containers:
     - name: sandbox
-      image: opensandbox/nodeagent:kind-smoke
+      image: NODEAGENT_SMOKE_IMAGE
       imagePullPolicy: Never
       command: ["sh", "-c", "echo must-not-be-collected; sleep 2"]
 YAML
@@ -155,13 +156,22 @@ if [[ -n "${agent_pods}" ]]; then
   exit 1
 fi
 kubectl exec -n workloads normal-sandbox -- touch /tmp/emit-during-restart
+sandbox_logs=""
 for _ in $(seq 1 30); do
-  if kubectl logs pod/normal-sandbox -n workloads | grep -Fxq 'during-agent-restart'; then
-    break
+  if sandbox_logs="$(kubectl logs pod/normal-sandbox -n workloads 2>"${logs_stderr}")"; then
+    if grep -Fxq 'during-agent-restart' <<<"${sandbox_logs}"; then
+      break
+    fi
   fi
   sleep 1
 done
-kubectl logs pod/normal-sandbox -n workloads | grep -Fxq 'during-agent-restart'
+if ! grep -Fxq 'during-agent-restart' <<<"${sandbox_logs}"; then
+  echo "outage log line was not observed" >&2
+  if [[ -s "${logs_stderr}" ]]; then
+    echo "last sandbox log query error: $(<"${logs_stderr}")" >&2
+  fi
+  exit 1
+fi
 agent_pods="$(kubectl get pod -n opensandbox-system -l app.kubernetes.io/component=node-agent -o name)"
 if [[ -n "${agent_pods}" ]]; then
   echo "Node Agent Pod restarted before the outage log was written" >&2
@@ -220,7 +230,7 @@ marker=""
 marker_ready=0
 last_marker_status="marker not found"
 last_marker_error=""
-for _ in $(seq 1 30); do
+for _ in $(seq 1 60); do
 	find_output=""
 	if find_output="$(docker exec "${node}" sh -c 'find /var/lib/opensandbox/nodeagent-data -path "*/kind-test/workloads/sb-normal/*/sandbox.finalized.*.json" -print' 2>"${find_stderr}")"; then
 		find_status=0
@@ -242,11 +252,11 @@ for _ in $(seq 1 30); do
 		fi
 	done <<<"${find_output}"
 	if [[ -z "${marker}" ]]; then
-    last_marker_status="marker not found"
-    last_marker_error=""
-    sleep 2
-    continue
-  fi
+		last_marker_status="marker not found"
+		last_marker_error=""
+		sleep 2
+		continue
+	fi
 
 	marker_raw=""
 	if marker_raw="$(docker exec "${node}" cat "${marker}" 2>"${marker_stderr}")"; then
@@ -280,7 +290,7 @@ for _ in $(seq 1 30); do
 done
 
 if [[ ${marker_ready} -ne 1 ]]; then
-  echo "finalization marker did not become valid: ${last_marker_status}" >&2
+	echo "finalization marker did not become valid: ${last_marker_status}" >&2
 	if [[ -n "${last_marker_error}" ]]; then
 		echo "last marker error: ${last_marker_error}" >&2
 	fi

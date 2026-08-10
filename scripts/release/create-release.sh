@@ -396,7 +396,7 @@ case "$TARGET" in
   docker/nodeagent)
     DISPLAY_NAME="Component Image nodeagent"
     WORKFLOW_HINT=".github/workflows/publish-components.yml"
-    TARGET_PATH_FILTERS=("components/nodeagent" "components/internal" "kubernetes/charts/opensandbox-node-agent")
+    TARGET_PATH_FILTERS=("components/nodeagent" "components/internal")
     ;;
   docker/code-interpreter)
     DISPLAY_NAME="Component Image code-interpreter"

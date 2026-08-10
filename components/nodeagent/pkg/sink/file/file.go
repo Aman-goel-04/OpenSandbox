@@ -34,7 +34,10 @@ import (
 	"time"
 
 	"github.com/alibaba/opensandbox/nodeagent/pkg/api"
+	"github.com/alibaba/opensandbox/nodeagent/pkg/config"
+	"github.com/alibaba/opensandbox/nodeagent/pkg/identity"
 	"github.com/alibaba/opensandbox/nodeagent/pkg/marker"
+	"github.com/alibaba/opensandbox/nodeagent/pkg/objectlayout"
 	"github.com/alibaba/opensandbox/nodeagent/pkg/registry"
 	lineformat "github.com/alibaba/opensandbox/nodeagent/pkg/sink"
 	"github.com/alibaba/opensandbox/nodeagent/pkg/state"
@@ -43,7 +46,12 @@ import (
 const name = "file"
 
 func init() {
-	registry.RegisterSink(name, func(dependencies registry.Dependencies) (api.Sink, error) {
+	registry.RegisterSink(name, func(cfg config.Config) (string, error) {
+		if cfg.FilePath == "" {
+			return identity.StdoutTargetID(cfg.ClusterID, cfg.NodeName), nil
+		}
+		return identity.FileTargetID(cfg.FilePath, cfg.ClusterID, cfg.NodeName)
+	}, func(dependencies registry.Dependencies) (api.Sink, error) {
 		cfg := dependencies.Config
 		return New(Config{Root: cfg.FilePath, ClusterID: cfg.ClusterID, MaxFileBytes: cfg.FileMaxBytes, MaxFiles: cfg.FileMaxFiles, MaxTotalBytes: cfg.FileMaxTotalBytes, Retention: cfg.FileRetention}, dependencies.State)
 	})
@@ -63,7 +71,6 @@ type Config struct {
 	MaxFiles      int
 	MaxTotalBytes int64
 	Retention     time.Duration
-	Stdout        io.Writer
 }
 
 type Sink struct {
@@ -83,15 +90,6 @@ type writer struct {
 	crc      hash.Hash64
 }
 
-type permanentSinkError struct {
-	err error
-}
-
-func (e permanentSinkError) Error() string { return e.err.Error() }
-func (e permanentSinkError) Unwrap() error { return e.err }
-func (permanentSinkError) Retryable() bool { return false }
-func permanent(err error) error            { return permanentSinkError{err: err} }
-
 type capacityExhaustedError struct {
 	limit int64
 }
@@ -104,9 +102,6 @@ func (capacityExhaustedError) Retryable() bool { return true }
 func New(cfg Config, store stateStore) (*Sink, error) {
 	if cfg.MaxFileBytes <= 0 || cfg.MaxFiles <= 0 || (cfg.Root != "" && cfg.MaxTotalBytes <= 0) {
 		return nil, errors.New("file limits must be positive")
-	}
-	if cfg.Stdout == nil {
-		cfg.Stdout = os.Stdout
 	}
 	if cfg.Root != "" {
 		canonical, err := filepath.Abs(filepath.Clean(cfg.Root))
@@ -126,7 +121,6 @@ func New(cfg Config, store stateStore) (*Sink, error) {
 	return &Sink{cfg: cfg, state: store, writers: make(map[string]*writer)}, nil
 }
 
-func (s *Sink) Name() string { return name }
 func (s *Sink) Capabilities() api.Capabilities {
 	return api.Capabilities{RecordKinds: []api.RecordKind{api.RecordKindContainerLog}}
 }
@@ -143,24 +137,24 @@ func (s *Sink) Consume(_ context.Context, batch api.Batch) error {
 	}
 	resource := batch.Items[0].Record.Resource
 	for _, item := range batch.Items[1:] {
-		if !sameResourceIdentity(resource, item.Record.Resource) {
-			return permanent(errors.New("file batch contains inconsistent resource identities"))
+		if !lineformat.SameResourceIdentity(resource, item.Record.Resource) {
+			return api.Permanent(errors.New("file batch contains inconsistent resource identities"))
 		}
 	}
 	data := lineformat.EncodeBatch(batch)
 	if s.cfg.Root == "" {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		_, err := s.cfg.Stdout.Write(data)
+		_, err := os.Stdout.Write(data)
 		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if resource.ClusterName != s.cfg.ClusterID {
-		return permanent(fmt.Errorf("resource cluster %q does not match configured cluster %q", resource.ClusterName, s.cfg.ClusterID))
+		return api.Permanent(fmt.Errorf("resource cluster %q does not match configured cluster %q", resource.ClusterName, s.cfg.ClusterID))
 	}
 	if int64(len(data)) > s.cfg.MaxFileBytes {
-		return permanent(fmt.Errorf("encoded batch size %d exceeds per-generation limit %d", len(data), s.cfg.MaxFileBytes))
+		return api.Permanent(fmt.Errorf("encoded batch size %d exceeds per-generation limit %d", len(data), s.cfg.MaxFileBytes))
 	}
 	digest := sha256.Sum256(data)
 	w, err := s.getWriter(batch.StreamRef, resource)
@@ -168,9 +162,9 @@ func (s *Sink) Consume(_ context.Context, batch api.Batch) error {
 		return err
 	}
 	if w.stream.AppendIntent != nil {
-		intent := state.AppendIntent{Position: w.stream.Position, Length: int64(len(data)), SHA256: hex.EncodeToString(digest[:]), Device: w.stream.Device, Inode: w.stream.Inode}
+		intent := fileAppendIntent(w.stream, int64(len(data)), digest)
 		if *w.stream.AppendIntent != intent {
-			return permanent(errors.New("file append retry does not match persisted intent"))
+			return api.Permanent(errors.New("file append retry does not match persisted intent"))
 		}
 		if err := recoverAppend(w); err != nil {
 			return err
@@ -179,7 +173,7 @@ func (s *Sink) Consume(_ context.Context, batch api.Batch) error {
 	requiresNextGeneration := w.stream.CurrentClosed ||
 		(w.stream.Position > 0 && w.stream.Position > s.cfg.MaxFileBytes-int64(len(data)))
 	if requiresNextGeneration && (s.cfg.MaxFiles <= 0 || w.stream.Generation >= uint64(s.cfg.MaxFiles-1)) {
-		return permanent(errors.New("durable file generation limit reached"))
+		return api.Permanent(errors.New("durable file generation limit reached"))
 	}
 	if err := s.reserveCapacity(int64(len(data))); err != nil {
 		return err
@@ -193,7 +187,7 @@ func (s *Sink) Consume(_ context.Context, batch api.Batch) error {
 			return err
 		}
 	}
-	intent := state.AppendIntent{Position: w.stream.Position, Length: int64(len(data)), SHA256: hex.EncodeToString(digest[:]), Device: w.stream.Device, Inode: w.stream.Inode}
+	intent := fileAppendIntent(w.stream, int64(len(data)), digest)
 	if w.stream.AppendIntent == nil {
 		w.stream.AppendIntent = &intent
 		if err := s.state.PutSinkStream(name, w.stream); err != nil {
@@ -202,7 +196,7 @@ func (s *Sink) Consume(_ context.Context, batch api.Batch) error {
 		}
 	} else {
 		if *w.stream.AppendIntent != intent {
-			return permanent(errors.New("file append retry does not match persisted intent"))
+			return api.Permanent(errors.New("file append retry does not match persisted intent"))
 		}
 	}
 	if err := writeFull(w.file, data); err != nil {
@@ -240,7 +234,7 @@ func (s *Sink) Finalize(ctx context.Context, request api.FinalizeRequest) error 
 		return err
 	}
 	if request.Resource.ClusterName != s.cfg.ClusterID {
-		return permanent(fmt.Errorf("resource cluster %q does not match configured cluster %q", request.Resource.ClusterName, s.cfg.ClusterID))
+		return api.Permanent(fmt.Errorf("resource cluster %q does not match configured cluster %q", request.Resource.ClusterName, s.cfg.ClusterID))
 	}
 	w := s.writers[request.StreamRef.ID]
 	var stream state.SinkStream
@@ -261,8 +255,8 @@ func (s *Sink) Finalize(ctx context.Context, request api.FinalizeRequest) error 
 		}
 	}
 	if w != nil {
-		if !sameResourceIdentity(w.resource, request.Resource) {
-			return permanent(errors.New("file finalization resource identity changed"))
+		if !lineformat.SameResourceIdentity(w.resource, request.Resource) {
+			return api.Permanent(errors.New("file finalization resource identity changed"))
 		}
 		if err := s.closeGeneration(w); err != nil {
 			return err
@@ -270,7 +264,7 @@ func (s *Sink) Finalize(ctx context.Context, request api.FinalizeRequest) error 
 		stream = w.stream
 	}
 	if request.Revision < stream.FinalizedRevision || request.Revision > stream.FinalizedRevision+1 {
-		return permanent(fmt.Errorf("file marker revision %d is not continuous after %d", request.Revision, stream.FinalizedRevision))
+		return api.Permanent(fmt.Errorf("file marker revision %d is not continuous after %d", request.Revision, stream.FinalizedRevision))
 	}
 	if err := s.verifyClosedFiles(ctx, request.Resource, stream); err != nil {
 		return err
@@ -280,7 +274,7 @@ func (s *Sink) Finalize(ctx context.Context, request api.FinalizeRequest) error 
 	}
 	raw, err := marker.Encode(marker.New(request, stream.ClosedObjects))
 	if err != nil {
-		return permanent(err)
+		return api.Permanent(err)
 	}
 	dir, err := familyDir(s.cfg.Root, request.Resource)
 	if err != nil {
@@ -289,12 +283,12 @@ func (s *Sink) Finalize(ctx context.Context, request api.FinalizeRequest) error 
 	if err := mkdirAllNoFollow(dir, 0o750); err != nil {
 		return err
 	}
-	markerPath := filepath.Join(dir, fmt.Sprintf("%s.finalized.%d.json", request.Resource.Container, request.Revision))
+	markerPath := filepath.Join(dir, objectlayout.MarkerName(request.Resource.Container, request.Revision))
 	digest := sha256.Sum256(raw)
 	tmpName := filepath.Join(dir, fmt.Sprintf(".%s.finalized.%d.%s.tmp", request.Resource.Container, request.Revision, hex.EncodeToString(digest[:8])))
 	if existing, readErr := readNoFollow(markerPath); readErr == nil {
 		if !bytes.Equal(existing, raw) {
-			return permanent(errors.New("conflicting finalization marker already exists"))
+			return api.Permanent(errors.New("conflicting finalization marker already exists"))
 		}
 		if err := syncDir(dir); err != nil {
 			return err
@@ -315,7 +309,7 @@ func (s *Sink) Finalize(ctx context.Context, request api.FinalizeRequest) error 
 	}
 	intent := state.MarkerIntent{Revision: request.Revision, Path: markerPath, TempPath: tmpName, SHA256: hex.EncodeToString(digest[:])}
 	if stream.MarkerIntent != nil && *stream.MarkerIntent != intent {
-		return permanent(errors.New("file marker intent conflicts with finalization request"))
+		return api.Permanent(errors.New("file marker intent conflicts with finalization request"))
 	}
 	temporaryExists := false
 	if existingFile, openErr := openNoFollowExisting(tmpName); openErr == nil {
@@ -327,7 +321,7 @@ func (s *Sink) Finalize(ctx context.Context, request api.FinalizeRequest) error 
 		if !bytes.Equal(existing, raw) {
 			if stream.MarkerIntent == nil || len(existing) >= len(raw) || !bytes.Equal(existing, raw[:len(existing)]) {
 				_ = existingFile.Close()
-				return permanent(errors.New("temporary marker bytes conflict with marker intent"))
+				return api.Permanent(errors.New("temporary marker bytes conflict with marker intent"))
 			}
 			additional := int64(len(raw) - len(existing))
 			if err := s.reserveCapacity(additional); err != nil {
@@ -434,7 +428,7 @@ func publishMarker(temporaryPath, markerPath string, raw []byte) (bool, error) {
 			return false, errors.Join(err, readErr)
 		}
 		if !bytes.Equal(existing, raw) {
-			return false, permanent(errors.Join(errors.New("conflicting finalization marker already exists"), err))
+			return false, api.Permanent(errors.Join(errors.New("conflicting finalization marker already exists"), err))
 		}
 		if syncErr := syncDir(dir); syncErr != nil {
 			return true, errors.Join(err, syncErr)
@@ -529,7 +523,7 @@ func (s *Sink) collectExpiredStream(ctx context.Context, now time.Time, source s
 		}
 	}
 	if stream.CleanupPath != staging {
-		return permanent(errors.New("durable-file cleanup staging path conflicts with checkpoint"))
+		return api.Permanent(errors.New("durable-file cleanup staging path conflicts with checkpoint"))
 	}
 	if stream.CleanupPhase == "planned" {
 		if err := ctx.Err(); err != nil {
@@ -574,7 +568,7 @@ func (s *Sink) collectExpiredStream(ctx context.Context, now time.Time, source s
 		}
 	}
 	if stream.CleanupPhase != "deleted" {
-		return permanent(fmt.Errorf("unknown durable-file cleanup phase %q", stream.CleanupPhase))
+		return api.Permanent(fmt.Errorf("unknown durable-file cleanup phase %q", stream.CleanupPhase))
 	}
 	delete(s.writers, source.StreamRef)
 	return s.state.DeleteStream(source.StreamRef)
@@ -582,8 +576,8 @@ func (s *Sink) collectExpiredStream(ctx context.Context, now time.Time, source s
 
 func (s *Sink) getWriter(streamRef api.StreamRef, resource api.Resource) (*writer, error) {
 	if existing := s.writers[streamRef.ID]; existing != nil {
-		if !sameResourceIdentity(existing.resource, resource) {
-			return nil, permanent(errors.New("file stream resource identity changed"))
+		if !lineformat.SameResourceIdentity(existing.resource, resource) {
+			return nil, api.Permanent(errors.New("file stream resource identity changed"))
 		}
 		return existing, nil
 	}
@@ -594,23 +588,19 @@ func (s *Sink) getWriter(streamRef api.StreamRef, resource api.Resource) (*write
 	if !found {
 		stream = state.SinkStream{SinkName: name, StreamRef: streamRef.ID}
 	} else if stream.StreamRef != streamRef.ID {
-		return nil, permanent(errors.New("durable file checkpoint stream reference mismatch"))
+		return nil, api.Permanent(errors.New("durable file checkpoint stream reference mismatch"))
 	}
 	dir, err := familyDir(s.cfg.Root, resource)
 	if err != nil {
 		return nil, err
 	}
-	path := filepath.Join(dir, generationName(resource.Container, stream.Generation))
-	relative, err := filepath.Rel(s.cfg.Root, path)
-	if err != nil {
-		return nil, err
-	}
-	expectedObjectKey := filepath.ToSlash(relative)
+	path := filepath.Join(dir, objectlayout.GenerationName(resource.Container, stream.Generation))
+	expectedObjectKey := objectlayout.DataKey(objectlayout.FamilyPrefix("", resource.ClusterName, resource.Namespace, resource.SandboxID, resource.PodUID), resource.Container, stream.Generation)
 	if found && stream.ObjectKey != "" && stream.ObjectKey != expectedObjectKey {
-		return nil, permanent(errors.New("durable file object key does not match checkpoint generation"))
+		return nil, api.Permanent(errors.New("durable file object key does not match checkpoint generation"))
 	}
 	if found && stream.ObjectKey == "" && (stream.Position != 0 || stream.CurrentClosed || len(stream.ClosedObjects) != 0) {
-		return nil, permanent(errors.New("durable file checkpoint is missing its object key"))
+		return nil, api.Permanent(errors.New("durable file checkpoint is missing its object key"))
 	}
 	stream.ObjectKey = expectedObjectKey
 	if found {
@@ -620,7 +610,7 @@ func (s *Sink) getWriter(streamRef api.StreamRef, resource api.Resource) (*write
 	}
 	if stream.CurrentClosed {
 		if stream.AppendIntent != nil {
-			return nil, permanent(errors.New("closed durable-file generation has an unresolved append intent"))
+			return nil, api.Permanent(errors.New("closed durable-file generation has an unresolved append intent"))
 		}
 		w := &writer{stream: stream, resource: resource, crc: crc64.New(crc64.MakeTable(crc64.ECMA))}
 		s.writers[streamRef.ID] = w
@@ -660,7 +650,7 @@ func (s *Sink) getWriter(streamRef api.StreamRef, resource api.Resource) (*write
 	}
 	if found && stream.Device != 0 && (stream.Device != device || stream.Inode != inode) {
 		_ = f.Close()
-		return nil, permanent(errors.New("durable file identity does not match checkpoint"))
+		return nil, api.Permanent(errors.New("durable file identity does not match checkpoint"))
 	}
 	stream.Device = device
 	stream.Inode = inode
@@ -669,11 +659,11 @@ func (s *Sink) getWriter(streamRef api.StreamRef, resource api.Resource) (*write
 		intent := stream.AppendIntent
 		if intent.Device != 0 && (intent.Device != device || intent.Inode != inode) {
 			_ = f.Close()
-			return nil, permanent(errors.New("file append intent identity mismatch"))
+			return nil, api.Permanent(errors.New("file append intent identity mismatch"))
 		}
 		if actualSize < intent.Position || actualSize > intent.Position+intent.Length {
 			_ = f.Close()
-			return nil, permanent(errors.New("file append intent size conflict"))
+			return nil, api.Permanent(errors.New("file append intent size conflict"))
 		}
 		if err := f.Truncate(intent.Position); err != nil {
 			_ = f.Close()
@@ -691,7 +681,7 @@ func (s *Sink) getWriter(streamRef api.StreamRef, resource api.Resource) (*write
 	}
 	if actualSize != stream.Position {
 		_ = f.Close()
-		return nil, permanent(fmt.Errorf("file position mismatch: actual=%d state=%d", actualSize, stream.Position))
+		return nil, api.Permanent(fmt.Errorf("file position mismatch: actual=%d state=%d", actualSize, stream.Position))
 	}
 	if _, err := f.Seek(stream.Position, io.SeekStart); err != nil {
 		_ = f.Close()
@@ -701,7 +691,7 @@ func (s *Sink) getWriter(streamRef api.StreamRef, resource api.Resource) (*write
 	if len(stream.CRC64State) > 0 {
 		if err := crc.(encoding.BinaryUnmarshaler).UnmarshalBinary(stream.CRC64State); err != nil {
 			_ = f.Close()
-			return nil, permanent(fmt.Errorf("decode durable file CRC64 checkpoint: %w", err))
+			return nil, api.Permanent(fmt.Errorf("decode durable file CRC64 checkpoint: %w", err))
 		}
 	} else if stream.Position > 0 {
 		if _, err := f.Seek(0, io.SeekStart); err != nil {
@@ -741,26 +731,23 @@ func (s *Sink) rollover(w *writer) error {
 
 func (s *Sink) startNextGeneration(w *writer) error {
 	if s.cfg.MaxFiles <= 0 || w.stream.Generation >= uint64(s.cfg.MaxFiles-1) {
-		return permanent(errors.New("durable file generation limit reached"))
+		return api.Permanent(errors.New("durable file generation limit reached"))
 	}
 	nextGeneration := w.stream.Generation + 1
 	dir, err := familyDir(s.cfg.Root, w.resource)
 	if err != nil {
 		return err
 	}
-	path := filepath.Join(dir, generationName(w.resource.Container, nextGeneration))
-	objectKey, err := filepath.Rel(s.cfg.Root, path)
-	if err != nil {
-		return err
-	}
+	path := filepath.Join(dir, objectlayout.GenerationName(w.resource.Container, nextGeneration))
+	objectKey := objectlayout.DataKey(objectlayout.FamilyPrefix("", w.resource.ClusterName, w.resource.Namespace, w.resource.SandboxID, w.resource.PodUID), w.resource.Container, nextGeneration)
 	if w.stream.GenerationTransition == nil {
-		w.stream.GenerationTransition = &state.GenerationTransition{FromGeneration: w.stream.Generation, ToGeneration: nextGeneration, ObjectKey: filepath.ToSlash(objectKey)}
+		w.stream.GenerationTransition = &state.GenerationTransition{FromGeneration: w.stream.Generation, ToGeneration: nextGeneration, ObjectKey: objectKey}
 		if err := s.state.PutSinkStream(name, w.stream); err != nil {
 			w.stream.GenerationTransition = nil
 			return err
 		}
-	} else if w.stream.GenerationTransition.FromGeneration != w.stream.Generation || w.stream.GenerationTransition.ToGeneration != nextGeneration || w.stream.GenerationTransition.ObjectKey != filepath.ToSlash(objectKey) {
-		return permanent(errors.New("generation transition conflicts with checkpoint"))
+	} else if w.stream.GenerationTransition.FromGeneration != w.stream.Generation || w.stream.GenerationTransition.ToGeneration != nextGeneration || w.stream.GenerationTransition.ObjectKey != objectKey {
+		return api.Permanent(errors.New("generation transition conflicts with checkpoint"))
 	}
 	f, err := openNoFollow(path)
 	if err != nil {
@@ -773,7 +760,7 @@ func (s *Sink) startNextGeneration(w *writer) error {
 	}
 	if info.Size() != 0 {
 		_ = f.Close()
-		return permanent(errors.New("refusing to adopt next generation"))
+		return api.Permanent(errors.New("refusing to adopt next generation"))
 	}
 	device, inode, err := fileIdentity(info)
 	if err != nil {
@@ -790,7 +777,7 @@ func (s *Sink) startNextGeneration(w *writer) error {
 	w.stream.Inode = inode
 	w.stream.CRC64State = nil
 	w.stream.CurrentClosed = false
-	w.stream.ObjectKey = filepath.ToSlash(objectKey)
+	w.stream.ObjectKey = objectKey
 	w.stream.GenerationTransition = nil
 	w.file = f
 	w.crc = crc64.New(crc64.MakeTable(crc64.ECMA))
@@ -802,7 +789,7 @@ func (s *Sink) closeGeneration(w *writer) error {
 		return nil
 	}
 	if w.stream.AppendIntent != nil {
-		return permanent(errors.New("cannot close durable-file generation with an unresolved append intent"))
+		return api.Permanent(errors.New("cannot close durable-file generation with an unresolved append intent"))
 	}
 	if err := syncData(w.file); err != nil {
 		return err
@@ -821,26 +808,13 @@ func (s *Sink) closeGeneration(w *writer) error {
 }
 
 func familyDir(root string, resource api.Resource) (string, error) {
-	parts := []string{resource.ClusterName, resource.Namespace, resource.SandboxID, resource.PodUID}
-	for _, part := range append(parts, resource.Container) {
+	for _, part := range []string{resource.ClusterName, resource.Namespace, resource.SandboxID, resource.PodUID, resource.Container} {
 		if part == "" || part == "." || part == ".." || strings.ContainsAny(part, `/\\`) {
-			return "", permanent(fmt.Errorf("unsafe path segment %q", part))
+			return "", api.Permanent(fmt.Errorf("unsafe path segment %q", part))
 		}
 	}
-	return filepath.Join(append([]string{root}, parts...)...), nil
-}
-
-func sameResourceIdentity(left, right api.Resource) bool {
-	return left.SandboxID == right.SandboxID && left.ClusterName == right.ClusterName &&
-		left.Namespace == right.Namespace && left.PodName == right.PodName && left.PodUID == right.PodUID &&
-		left.NodeName == right.NodeName && left.Container == right.Container && left.LogDirectory == right.LogDirectory
-}
-
-func generationName(container string, generation uint64) string {
-	if generation == 0 {
-		return container + ".log"
-	}
-	return container + "." + strconv.FormatUint(generation, 10) + ".log"
+	relative := objectlayout.FamilyPrefix("", resource.ClusterName, resource.Namespace, resource.SandboxID, resource.PodUID)
+	return filepath.Join(root, filepath.FromSlash(relative)), nil
 }
 
 func writeFull(file *os.File, data []byte) error {
@@ -855,6 +829,16 @@ func writeFull(file *os.File, data []byte) error {
 		data = data[written:]
 	}
 	return nil
+}
+
+func fileAppendIntent(stream state.SinkStream, length int64, digest [sha256.Size]byte) state.AppendIntent {
+	return state.AppendIntent{
+		Position: stream.Position,
+		Length:   length,
+		SHA256:   hex.EncodeToString(digest[:]),
+		Device:   stream.Device,
+		Inode:    stream.Inode,
+	}
 }
 
 func recoverAppend(w *writer) error {
@@ -894,7 +878,7 @@ func (s *Sink) recoverFailedAppend(w *writer, cause error) error {
 
 func (s *Sink) reserveCapacity(additional int64) error {
 	if additional < 0 {
-		return permanent(errors.New("durable file capacity reservation cannot be negative"))
+		return api.Permanent(errors.New("durable file capacity reservation cannot be negative"))
 	}
 	if s.cfg.Root == "" || s.cfg.MaxTotalBytes <= 0 {
 		return nil
@@ -909,7 +893,7 @@ func (s *Sink) reserveCapacity(additional int64) error {
 	}
 	if s.capacityUsed > s.cfg.MaxTotalBytes || additional > s.cfg.MaxTotalBytes-s.capacityUsed {
 		if additional > s.cfg.MaxTotalBytes {
-			return permanent(fmt.Errorf("durable file reservation %d exceeds total-byte limit %d", additional, s.cfg.MaxTotalBytes))
+			return api.Permanent(fmt.Errorf("durable file reservation %d exceeds total-byte limit %d", additional, s.cfg.MaxTotalBytes))
 		}
 		return capacityExhaustedError{limit: s.cfg.MaxTotalBytes}
 	}
@@ -930,7 +914,7 @@ func measureCapacity(root string) (int64, error) {
 			return err
 		}
 		if info.Size() > math.MaxInt64-used {
-			return permanent(errors.New("durable file capacity exceeds int64"))
+			return api.Permanent(errors.New("durable file capacity exceeds int64"))
 		}
 		used += info.Size()
 		return nil
@@ -955,37 +939,33 @@ func (s *Sink) invalidateCapacity() {
 }
 
 func (s *Sink) validateClosedFileLayout(resource api.Resource, stream state.SinkStream) error {
-	dir, err := familyDir(s.cfg.Root, resource)
-	if err != nil {
+	// Validate every resource-derived path segment before reconstructing object keys.
+	if _, err := familyDir(s.cfg.Root, resource); err != nil {
 		return err
 	}
 	expectedClosed := stream.Generation
 	if stream.CurrentClosed {
 		if expectedClosed == ^uint64(0) {
-			return permanent(errors.New("durable file checkpoint generation overflows closed-object count"))
+			return api.Permanent(errors.New("durable file checkpoint generation overflows closed-object count"))
 		}
 		expectedClosed++
 	}
 	if uint64(len(stream.ClosedObjects)) != expectedClosed {
-		return permanent(fmt.Errorf("durable file checkpoint has %d closed objects for generation %d (closed=%t)", len(stream.ClosedObjects), stream.Generation, stream.CurrentClosed))
+		return api.Permanent(fmt.Errorf("durable file checkpoint has %d closed objects for generation %d (closed=%t)", len(stream.ClosedObjects), stream.Generation, stream.CurrentClosed))
 	}
 	for index, object := range stream.ClosedObjects {
 		if object.Generation != uint64(index) {
-			return permanent(fmt.Errorf("closed file generation %d is not continuous at index %d", object.Generation, index))
+			return api.Permanent(fmt.Errorf("closed file generation %d is not continuous at index %d", object.Generation, index))
 		}
-		expectedPath := filepath.Join(dir, generationName(resource.Container, object.Generation))
-		expectedKey, err := filepath.Rel(s.cfg.Root, expectedPath)
-		if err != nil {
-			return err
-		}
-		if object.Key != filepath.ToSlash(expectedKey) {
-			return permanent(fmt.Errorf("closed file generation %d has unexpected object key %q", object.Generation, object.Key))
+		expectedKey := objectlayout.DataKey(objectlayout.FamilyPrefix("", resource.ClusterName, resource.Namespace, resource.SandboxID, resource.PodUID), resource.Container, object.Generation)
+		if object.Key != expectedKey {
+			return api.Permanent(fmt.Errorf("closed file generation %d has unexpected object key %q", object.Generation, object.Key))
 		}
 	}
 	if stream.CurrentClosed {
 		current := stream.ClosedObjects[len(stream.ClosedObjects)-1]
 		if current.Key != stream.ObjectKey || current.Size != stream.Position {
-			return permanent(errors.New("closed file checkpoint does not match the current generation"))
+			return api.Permanent(errors.New("closed file checkpoint does not match the current generation"))
 		}
 	}
 	return nil
@@ -1009,7 +989,7 @@ func (s *Sink) verifyClosedFiles(ctx context.Context, resource api.Resource, str
 		file, err := openNoFollowRead(path)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
-				return permanent(fmt.Errorf("closed file %s is missing: %w", object.Key, err))
+				return api.Permanent(fmt.Errorf("closed file %s is missing: %w", object.Key, err))
 			}
 			return err
 		}
@@ -1020,7 +1000,7 @@ func (s *Sink) verifyClosedFiles(ctx context.Context, resource api.Resource, str
 		}
 		if !info.Mode().IsRegular() || info.Size() != object.Size {
 			_ = file.Close()
-			return permanent(fmt.Errorf("closed file %s changed size or type", object.Key))
+			return api.Permanent(fmt.Errorf("closed file %s changed size or type", object.Key))
 		}
 		checksum := crc64.New(crc64.MakeTable(crc64.ECMA))
 		if _, err := io.Copy(checksum, contextReader{ctx: ctx, reader: file}); err != nil {
@@ -1031,7 +1011,7 @@ func (s *Sink) verifyClosedFiles(ctx context.Context, resource api.Resource, str
 			return err
 		}
 		if strconv.FormatUint(checksum.Sum64(), 10) != object.CRC64 {
-			return permanent(fmt.Errorf("closed file %s changed checksum", object.Key))
+			return api.Permanent(fmt.Errorf("closed file %s changed checksum", object.Key))
 		}
 	}
 	return nil
@@ -1061,12 +1041,12 @@ func readNoFollow(path string) ([]byte, error) {
 func safeObjectPath(root, key string) (string, error) {
 	clean := filepath.Clean(filepath.FromSlash(key))
 	if clean == "." || filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-		return "", permanent(errors.New("unsafe durable file object key"))
+		return "", api.Permanent(errors.New("unsafe durable file object key"))
 	}
 	path := filepath.Join(root, clean)
 	relative, err := filepath.Rel(root, path)
 	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return "", permanent(errors.New("durable file object escapes root"))
+		return "", api.Permanent(errors.New("durable file object escapes root"))
 	}
 	return path, nil
 }

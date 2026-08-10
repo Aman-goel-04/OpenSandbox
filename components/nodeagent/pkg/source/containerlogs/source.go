@@ -35,6 +35,7 @@ import (
 	"github.com/alibaba/opensandbox/internal/logger"
 	"github.com/alibaba/opensandbox/nodeagent/pkg/api"
 	"github.com/alibaba/opensandbox/nodeagent/pkg/config"
+	"github.com/alibaba/opensandbox/nodeagent/pkg/objectlayout"
 	"github.com/alibaba/opensandbox/nodeagent/pkg/registry"
 	"github.com/alibaba/opensandbox/nodeagent/pkg/state"
 	"github.com/alibaba/opensandbox/nodeagent/pkg/store"
@@ -50,25 +51,10 @@ const (
 
 var logNamePattern = regexp.MustCompile(`^(\d+)\.log(?:\.(.+))?$`)
 
-type permanentSourceError struct {
-	err error
-}
-
-func (e permanentSourceError) Error() string { return e.err.Error() }
-func (e permanentSourceError) Unwrap() error { return e.err }
-func (permanentSourceError) Retryable() bool { return false }
-
-func permanent(err error) error {
-	if err == nil {
-		return nil
-	}
-	return permanentSourceError{err: err}
-}
-
 func (s *Source) commitSource(checkpoints []state.FileCheckpoint, stream state.SourceStream) error {
 	err := s.state.CommitSource(checkpoints, stream)
 	if errors.Is(err, state.ErrFileCheckpointSuperseded) {
-		return permanent(err)
+		return api.Permanent(err)
 	}
 	return err
 }
@@ -76,7 +62,7 @@ func (s *Source) commitSource(checkpoints []state.FileCheckpoint, stream state.S
 func init() {
 	registry.RegisterSource(sourceName, func(dependencies registry.Dependencies) (api.Source, error) {
 		cfg := dependencies.Config
-		return New(Config{MaxLineBytes: cfg.MaxLineBytes, PartialTimeout: cfg.PartialTimeout, ReconcileInterval: cfg.ReconcileInterval, EndedStateRetention: cfg.EndedStateRetention, PruneEndedState: pruneEndedState(cfg)}, dependencies.Store, dependencies.State, dependencies.Logger, dependencies.OnError), nil
+		return New(Config{MaxLineBytes: cfg.MaxLineBytes, PartialTimeout: cfg.PartialTimeout, ReconcileInterval: config.InternalReconcileInterval, EndedStateRetention: cfg.EndedStateRetention, PruneEndedState: pruneEndedState(cfg)}, dependencies.Store, dependencies.State, dependencies.Logger, dependencies.OnError), nil
 	})
 }
 
@@ -127,7 +113,7 @@ type watchIdentity struct {
 
 type streamRuntime struct {
 	mu          sync.Mutex
-	resource    api.Resource
+	resource    store.Resource
 	files       map[string]*fileRuntime
 	assembler   *assembler
 	pending     []*pendingSpan
@@ -191,8 +177,6 @@ func New(cfg Config, view store.View, checkpoints checkpointStore, log logger.Lo
 	return &Source{cfg: cfg, store: view, state: checkpoints, log: log.Named(sourceName), onError: onError, streams: make(map[string]*streamRuntime), done: make(chan struct{}), epochID: uuid.NewString(), watches: make(map[string]watchIdentity), pendingRootWatchReplacements: make(map[string]map[string]struct{})}
 }
 
-func (s *Source) Name() string { return sourceName }
-
 func (s *Source) Capabilities() api.Capabilities {
 	return api.Capabilities{RecordKinds: []api.RecordKind{api.RecordKindContainerLog}}
 }
@@ -238,20 +222,20 @@ func (s *Source) Acknowledge(_ context.Context, results []api.AckResult) error {
 	groupByStream := make(map[string]int)
 	for _, result := range results {
 		if result.Token.Source != sourceName {
-			return permanent(fmt.Errorf("ack token source %q does not match %q", result.Token.Source, sourceName))
+			return api.Permanent(fmt.Errorf("ack token source %q does not match %q", result.Token.Source, sourceName))
 		}
 		if result.Guarantee != api.GuaranteeDurable && result.Guarantee != api.GuaranteeBestEffort {
-			return permanent(fmt.Errorf("unsupported delivery guarantee %q", result.Guarantee))
+			return api.Permanent(fmt.Errorf("unsupported delivery guarantee %q", result.Guarantee))
 		}
 		if result.Disposition != api.AckDelivered && result.Disposition != api.AckIntentionalDrop {
-			return permanent(fmt.Errorf("unsupported acknowledgement disposition %q", result.Disposition))
+			return api.Permanent(fmt.Errorf("unsupported acknowledgement disposition %q", result.Disposition))
 		}
 		var value tokenValue
 		if err := json.Unmarshal(result.Token.Value, &value); err != nil {
-			return permanent(fmt.Errorf("decode ack token: %w", err))
+			return api.Permanent(fmt.Errorf("decode ack token: %w", err))
 		}
 		if len(value.Spans) == 0 {
-			return permanent(errors.New("ack token contains no source span"))
+			return api.Permanent(errors.New("ack token contains no source span"))
 		}
 		streamRef := result.Token.StreamRef.ID
 		index, exists := groupByStream[streamRef]
@@ -267,7 +251,7 @@ func (s *Source) Acknowledge(_ context.Context, results []api.AckResult) error {
 		runtime := s.streams[group.streamRef]
 		s.mu.Unlock()
 		if runtime == nil {
-			return permanent(fmt.Errorf("unknown stream %q", group.streamRef))
+			return api.Permanent(fmt.Errorf("unknown stream %q", group.streamRef))
 		}
 		runtime.mu.Lock()
 		oldGuarantee := runtime.persisted.Guarantee
@@ -289,12 +273,12 @@ func (s *Source) Acknowledge(_ context.Context, results []api.AckResult) error {
 			if value.Revision != runtime.revision {
 				rollback()
 				runtime.mu.Unlock()
-				return permanent(fmt.Errorf("ack token revision %d does not match stream revision %d", value.Revision, runtime.revision))
+				return api.Permanent(fmt.Errorf("ack token revision %d does not match stream revision %d", value.Revision, runtime.revision))
 			}
 			if runtime.persisted.Guarantee != "" && runtime.persisted.Guarantee != string(result.Guarantee) {
 				rollback()
 				runtime.mu.Unlock()
-				return permanent(fmt.Errorf("stream guarantee changed from %q to %q", runtime.persisted.Guarantee, result.Guarantee))
+				return api.Permanent(fmt.Errorf("stream guarantee changed from %q to %q", runtime.persisted.Guarantee, result.Guarantee))
 			}
 			indices, err := runtime.pendingForToken(result.Token.ID, value.Spans)
 			if err != nil {
@@ -303,7 +287,7 @@ func (s *Source) Acknowledge(_ context.Context, results []api.AckResult) error {
 				}
 				rollback()
 				runtime.mu.Unlock()
-				return permanent(err)
+				return api.Permanent(err)
 			}
 			for _, index := range indices {
 				runtime.pending[index].complete = true
@@ -334,17 +318,17 @@ func (s *Source) Acknowledge(_ context.Context, results []api.AckResult) error {
 
 func (s *Source) AcknowledgeEnd(_ context.Context, token api.EndToken) error {
 	if token.Source != sourceName {
-		return permanent(fmt.Errorf("end token source %q does not match", token.Source))
+		return api.Permanent(fmt.Errorf("end token source %q does not match", token.Source))
 	}
 	revision, err := strconv.ParseUint(string(token.Value), 10, 64)
 	if err != nil || revision == 0 {
-		return permanent(errors.New("invalid end token revision"))
+		return api.Permanent(errors.New("invalid end token revision"))
 	}
 	s.mu.Lock()
 	runtime := s.streams[token.StreamRef.ID]
 	s.mu.Unlock()
 	if runtime == nil {
-		return permanent(fmt.Errorf("unknown stream %q", token.StreamRef.ID))
+		return api.Permanent(fmt.Errorf("unknown stream %q", token.StreamRef.ID))
 	}
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
@@ -352,10 +336,10 @@ func (s *Source) AcknowledgeEnd(_ context.Context, token api.EndToken) error {
 		return nil
 	}
 	if revision != runtime.revision || runtime.persisted.FinalizingRevision != revision {
-		return permanent(fmt.Errorf("end token revision %d is not the active finalization", revision))
+		return api.Permanent(fmt.Errorf("end token revision %d is not the active finalization", revision))
 	}
 	if len(runtime.pending) != 0 {
-		return permanent(errors.New("cannot acknowledge stream end with unresolved source spans"))
+		return api.Permanent(errors.New("cannot acknowledge stream end with unresolved source spans"))
 	}
 	next := runtime.persisted
 	next.AcknowledgedRevision = revision
@@ -363,11 +347,7 @@ func (s *Source) AcknowledgeEnd(_ context.Context, token api.EndToken) error {
 	next.FinalizingOutcome = nil
 	next.Ended = true
 	if !next.CoverageStartedAt.IsZero() && next.MonitoringEpoch != s.epochID {
-		scope := next.MonitoringEpoch
-		if scope == "" {
-			scope = "unknown-monitoring-epoch"
-		}
-		appendCoverageGapToStream(&next, scope, "monitor-interrupted", runtime.resource.LogDirectory)
+		appendCoverageGapToStream(&next, next.MonitoringEpoch, "monitor-interrupted", runtime.resource.LogDirectory)
 		next.MonitoringEpoch = s.epochID
 	}
 	if next.RepairDeadline == nil {
@@ -452,10 +432,10 @@ func (s *Source) commitCompletedLocked(runtime *streamRuntime) error {
 	liveByFileID := make(map[string]*fileRuntime)
 	for path, file := range runtime.files {
 		if file == nil || file.fileID == "" || file.path != path {
-			return permanent(fmt.Errorf("invalid live source runtime at path %q", path))
+			return api.Permanent(fmt.Errorf("invalid live source runtime at path %q", path))
 		}
 		if existing := liveByFileID[file.fileID]; existing != nil && existing != file {
-			return permanent(fmt.Errorf("duplicate live source runtime for file_id %q", file.fileID))
+			return api.Permanent(fmt.Errorf("duplicate live source runtime for file_id %q", file.fileID))
 		}
 		liveByFileID[file.fileID] = file
 	}
@@ -463,14 +443,14 @@ func (s *Source) commitCompletedLocked(runtime *streamRuntime) error {
 	for sequence, pending := range runtime.pending[:count] {
 		file := pending.file
 		if file == nil || pending.span.FileID == "" || file.fileID != pending.span.FileID || !sameFingerprint(file.fingerprint, pending.span) {
-			return permanent(fmt.Errorf("pending source span for path %q has inconsistent file identity", pending.span.Path))
+			return api.Permanent(fmt.Errorf("pending source span for path %q has inconsistent file identity", pending.span.Path))
 		}
 		commit := commitsByFile[file]
 		if commit == nil {
 			commit = &checkpointCommit{file: file, fileID: file.fileID, path: file.path}
 			commitsByFile[file] = commit
 		} else if commit.path != file.path {
-			return permanent(fmt.Errorf("source file_id %q changed path while committing", file.fileID))
+			return api.Permanent(fmt.Errorf("source file_id %q changed path while committing", file.fileID))
 		}
 		commit.endOffset = max(commit.endOffset, pending.span.EndOffset)
 		commit.lastSeq = sequence
@@ -488,14 +468,14 @@ func (s *Source) commitCompletedLocked(runtime *streamRuntime) error {
 				}
 				foundRepairGap = true
 				if gap.Resolved || gap.ResumeAt != nil || gap.FileID != pending.span.FileID || gap.Device != pending.span.Device || gap.Inode != pending.span.Inode || gap.PrefixHash != pending.span.PrefixHash || gap.HashBytes != pending.span.HashBytes {
-					return permanent(fmt.Errorf("repair span does not match gap %q", gap.ID))
+					return api.Permanent(fmt.Errorf("repair span does not match gap %q", gap.ID))
 				}
 				expected := gap.FromOffset
 				if gap.RepairOffset != nil {
 					expected = *gap.RepairOffset
 				}
 				if pending.span.StartOffset != expected || pending.span.EndOffset < pending.span.StartOffset {
-					return permanent(fmt.Errorf("repair span for gap %q is not contiguous at offset %d", gap.ID, expected))
+					return api.Permanent(fmt.Errorf("repair span for gap %q is not contiguous at offset %d", gap.ID, expected))
 				}
 				repairOffset := pending.span.EndOffset
 				gap.RepairOffset = &repairOffset
@@ -510,16 +490,11 @@ func (s *Source) commitCompletedLocked(runtime *streamRuntime) error {
 				break
 			}
 			if !foundRepairGap {
-				return permanent(fmt.Errorf("repair span references unknown gap %q", pending.span.RepairGapID))
+				return api.Permanent(fmt.Errorf("repair span references unknown gap %q", pending.span.RepairGapID))
 			}
 		}
 	}
 	recomputeOutcome(&next)
-	watermark, err := json.Marshal(runtime.pending[count-1].span)
-	if err != nil {
-		return err
-	}
-	next.TerminalWatermark = watermark
 	winnerByPath := make(map[string]*checkpointCommit)
 	for _, commit := range commitsByFile {
 		commit.endOffset = max(commit.endOffset, commit.file.committed)
@@ -683,10 +658,7 @@ func (s *Source) recordUnobservedWatchEvent(event fsnotify.Event) error {
 }
 
 func isRecognizedLogArtifact(path string) bool {
-	name := filepath.Base(path)
-	if strings.HasSuffix(name, ".gz") {
-		name = strings.TrimSuffix(name, ".gz")
-	}
+	name := strings.TrimSuffix(filepath.Base(path), ".gz")
 	return logNamePattern.MatchString(name)
 }
 
@@ -766,23 +738,19 @@ func (s *Source) resumeMonitoring(runtime *streamRuntime, leafWatched bool, disc
 		if !leafWatched {
 			return nil
 		}
-		hadPriorProgress := len(runtime.files) > 0 || next.Revision > 1 || next.AcknowledgedRevision > 0 || next.FinalizingRevision > 0 || len(next.Drops) > 0 || len(next.Gaps) > 0 || len(next.TerminalWatermark) > 0
+		hadPriorProgress := len(runtime.files) > 0 || next.Revision > 1 || next.AcknowledgedRevision > 0 || next.FinalizingRevision > 0 || len(next.Drops) > 0 || len(next.Gaps) > 0
+		if hadPriorProgress {
+			return api.Permanent(fmt.Errorf("source stream %q has progress without a coverage boundary", next.StreamRef))
+		}
 		next.CoverageStartedAt = canonicalCoverageBoundary(time.Now())
 		next.MonitoringEpoch = s.epochID
-		if hadPriorProgress {
-			appendCoverageGapToStream(&next, "legacy-monitoring-state", "monitor-interrupted", runtime.resource.LogDirectory)
-		}
 		changed = true
 	} else if next.MonitoringEpoch != s.epochID {
 		reason := "monitor-interrupted"
 		if !next.InitialScanComplete {
 			reason = "adoption-scan-interrupted"
 		}
-		scope := next.MonitoringEpoch
-		if scope == "" {
-			scope = "unknown-monitoring-epoch"
-		}
-		appendCoverageGapToStream(&next, scope, reason, runtime.resource.LogDirectory)
+		appendCoverageGapToStream(&next, next.MonitoringEpoch, reason, runtime.resource.LogDirectory)
 		next.MonitoringEpoch = s.epochID
 		changed = true
 	}
@@ -854,9 +822,6 @@ func (s *Source) recordSharedRootWatchReplacements(logDirectory string, disconti
 	logRoot := filepath.Dir(filepath.Dir(logDirectory))
 	replacementPrefix := "watch-replaced:" + logRoot + ":"
 	s.mu.Lock()
-	if s.pendingRootWatchReplacements == nil {
-		s.pendingRootWatchReplacements = make(map[string]map[string]struct{})
-	}
 	for _, scope := range discontinuities {
 		if strings.HasPrefix(scope, replacementPrefix) {
 			pending := s.pendingRootWatchReplacements[logRoot]
@@ -1149,9 +1114,7 @@ func (s *Source) pruneEndedRuntime(streamRef api.StreamRef, runtime *streamRunti
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return false, err
 	}
-	if forgetter, ok := s.store.(interface{ Forget(string) }); ok {
-		forgetter.Forget(podUID)
-	}
+	s.store.Forget(podUID)
 	if !s.cfg.PruneEndedState {
 		s.mu.Lock()
 		if s.streams[streamRef.ID] == runtime {
@@ -1312,7 +1275,7 @@ func (s *Source) scanFile(ctx context.Context, streamRef api.StreamRef, runtime 
 	promotingFingerprint := requestedHashBytes == 0
 	if promotingFingerprint {
 		if committed != 0 || readOffsetForIdentity != 0 {
-			return false, permanent(fmt.Errorf("source file %q has a zero-length fingerprint past offset zero", path))
+			return false, api.Permanent(fmt.Errorf("source file %q has a zero-length fingerprint past offset zero", path))
 		}
 		requestedHashBytes = -1
 	}
@@ -1337,7 +1300,7 @@ func (s *Source) scanFile(ctx context.Context, streamRef api.StreamRef, runtime 
 		runtime.mu.Lock()
 		if runtime.files[path] != fileState || fileState.fingerprint != storedFingerprint || fileState.committed != 0 || fileState.readOffset != 0 {
 			runtime.mu.Unlock()
-			return false, permanent(fmt.Errorf("source file %q changed while promoting its fingerprint", path))
+			return false, api.Permanent(fmt.Errorf("source file %q changed while promoting its fingerprint", path))
 		}
 		fileState.fingerprint = current
 		checkpoint := checkpointFor(runtime.persisted.StreamRef, runtime.revision, fileState, 0)
@@ -1570,7 +1533,7 @@ func (s *Source) emit(ctx context.Context, streamRef api.StreamRef, runtime *str
 		runtime.outcome.HadDrops = true
 		runtime.outcome.LossReasons = addReason(runtime.outcome.LossReasons, reason)
 	}
-	resource := runtime.resource
+	resource := runtime.resource.Resource
 	runtime.mu.Unlock()
 	event := api.SourceEvent{Delivery: &api.Delivery{
 		Record:    api.Record{Kind: api.RecordKindContainerLog, Timestamp: record.timestamp, Body: record.body, Resource: resource, Attributes: map[string]string{"source": "container." + record.stream, "stream": record.stream, "log.file.path": record.spans[len(record.spans)-1].Path}},
@@ -1600,7 +1563,7 @@ func (s *Source) emitEnd(ctx context.Context, streamRef api.StreamRef, runtime *
 		next.FinalizingOutcome = &state.OutcomeSnapshot{HadDrops: runtime.outcome.HadDrops, HadSourceGaps: runtime.outcome.HadSourceGaps, LossReasons: append([]string(nil), runtime.outcome.LossReasons...)}
 	} else if next.FinalizingOutcome == nil {
 		runtime.mu.Unlock()
-		return permanent(errors.New("finalizing source stream has no frozen outcome"))
+		return api.Permanent(errors.New("finalizing source stream has no frozen outcome"))
 	}
 	if err := s.state.PutSourceStream(next); err != nil {
 		runtime.mu.Unlock()
@@ -1610,13 +1573,8 @@ func (s *Source) emitEnd(ctx context.Context, streamRef api.StreamRef, runtime *
 	if !replaying {
 		runtime.latePending = false
 	}
-	var watermark *api.SourcePositionToken
-	if len(next.TerminalWatermark) > 0 {
-		watermarkHash := sha256.Sum256(append([]byte(streamRef.ID), next.TerminalWatermark...))
-		watermark = &api.SourcePositionToken{ID: hex.EncodeToString(watermarkHash[:]), Source: sourceName, StreamRef: streamRef, Value: append([]byte(nil), next.TerminalWatermark...)}
-	}
 	frozenOutcome := api.SourceOutcome{HadDrops: next.FinalizingOutcome.HadDrops, HadSourceGaps: next.FinalizingOutcome.HadSourceGaps, LossReasons: append([]string(nil), next.FinalizingOutcome.LossReasons...)}
-	event := api.SourceEvent{End: &api.StreamEnd{StreamRef: streamRef, EndToken: api.EndToken{ID: id, Source: sourceName, StreamRef: streamRef, Value: value}, TerminalWatermark: watermark, Revision: runtime.revision, CoverageStartedAt: next.CoverageStartedAt, Resource: runtime.resource, Outcome: frozenOutcome}}
+	event := api.SourceEvent{End: &api.StreamEnd{StreamRef: streamRef, EndToken: api.EndToken{ID: id, Source: sourceName, StreamRef: streamRef, Value: value}, Revision: runtime.revision, CoverageStartedAt: next.CoverageStartedAt, Resource: runtime.resource.Resource, Outcome: frozenOutcome}}
 	runtime.ended = true
 	runtime.endAcked = false
 	runtime.mu.Unlock()
@@ -1669,12 +1627,12 @@ func (s *Source) restoreStreams(ctx context.Context, watcher *fsnotify.Watcher) 
 	}
 	for _, persisted := range streams {
 		if persisted.Revision == 0 {
-			return permanent(fmt.Errorf("persisted stream %q has revision zero", persisted.StreamRef))
+			return api.Permanent(fmt.Errorf("persisted stream %q has revision zero", persisted.StreamRef))
 		}
 		resource := thawResource(persisted.Resource)
 		expectedStreamRef := streamRef(resource).ID
 		if persisted.StreamRef != expectedStreamRef {
-			return permanent(fmt.Errorf("persisted stream_ref %q does not match resource-derived stream_ref %q", persisted.StreamRef, expectedStreamRef))
+			return api.Permanent(fmt.Errorf("persisted stream_ref %q does not match resource-derived stream_ref %q", persisted.StreamRef, expectedStreamRef))
 		}
 		if _, present := s.store.GetByUID(resource.PodUID); !present && !resource.Terminated {
 			resource.Terminated = true
@@ -1717,8 +1675,8 @@ func (s *Source) restoreStreams(ctx context.Context, watcher *fsnotify.Watcher) 
 	return nil
 }
 
-func (s *Source) allResources() []api.Resource {
-	byStream := make(map[string]api.Resource)
+func (s *Source) allResources() []store.Resource {
+	byStream := make(map[string]store.Resource)
 	for _, resource := range s.store.List() {
 		byStream[streamRef(resource).ID] = resource
 	}
@@ -1731,7 +1689,7 @@ func (s *Source) allResources() []api.Resource {
 		runtime.mu.Unlock()
 	}
 	s.mu.Unlock()
-	out := make([]api.Resource, 0, len(byStream))
+	out := make([]store.Resource, 0, len(byStream))
 	for _, resource := range byStream {
 		out = append(out, resource)
 	}
@@ -1739,7 +1697,7 @@ func (s *Source) allResources() []api.Resource {
 	return out
 }
 
-func (s *Source) getOrCreateRuntime(streamRef api.StreamRef, resource api.Resource) (*streamRuntime, error) {
+func (s *Source) getOrCreateRuntime(streamRef api.StreamRef, resource store.Resource) (*streamRuntime, error) {
 	s.mu.Lock()
 	runtime := s.streams[streamRef.ID]
 	s.mu.Unlock()
@@ -1768,7 +1726,7 @@ func (s *Source) getOrCreateRuntime(streamRef api.StreamRef, resource api.Resour
 	}
 	if found {
 		if persisted.Revision == 0 {
-			return nil, permanent(fmt.Errorf("persisted stream %q has revision zero", streamRef.ID))
+			return nil, api.Permanent(fmt.Errorf("persisted stream %q has revision zero", streamRef.ID))
 		}
 		frozen := thawResource(persisted.Resource)
 		if frozen.PodUID != resource.PodUID || frozen.LogDirectory != resource.LogDirectory || frozen.SandboxID != resource.SandboxID {
@@ -1804,15 +1762,12 @@ func (s *Source) hydrateFiles(runtime *streamRuntime) error {
 		if err := validateCheckpointFingerprint(checkpoint); err != nil {
 			return err
 		}
-		if checkpoint.FileID == "" {
-			checkpoint.FileID = uuid.NewString()
-		}
 		runtime.files[checkpoint.Path] = &fileRuntime{fileID: checkpoint.FileID, path: checkpoint.Path, restart: restartIdentity(checkpoint.Path), readOffset: checkpoint.Offset, committed: checkpoint.Offset, observedSize: checkpoint.ObservedSize, modTimeUnixNano: checkpoint.ModTimeUnixNano, fingerprint: fileFingerprint{Device: checkpoint.Device, Inode: checkpoint.Inode, PrefixHash: checkpoint.PrefixHash, HashBytes: checkpoint.HashBytes}}
 	}
 	return nil
 }
 
-func runtimeFromState(cfg Config, resource api.Resource, persisted state.SourceStream) *streamRuntime {
+func runtimeFromState(cfg Config, resource store.Resource, persisted state.SourceStream) *streamRuntime {
 	return &streamRuntime{
 		resource:    resource,
 		files:       make(map[string]*fileRuntime),
@@ -1826,12 +1781,12 @@ func runtimeFromState(cfg Config, resource api.Resource, persisted state.SourceS
 	}
 }
 
-func freezeResource(resource api.Resource) state.FrozenResource {
+func freezeResource(resource store.Resource) state.FrozenResource {
 	return state.FrozenResource{SandboxID: resource.SandboxID, ClusterName: resource.ClusterName, Namespace: resource.Namespace, PodName: resource.PodName, PodUID: resource.PodUID, NodeName: resource.NodeName, Container: resource.Container, LogDirectory: resource.LogDirectory, Terminated: resource.Terminated}
 }
 
-func thawResource(resource state.FrozenResource) api.Resource {
-	return api.Resource{SandboxID: resource.SandboxID, ClusterName: resource.ClusterName, Namespace: resource.Namespace, PodName: resource.PodName, PodUID: resource.PodUID, NodeName: resource.NodeName, Container: resource.Container, LogDirectory: resource.LogDirectory, Terminated: resource.Terminated}
+func thawResource(resource state.FrozenResource) store.Resource {
+	return store.Resource{Resource: api.Resource{SandboxID: resource.SandboxID, ClusterName: resource.ClusterName, Namespace: resource.Namespace, PodName: resource.PodName, PodUID: resource.PodUID, NodeName: resource.NodeName, Container: resource.Container, LogDirectory: resource.LogDirectory}, Terminated: resource.Terminated}
 }
 
 func (s *Source) runtimeHasNewBytes(runtime *streamRuntime, files []string) (bool, error) {
@@ -1964,7 +1919,7 @@ func (s *Source) findRepairCheckpoint(runtime *streamRuntime, path string) (stat
 			offset = *gap.RepairOffset
 		}
 		if offset < gap.FromOffset || gap.ToOffset != nil && (offset > *gap.ToOffset || *gap.ToOffset < gap.FromOffset) {
-			return state.FileCheckpoint{}, "", false, permanent(fmt.Errorf("gap %q has invalid repair bounds", gap.ID))
+			return state.FileCheckpoint{}, "", false, api.Permanent(fmt.Errorf("gap %q has invalid repair bounds", gap.ID))
 		}
 		fingerprintValue, err := fingerprint(path, gap.HashBytes)
 		if err != nil {
@@ -1986,7 +1941,7 @@ func (s *Source) findRepairCheckpoint(runtime *streamRuntime, path string) (stat
 		})
 	}
 	if len(matches) > 1 {
-		return state.FileCheckpoint{}, "", false, permanent(fmt.Errorf("ambiguous repair gap candidates for %s", path))
+		return state.FileCheckpoint{}, "", false, api.Permanent(fmt.Errorf("ambiguous repair gap candidates for %s", path))
 	}
 	if len(matches) == 1 {
 		return matches[0].checkpoint, matches[0].gapID, true, nil
@@ -2133,7 +2088,7 @@ func (s *Source) makeBoundRepairGapCoverageLocked(runtime *streamRuntime, file *
 		break
 	}
 	if !found {
-		return permanent(fmt.Errorf("repair file references unknown gap %q", file.repairGapID))
+		return api.Permanent(fmt.Errorf("repair file references unknown gap %q", file.repairGapID))
 	}
 	recomputeOutcome(&next)
 	if err := s.state.PutSourceStream(next); err != nil {
@@ -2249,14 +2204,14 @@ func bindRepairGap(stream state.SourceStream, file *fileRuntime) error {
 			expected = *gap.RepairOffset
 		}
 		if expected < gap.FromOffset || gap.ToOffset != nil && (expected > *gap.ToOffset || *gap.ToOffset < gap.FromOffset) {
-			return permanent(fmt.Errorf("gap %q has invalid repair bounds", gap.ID))
+			return api.Permanent(fmt.Errorf("gap %q has invalid repair bounds", gap.ID))
 		}
 		if expected != file.committed {
 			continue
 		}
 		if gap.Device == file.fingerprint.Device && gap.Inode == file.fingerprint.Inode && gap.PrefixHash == file.fingerprint.PrefixHash && gap.HashBytes == file.fingerprint.HashBytes {
 			if candidate != "" {
-				return permanent(fmt.Errorf("multiple repair gaps match file_id %q at offset %d", file.fileID, file.committed))
+				return api.Permanent(fmt.Errorf("multiple repair gaps match file_id %q at offset %d", file.fileID, file.committed))
 			}
 			candidate = gap.ID
 		}
@@ -2282,17 +2237,17 @@ func (s *Source) resolveStableRepairGapsLocked(runtime *streamRuntime) error {
 			}
 			foundGap = true
 			if gap.Resolved || gap.Coverage || gap.ResumeAt != nil || gap.FileID != file.fileID || gap.Device != file.fingerprint.Device || gap.Inode != file.fingerprint.Inode || gap.PrefixHash != file.fingerprint.PrefixHash || gap.HashBytes != file.fingerprint.HashBytes {
-				return permanent(fmt.Errorf("stable repair file does not match gap %q", gap.ID))
+				return api.Permanent(fmt.Errorf("stable repair file does not match gap %q", gap.ID))
 			}
 			if file.observedSize < gap.FromOffset {
-				return permanent(fmt.Errorf("stable repair file for gap %q ends before the gap starts", gap.ID))
+				return api.Permanent(fmt.Errorf("stable repair file for gap %q ends before the gap starts", gap.ID))
 			}
 			if file.observedSize < gap.ObservedSize {
 				break
 			}
 			toOffset := file.observedSize
 			if gap.ToOffset != nil && *gap.ToOffset != toOffset {
-				return permanent(fmt.Errorf("stable repair EOF for gap %q changed from %d to %d", gap.ID, *gap.ToOffset, toOffset))
+				return api.Permanent(fmt.Errorf("stable repair EOF for gap %q changed from %d to %d", gap.ID, *gap.ToOffset, toOffset))
 			}
 			gap.ToOffset = &toOffset
 			repairOffset := gap.FromOffset
@@ -2307,7 +2262,7 @@ func (s *Source) resolveStableRepairGapsLocked(runtime *streamRuntime) error {
 			break
 		}
 		if !foundGap {
-			return permanent(fmt.Errorf("stable repair file references unknown gap %q", file.repairGapID))
+			return api.Permanent(fmt.Errorf("stable repair file references unknown gap %q", file.repairGapID))
 		}
 	}
 	if !changed {
@@ -2396,8 +2351,8 @@ func (s *Source) fail(err error) {
 	}
 }
 
-func streamRef(resource api.Resource) api.StreamRef {
-	return api.StreamRef{ID: sourceName + "/" + resource.PodUID + "/" + resource.Container}
+func streamRef(resource store.Resource) api.StreamRef {
+	return api.StreamRef{ID: objectlayout.StreamRef(resource.PodUID, resource.Container)}
 }
 
 type discoveredFile struct {
@@ -2405,11 +2360,6 @@ type discoveredFile struct {
 	restart int
 	rotated bool
 	suffix  string
-}
-
-func discoverFiles(dir string) ([]string, error) {
-	files, _, err := discoverDirectory(dir)
-	return files, err
 }
 
 func discoverDirectory(dir string) ([]string, []string, error) {
@@ -2482,7 +2432,7 @@ func fingerprintForCheckpoint(path string, checkpoint state.FileCheckpoint) (fil
 
 func validateCheckpointFingerprint(checkpoint state.FileCheckpoint) error {
 	if checkpoint.HashBytes == 0 && (checkpoint.Offset != 0 || checkpoint.ObservedSize != 0) {
-		return permanent(fmt.Errorf("source checkpoint for %q has a zero-length fingerprint past offset zero", checkpoint.Path))
+		return api.Permanent(fmt.Errorf("source checkpoint for %q has a zero-length fingerprint past offset zero", checkpoint.Path))
 	}
 	return nil
 }

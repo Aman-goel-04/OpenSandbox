@@ -17,7 +17,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"os"
 	"os/signal"
@@ -32,7 +31,6 @@ import (
 	"github.com/alibaba/opensandbox/internal/version"
 	"github.com/alibaba/opensandbox/nodeagent/pkg/api"
 	"github.com/alibaba/opensandbox/nodeagent/pkg/config"
-	"github.com/alibaba/opensandbox/nodeagent/pkg/identity"
 	"github.com/alibaba/opensandbox/nodeagent/pkg/pipeline"
 	"github.com/alibaba/opensandbox/nodeagent/pkg/registry"
 	"github.com/alibaba/opensandbox/nodeagent/pkg/resourcecheck"
@@ -90,7 +88,7 @@ func run() (exitCode int) {
 		}()
 	}
 
-	targetID, err := targetID(cfg)
+	targetID, err := registry.TargetID(cfg.Sink, cfg)
 	if err != nil {
 		readiness.Replace("invalid-target")
 		log.Errorf("target identity invalid: %v", err)
@@ -147,9 +145,9 @@ func run() (exitCode int) {
 		<-signalCtx.Done()
 		return
 	}
-	staleThreshold := max(3*cfg.ReconcileInterval, time.Minute)
+	staleThreshold := max(3*config.InternalReconcileInterval, time.Minute)
 	safego.Go(func() {
-		ticker := time.NewTicker(min(cfg.ReconcileInterval, time.Minute))
+		ticker := time.NewTicker(min(config.InternalReconcileInterval, time.Minute))
 		defer ticker.Stop()
 		for {
 			select {
@@ -172,7 +170,7 @@ func run() (exitCode int) {
 		<-signalCtx.Done()
 		return
 	}
-	p, err := pipeline.New(pipeline.Config{BatchMaxItems: cfg.BatchMaxItems, FlushInterval: cfg.BatchFlushInterval, SinkTimeout: cfg.SinkTimeout, RetryMaxInterval: cfg.RetryMaxInterval, OnRetryStateChange: func(active bool) { readiness.Set("operation-retrying", active) }, PerStreamQueueSize: 1, MemoryBudgetBytes: cfg.MemoryBudgetBytes, PerSandboxQueueBytes: cfg.PerSandboxQueueBytes, PerSandboxRateLimit: cfg.PerSandboxRateLimit, DropPolicy: cfg.DropPolicy}, source, sink, checkpoint, targetID, log, onRuntimeError)
+	p, err := pipeline.New(pipeline.Config{BatchMaxItems: config.InternalBatchMaxItems, FlushInterval: config.InternalBatchFlushInterval, SinkTimeout: cfg.SinkTimeout, RetryMaxInterval: cfg.RetryMaxInterval, OnRetryStateChange: func(active bool) { readiness.Set("operation-retrying", active) }, MemoryBudgetBytes: cfg.MemoryBudgetBytes, PerSandboxQueueBytes: cfg.PerSandboxQueueBytes, PerSandboxRateLimit: cfg.PerSandboxRateLimit, DropPolicy: cfg.DropPolicy}, source, sink, checkpoint, targetID, log, onRuntimeError)
 	if err != nil {
 		readiness.Replace("pipeline-invalid")
 		log.Errorf("pipeline invalid: %v", err)
@@ -190,7 +188,7 @@ func run() (exitCode int) {
 		CollectExpired(context.Context, time.Time) error
 	}); ok {
 		safego.Go(func() {
-			ticker := time.NewTicker(min(cfg.ReconcileInterval, 5*time.Minute))
+			ticker := time.NewTicker(min(config.InternalReconcileInterval, 5*time.Minute))
 			defer ticker.Stop()
 			for {
 				select {
@@ -250,20 +248,6 @@ func runPipeline(done chan<- error, run func() error) {
 
 func buildSink(cfg config.Config, checkpoint *state.DB) (api.Sink, error) {
 	return registry.BuildSink(cfg.Sink, registry.Dependencies{Config: cfg, State: checkpoint})
-}
-
-func targetID(cfg config.Config) (string, error) {
-	switch cfg.Sink {
-	case config.SinkFile:
-		if cfg.FilePath == "" {
-			return identity.StdoutTargetID(cfg.ClusterID, cfg.NodeName), nil
-		}
-		return identity.FileTargetID(cfg.FilePath, cfg.ClusterID, cfg.NodeName)
-	case config.SinkOSS:
-		return identity.OSSTargetID(cfg.OSSEndpoint, cfg.OSSBucket, cfg.OSSKeyPrefix, cfg.ClusterID)
-	default:
-		return "", fmt.Errorf("unsupported sink %q", cfg.Sink)
-	}
 }
 
 func waitForSignal() {

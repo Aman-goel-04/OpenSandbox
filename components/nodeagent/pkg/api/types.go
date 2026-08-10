@@ -39,7 +39,6 @@ type Resource struct {
 	NodeName     string `json:"k8s.node.name"`
 	Container    string `json:"k8s.container.name"`
 	LogDirectory string `json:"log_directory,omitempty"`
-	Terminated   bool   `json:"-"`
 }
 
 type Record struct {
@@ -55,13 +54,6 @@ type StreamRef struct {
 }
 
 type AckToken struct {
-	ID        string    `json:"id"`
-	Source    string    `json:"source"`
-	StreamRef StreamRef `json:"stream_ref"`
-	Value     []byte    `json:"value"`
-}
-
-type SourcePositionToken struct {
 	ID        string    `json:"id"`
 	Source    string    `json:"source"`
 	StreamRef StreamRef `json:"stream_ref"`
@@ -112,7 +104,6 @@ type Delivery struct {
 type StreamEnd struct {
 	StreamRef         StreamRef
 	EndToken          EndToken
-	TerminalWatermark *SourcePositionToken
 	Revision          uint64
 	CoverageStartedAt time.Time
 	Resource          Resource
@@ -129,7 +120,6 @@ func (e SourceEvent) Valid() bool {
 }
 
 type Source interface {
-	Name() string
 	Capabilities() Capabilities
 	Start(context.Context, chan<- SourceEvent) error
 	Acknowledge(context.Context, []AckResult) error
@@ -137,23 +127,36 @@ type Source interface {
 	Stop(context.Context) error
 }
 
-// SourceError optionally classifies whether retrying the same Source
-// acknowledgement without changing its token can succeed. Unclassified
-// errors are retryable for backward compatibility with custom Sources.
-type SourceError interface {
+// RetryableError classifies whether retrying an operation with unchanged
+// inputs and configuration can succeed.
+type RetryableError interface {
 	error
 	Retryable() bool
 }
 
-// IsRetryableSourceError reports whether a failed Source operation may be
-// retried. It returns false for nil because there is no failed operation to
-// retry.
-func IsRetryableSourceError(err error) bool {
+// IsRetryableError reports whether a failed operation may be retried.
+// Unclassified errors are conservatively treated as retryable.
+func IsRetryableError(err error) bool {
 	if err == nil {
 		return false
 	}
-	var sourceErr SourceError
-	return !errors.As(err, &sourceErr) || sourceErr.Retryable()
+	var classified RetryableError
+	return !errors.As(err, &classified) || classified.Retryable()
+}
+
+type permanentError struct{ err error }
+
+func (e permanentError) Error() string { return e.err.Error() }
+func (e permanentError) Unwrap() error { return e.err }
+func (permanentError) Retryable() bool { return false }
+
+// Permanent marks err as non-retryable while preserving it for errors.Is and
+// errors.As. A nil error remains nil.
+func Permanent(err error) error {
+	if err == nil {
+		return nil
+	}
+	return permanentError{err: err}
 }
 
 type BatchItem struct {
@@ -178,28 +181,9 @@ type FinalizeRequest struct {
 }
 
 type Sink interface {
-	Name() string
 	Capabilities() Capabilities
 	Guarantee() DeliveryGuarantee
 	Consume(context.Context, Batch) error
 	Finalize(context.Context, FinalizeRequest) error
 	Close(context.Context) error
-}
-
-// SinkError optionally classifies whether retrying the same Sink operation
-// without changing its inputs or configuration can succeed. Unclassified
-// errors are retryable for backward compatibility with custom Sinks.
-type SinkError interface {
-	error
-	Retryable() bool
-}
-
-// IsRetryableSinkError reports whether a failed Sink operation may be retried.
-// It returns false for nil because there is no failed operation to retry.
-func IsRetryableSinkError(err error) bool {
-	if err == nil {
-		return false
-	}
-	var sinkErr SinkError
-	return !errors.As(err, &sinkErr) || sinkErr.Retryable()
 }

@@ -23,7 +23,6 @@ config:
   dropPolicy: block
   sinkTimeout: 30s
   retryMaxInterval: 30s
-  reconcileInterval: 30s
   endedStateRetention: 24h
   serverAddr: :8080
   pprofAddr: ""
@@ -40,7 +39,6 @@ sink:
     endpoint: ""
     bucket: ""
     keyPrefix: logs
-    maxObjectBytes: 1073741824
     existingSecret: ""
     accessKeyIDKey: access-key-id
     accessKeySecretKey: access-key-secret

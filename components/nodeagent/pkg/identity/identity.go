@@ -28,24 +28,31 @@ import (
 )
 
 func OSSTargetID(endpoint, bucket, prefix, clusterID string) (string, error) {
-	u, err := url.Parse(endpoint)
+	normalized, err := CanonicalOSSEndpoint(endpoint)
 	if err != nil {
 		return "", err
-	}
-	if !strings.EqualFold(u.Scheme, "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path != "" && u.Path != "/" {
-		return "", errors.New("OSS endpoint must be an HTTPS origin")
 	}
 	if bucket == "" || strings.Trim(prefix, "/") == "" || clusterID == "" {
 		return "", errors.New("OSS target identity fields are required")
 	}
+	return digest("opensandbox-nodeagent-target-v1\x00", "oss", normalized, bucket, strings.Trim(prefix, "/"), clusterID), nil
+}
+
+func CanonicalOSSEndpoint(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil || !strings.EqualFold(u.Scheme, "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path != "" && u.Path != "/" {
+		return "", errors.New("OSS endpoint must be an HTTPS origin")
+	}
 	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return "", errors.New("OSS endpoint must be an HTTPS origin")
+	}
 	if port := u.Port(); port != "" && port != "443" {
 		host = net.JoinHostPort(host, port)
 	} else if strings.Contains(host, ":") {
 		host = "[" + host + "]"
 	}
-	normalized := "https://" + host
-	return digest("opensandbox-nodeagent-target-v1\x00", "oss", normalized, bucket, strings.Trim(prefix, "/"), clusterID), nil
+	return "https://" + host, nil
 }
 
 func FileTargetID(root, clusterID, nodeName string) (string, error) {

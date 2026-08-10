@@ -31,7 +31,10 @@ import (
 	"unicode/utf8"
 
 	"github.com/alibaba/opensandbox/nodeagent/pkg/api"
+	"github.com/alibaba/opensandbox/nodeagent/pkg/config"
+	"github.com/alibaba/opensandbox/nodeagent/pkg/identity"
 	"github.com/alibaba/opensandbox/nodeagent/pkg/marker"
+	"github.com/alibaba/opensandbox/nodeagent/pkg/objectlayout"
 	"github.com/alibaba/opensandbox/nodeagent/pkg/registry"
 	lineformat "github.com/alibaba/opensandbox/nodeagent/pkg/sink"
 	"github.com/alibaba/opensandbox/nodeagent/pkg/state"
@@ -42,6 +45,7 @@ const (
 	name                 = "oss"
 	streamLockCount      = 64
 	maxOSSObjectKeyBytes = 1023
+	maxObjectBytes       = int64(1 << 30)
 	ossObjectTypeHeader  = "X-Oss-Object-Type"
 	ossSealedTimeHeader  = "X-Oss-Sealed-Time"
 	appendableObjectType = "Appendable"
@@ -50,9 +54,11 @@ const (
 var errObjectNotFound = errors.New("OSS object not found")
 
 func init() {
-	registry.RegisterSink(name, func(dependencies registry.Dependencies) (api.Sink, error) {
+	registry.RegisterSink(name, func(cfg config.Config) (string, error) {
+		return identity.OSSTargetID(cfg.OSSEndpoint, cfg.OSSBucket, cfg.OSSKeyPrefix, cfg.ClusterID)
+	}, func(dependencies registry.Dependencies) (api.Sink, error) {
 		cfg := dependencies.Config
-		return New(Config{Endpoint: cfg.OSSEndpoint, Bucket: cfg.OSSBucket, Prefix: cfg.OSSKeyPrefix, ClusterID: cfg.ClusterID, AccessKeyID: cfg.OSSAccessKeyID, AccessKeySecret: cfg.OSSAccessKeySecret, SessionToken: cfg.OSSSessionToken, WriterID: dependencies.State.WriterID(), TargetID: dependencies.State.TargetID(), MaxObjectBytes: cfg.FileMaxBytes, Timeout: cfg.SinkTimeout}, dependencies.State)
+		return New(Config{Endpoint: cfg.OSSEndpoint, Bucket: cfg.OSSBucket, Prefix: cfg.OSSKeyPrefix, ClusterID: cfg.ClusterID, AccessKeyID: cfg.OSSAccessKeyID, AccessKeySecret: cfg.OSSAccessKeySecret, SessionToken: cfg.OSSSessionToken, WriterID: dependencies.State.WriterID(), TargetID: dependencies.State.TargetID(), MaxObjectBytes: maxObjectBytes, Timeout: cfg.SinkTimeout}, dependencies.State)
 	})
 }
 
@@ -85,15 +91,6 @@ type Sink struct {
 	streams     map[string]state.SinkStream
 	resources   map[string]api.Resource
 }
-
-type permanentSinkError struct {
-	err error
-}
-
-func (e permanentSinkError) Error() string { return e.err.Error() }
-func (e permanentSinkError) Unwrap() error { return e.err }
-func (permanentSinkError) Retryable() bool { return false }
-func permanent(err error) error            { return permanentSinkError{err: err} }
 
 type objectMetadata struct {
 	Size               int64
@@ -149,7 +146,6 @@ func newWithBackend(cfg Config, store stateStore, storage backend) *Sink {
 	return &Sink{cfg: cfg, backend: storage, state: store, streams: make(map[string]state.SinkStream), resources: make(map[string]api.Resource)}
 }
 
-func (s *Sink) Name() string { return name }
 func (s *Sink) Capabilities() api.Capabilities {
 	return api.Capabilities{RecordKinds: []api.RecordKind{api.RecordKindContainerLog}}
 }
@@ -166,11 +162,11 @@ func (b *realBackend) Preflight(ctx context.Context, managed string) error {
 		return fmt.Errorf("read OSS bucket versioning: %w", err)
 	}
 	if versioning.Status != "" {
-		return permanent(fmt.Errorf("OSS bucket versioning must be disabled, got %q", versioning.Status))
+		return api.Permanent(fmt.Errorf("OSS bucket versioning must be disabled, got %q", versioning.Status))
 	}
 	if worm, err := b.client.GetBucketWorm(b.bucketName, aliyunoss.WithContext(ctx)); err == nil {
 		if worm.WormId != "" || worm.State != "" {
-			return permanent(errors.New("OSS bucket WORM must not be configured"))
+			return api.Permanent(errors.New("OSS bucket WORM must not be configured"))
 		}
 	} else if !serviceCode(err, "NoSuchWORMConfiguration") && !serviceCode(err, "WormConfigurationNotFoundError") {
 		return fmt.Errorf("read OSS bucket WORM: %w", err)
@@ -185,7 +181,7 @@ func (b *realBackend) Preflight(ctx context.Context, managed string) error {
 	for _, rule := range lifecycle.Rules {
 		prefix := strings.Trim(rule.Prefix, "/")
 		if prefix == "" || strings.HasPrefix(managed, prefix+"/") || strings.HasPrefix(prefix+"/", managed) {
-			return permanent(fmt.Errorf("OSS lifecycle prefix %q overlaps managed prefix %q", rule.Prefix, managed))
+			return api.Permanent(fmt.Errorf("OSS lifecycle prefix %q overlaps managed prefix %q", rule.Prefix, managed))
 		}
 	}
 	return nil
@@ -210,7 +206,7 @@ func (b *realBackend) Head(ctx context.Context, key string) (objectMetadata, err
 func parseObjectMetadata(header http.Header) (objectMetadata, error) {
 	size, err := strconv.ParseInt(header.Get("Content-Length"), 10, 64)
 	if err != nil || size < 0 {
-		return objectMetadata{}, permanent(fmt.Errorf("invalid OSS Content-Length header %q", header.Get("Content-Length")))
+		return objectMetadata{}, api.Permanent(fmt.Errorf("invalid OSS Content-Length header %q", header.Get("Content-Length")))
 	}
 	metadata := make(map[string]string)
 	for _, key := range []string{"nodeagent-writer-id", "nodeagent-target-id", "nodeagent-stream-ref", "nodeagent-generation", "sandbox-id", "k8s-cluster-name", "k8s-namespace-name", "k8s-pod-name", "k8s-pod-uid", "k8s-container-name", "k8s-node-name", "log-directory"} {
@@ -220,7 +216,7 @@ func parseObjectMetadata(header http.Header) (objectMetadata, error) {
 	if raw := header.Get(aliyunoss.HTTPHeaderOssNextAppendPosition); raw != "" {
 		next, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil || next < 0 {
-			return objectMetadata{}, permanent(fmt.Errorf("invalid OSS next append position header %q", raw))
+			return objectMetadata{}, api.Permanent(fmt.Errorf("invalid OSS next append position header %q", raw))
 		}
 		nextAppendPosition = &next
 	}
@@ -253,13 +249,13 @@ func (s *Sink) Consume(ctx context.Context, batch api.Batch) error {
 	}
 	resource := batch.Items[0].Record.Resource
 	for _, item := range batch.Items[1:] {
-		if !sameResourceIdentity(resource, item.Record.Resource) {
-			return permanent(errors.New("OSS batch contains inconsistent resource identities"))
+		if !lineformat.SameResourceIdentity(resource, item.Record.Resource) {
+			return api.Permanent(errors.New("OSS batch contains inconsistent resource identities"))
 		}
 	}
 	data := lineformat.EncodeBatch(batch)
 	if int64(len(data)) > s.cfg.MaxObjectBytes {
-		return permanent(fmt.Errorf("encoded batch size %d exceeds per-generation limit %d", len(data), s.cfg.MaxObjectBytes))
+		return api.Permanent(fmt.Errorf("encoded batch size %d exceeds per-generation limit %d", len(data), s.cfg.MaxObjectBytes))
 	}
 	streamLock := s.streamLock(batch.StreamRef.ID)
 	streamLock.Lock()
@@ -295,7 +291,7 @@ func (s *Sink) Consume(ctx context.Context, batch api.Batch) error {
 	digest := sha256.Sum256(data)
 	intent := state.AppendIntent{Position: stream.Position, Length: int64(len(data)), SHA256: hex.EncodeToString(digest[:])}
 	if stream.AppendIntent != nil && *stream.AppendIntent != intent {
-		return permanent(errors.New("OSS append retry does not match persisted intent"))
+		return api.Permanent(errors.New("OSS append retry does not match persisted intent"))
 	}
 	stream.AppendIntent = &intent
 	if err := s.state.PutSinkStream(name, stream); err != nil {
@@ -319,7 +315,7 @@ func (s *Sink) Consume(ctx context.Context, batch api.Batch) error {
 			"log-directory":        resource.LogDirectory,
 		}
 		if metadataBytes(metadata) > 8<<10 {
-			return permanent(errors.New("OSS object metadata exceeds 8 KiB"))
+			return api.Permanent(errors.New("OSS object metadata exceeds 8 KiB"))
 		}
 	}
 	next, appendErr := s.backend.Append(ctx, stream.ObjectKey, data, stream.Position, metadata)
@@ -359,7 +355,7 @@ func (s *Sink) recoverAppendResult(ctx context.Context, streamRef string, resour
 			return 0, fmt.Errorf("OSS append returned next position %d while the object remained at %d", next, stream.Position)
 		default:
 			s.deleteCachedStream(streamRef)
-			return 0, permanent(fmt.Errorf("OSS append position conflict: remote position %d, committed position %d, expected position %d", metadata.Size, stream.Position, expected))
+			return 0, api.Permanent(fmt.Errorf("OSS append position conflict: remote position %d, committed position %d, expected position %d", metadata.Size, stream.Position, expected))
 		}
 	}
 	if err := ctx.Err(); err != nil {
@@ -408,11 +404,11 @@ func (s *Sink) Finalize(ctx context.Context, request api.FinalizeRequest) error 
 		return err
 	}
 	if request.Revision < stream.FinalizedRevision || request.Revision > stream.FinalizedRevision+1 {
-		return permanent(fmt.Errorf("OSS marker revision %d is not continuous after %d", request.Revision, stream.FinalizedRevision))
+		return api.Permanent(fmt.Errorf("OSS marker revision %d is not continuous after %d", request.Revision, stream.FinalizedRevision))
 	}
 	raw, err := marker.Encode(marker.New(request, stream.ClosedObjects))
 	if err != nil {
-		return permanent(err)
+		return api.Permanent(err)
 	}
 	err = classifyOSSError(s.backend.PutMarker(ctx, key, raw))
 	if err == nil {
@@ -429,7 +425,7 @@ func (s *Sink) Finalize(ctx context.Context, request api.FinalizeRequest) error 
 		return errors.Join(err, getErr)
 	}
 	if !bytes.Equal(existing, raw) {
-		return permanent(errors.New("conflicting OSS finalization marker"))
+		return api.Permanent(errors.New("conflicting OSS finalization marker"))
 	}
 	stream.FinalizedRevision = request.Revision
 	if err := s.state.PutSinkStream(name, stream); err != nil {
@@ -443,8 +439,8 @@ func (s *Sink) Close(context.Context) error { return nil }
 
 func (s *Sink) getStream(ctx context.Context, streamRef api.StreamRef, resource api.Resource) (state.SinkStream, error) {
 	if current, cachedResource, ok := s.cachedStream(streamRef.ID); ok {
-		if !sameResourceIdentity(cachedResource, resource) {
-			return state.SinkStream{}, permanent(errors.New("OSS stream resource identity changed"))
+		if !lineformat.SameResourceIdentity(cachedResource, resource) {
+			return state.SinkStream{}, api.Permanent(errors.New("OSS stream resource identity changed"))
 		}
 		return current, nil
 	}
@@ -458,7 +454,7 @@ func (s *Sink) getStream(ctx context.Context, streamRef api.StreamRef, resource 
 			return state.SinkStream{}, err
 		}
 		if _, err := s.backend.Head(ctx, stream.ObjectKey); err == nil {
-			return state.SinkStream{}, permanent(errors.New("refusing to adopt existing OSS object without state"))
+			return state.SinkStream{}, api.Permanent(errors.New("refusing to adopt existing OSS object without state"))
 		} else if !isNotFound(err) {
 			return state.SinkStream{}, classifyOSSError(err)
 		}
@@ -475,7 +471,7 @@ func (s *Sink) getStream(ctx context.Context, streamRef api.StreamRef, resource 
 				size = 0
 			} else if err != nil {
 				if isNotFound(err) {
-					return state.SinkStream{}, permanent(fmt.Errorf("OSS append target %q is missing for persisted position %d: %w", stream.ObjectKey, stream.AppendIntent.Position, err))
+					return state.SinkStream{}, api.Permanent(fmt.Errorf("OSS append target %q is missing for persisted position %d: %w", stream.ObjectKey, stream.AppendIntent.Position, err))
 				}
 				return state.SinkStream{}, err
 			}
@@ -488,7 +484,7 @@ func (s *Sink) getStream(ctx context.Context, streamRef api.StreamRef, resource 
 				stream.Position = size
 				stream.AppendIntent = nil
 			default:
-				return state.SinkStream{}, permanent(fmt.Errorf("OSS append intent position conflict: %d", size))
+				return state.SinkStream{}, api.Permanent(fmt.Errorf("OSS append intent position conflict: %d", size))
 			}
 		}
 		if err := s.verifyMetadata(ctx, stream, streamRef, resource); err != nil {
@@ -512,11 +508,11 @@ func (s *Sink) closeGeneration(ctx context.Context, resource api.Resource, strea
 	}
 	size := metadata.Size
 	if size != stream.Position {
-		return permanent(fmt.Errorf("OSS object size %d does not match position %d", size, stream.Position))
+		return api.Permanent(fmt.Errorf("OSS object size %d does not match position %d", size, stream.Position))
 	}
 	crc := metadata.CRC64
 	if crc == "" {
-		return permanent(errors.New("OSS object CRC64 header missing"))
+		return api.Permanent(errors.New("OSS object CRC64 header missing"))
 	}
 	object := state.ClosedObject{Key: stream.ObjectKey, Generation: stream.Generation, Size: size, CRC64: crc}
 	if len(stream.ClosedObjects) == 0 || stream.ClosedObjects[len(stream.ClosedObjects)-1].Generation != object.Generation {
@@ -542,7 +538,7 @@ func (s *Sink) verifyMetadata(ctx context.Context, stream state.SinkStream, stre
 		return err
 	}
 	if metadata.Size != stream.Position {
-		return permanent(errors.New("OSS object position does not match local state"))
+		return api.Permanent(errors.New("OSS object position does not match local state"))
 	}
 	return nil
 }
@@ -561,14 +557,14 @@ func (s *Sink) verifyClosedObjects(ctx context.Context, streamRef api.StreamRef,
 			return err
 		}
 		if object.Generation != uint64(index) || object.Key != objectKey(s.cfg.Prefix, resource, object.Generation) {
-			return permanent(fmt.Errorf("OSS closed generation %d has an invalid object layout", object.Generation))
+			return api.Permanent(fmt.Errorf("OSS closed generation %d has an invalid object layout", object.Generation))
 		}
 		metadata, err := s.backend.Head(ctx, object.Key)
 		if err != nil {
 			return existingObjectError("verify closed generation", object.Key, err)
 		}
 		if metadata.Size != object.Size || metadata.CRC64 != object.CRC64 {
-			return permanent(fmt.Errorf("OSS object %s changed after logical close", object.Key))
+			return api.Permanent(fmt.Errorf("OSS object %s changed after logical close", object.Key))
 		}
 		stream := state.SinkStream{SinkName: name, StreamRef: streamRef.ID, Generation: object.Generation}
 		if err := s.validateObjectIdentity(metadata, stream, streamRef, resource); err != nil {
@@ -591,15 +587,13 @@ func appendExceedsObjectLimit(position, appendBytes, limit int64) bool {
 }
 
 func objectKey(prefix string, resource api.Resource, generation uint64) string {
-	name := resource.Container + ".log"
-	if generation > 0 {
-		name = resource.Container + "." + strconv.FormatUint(generation, 10) + ".log"
-	}
-	return path.Join(prefix, resource.ClusterName, resource.Namespace, resource.SandboxID, resource.PodUID, name)
+	family := objectlayout.FamilyPrefix(prefix, resource.ClusterName, resource.Namespace, resource.SandboxID, resource.PodUID)
+	return objectlayout.DataKey(family, resource.Container, generation)
 }
 
 func markerKey(prefix string, resource api.Resource, revision uint64) string {
-	return path.Join(prefix, resource.ClusterName, resource.Namespace, resource.SandboxID, resource.PodUID, fmt.Sprintf("%s.finalized.%d.json", resource.Container, revision))
+	family := objectlayout.FamilyPrefix(prefix, resource.ClusterName, resource.Namespace, resource.SandboxID, resource.PodUID)
+	return objectlayout.MarkerKey(family, resource.Container, revision)
 }
 
 func serviceCode(err error, code string) bool {
@@ -632,11 +626,11 @@ func (s *Sink) streamLock(streamRef string) *sync.Mutex {
 
 func (s *Sink) validateResource(resource api.Resource) error {
 	if resource.ClusterName != s.cfg.ClusterID {
-		return permanent(fmt.Errorf("resource cluster %q does not match configured cluster %q", resource.ClusterName, s.cfg.ClusterID))
+		return api.Permanent(fmt.Errorf("resource cluster %q does not match configured cluster %q", resource.ClusterName, s.cfg.ClusterID))
 	}
 	for _, segment := range []string{resource.ClusterName, resource.Namespace, resource.SandboxID, resource.PodUID, resource.Container} {
 		if segment == "" || segment == "." || segment == ".." || strings.ContainsAny(segment, `/\\`) {
-			return permanent(fmt.Errorf("unsafe OSS object-key segment %q", segment))
+			return api.Permanent(fmt.Errorf("unsafe OSS object-key segment %q", segment))
 		}
 	}
 	for _, field := range []struct{ name, value string }{
@@ -651,11 +645,11 @@ func (s *Sink) validateResource(resource api.Resource) error {
 	} {
 		name, value := field.name, field.value
 		if value == "" {
-			return permanent(fmt.Errorf("OSS metadata resource field %s is empty", name))
+			return api.Permanent(fmt.Errorf("OSS metadata resource field %s is empty", name))
 		}
 		for i := 0; i < len(value); i++ {
 			if value[i] < 0x20 || value[i] > 0x7e {
-				return permanent(fmt.Errorf("OSS metadata resource field %s contains a non-visible-ASCII byte", name))
+				return api.Permanent(fmt.Errorf("OSS metadata resource field %s contains a non-visible-ASCII byte", name))
 			}
 		}
 	}
@@ -672,19 +666,19 @@ func (s *Sink) validateResource(resource api.Resource) error {
 
 func (s *Sink) validateStreamLayout(stream state.SinkStream, streamRef api.StreamRef, resource api.Resource) error {
 	if stream.StreamRef != streamRef.ID {
-		return permanent(fmt.Errorf("OSS checkpoint stream %q does not match requested stream %q", stream.StreamRef, streamRef.ID))
+		return api.Permanent(fmt.Errorf("OSS checkpoint stream %q does not match requested stream %q", stream.StreamRef, streamRef.ID))
 	}
 	if stream.Position < 0 {
-		return permanent(fmt.Errorf("OSS checkpoint position %d is negative", stream.Position))
+		return api.Permanent(fmt.Errorf("OSS checkpoint position %d is negative", stream.Position))
 	}
 	if stream.Device != 0 || stream.Inode != 0 || len(stream.CRC64State) != 0 || stream.GenerationTransition != nil || stream.MarkerIntent != nil || stream.CleanupPhase != "" || stream.CleanupPath != "" {
-		return permanent(errors.New("OSS checkpoint contains file-sink-only state"))
+		return api.Permanent(errors.New("OSS checkpoint contains file-sink-only state"))
 	}
 	if stream.AppendIntent != nil {
 		intent := stream.AppendIntent
 		digest, err := hex.DecodeString(intent.SHA256)
 		if intent.Position != stream.Position || intent.Length <= 0 || intent.Position > (1<<63-1)-intent.Length || len(digest) != sha256.Size || err != nil || hex.EncodeToString(digest) != intent.SHA256 {
-			return permanent(errors.New("OSS checkpoint has an invalid append intent"))
+			return api.Permanent(errors.New("OSS checkpoint has an invalid append intent"))
 		}
 	}
 	expected := objectKey(s.cfg.Prefix, resource, stream.Generation)
@@ -693,30 +687,30 @@ func (s *Sink) validateStreamLayout(stream state.SinkStream, streamRef api.Strea
 	}
 	unset := stream.ObjectKey == "" && stream.Position == 0 && stream.AppendIntent == nil && len(stream.ClosedObjects) == 0
 	if !unset && stream.ObjectKey != expected {
-		return permanent(fmt.Errorf("OSS checkpoint object key %q does not match generation %d", stream.ObjectKey, stream.Generation))
+		return api.Permanent(fmt.Errorf("OSS checkpoint object key %q does not match generation %d", stream.ObjectKey, stream.Generation))
 	}
 	expectedClosed := stream.Generation
 	if stream.CurrentClosed {
 		if expectedClosed == ^uint64(0) {
-			return permanent(errors.New("OSS checkpoint generation overflows closed-object count"))
+			return api.Permanent(errors.New("OSS checkpoint generation overflows closed-object count"))
 		}
 		expectedClosed++
 	}
 	if uint64(len(stream.ClosedObjects)) != expectedClosed {
-		return permanent(fmt.Errorf("OSS checkpoint has %d closed objects for generation %d (closed=%t)", len(stream.ClosedObjects), stream.Generation, stream.CurrentClosed))
+		return api.Permanent(fmt.Errorf("OSS checkpoint has %d closed objects for generation %d (closed=%t)", len(stream.ClosedObjects), stream.Generation, stream.CurrentClosed))
 	}
 	if stream.CurrentClosed && stream.AppendIntent != nil {
-		return permanent(errors.New("closed OSS generation has an unresolved append intent"))
+		return api.Permanent(errors.New("closed OSS generation has an unresolved append intent"))
 	}
 	for index, object := range stream.ClosedObjects {
 		if object.Generation != uint64(index) || object.Key != objectKey(s.cfg.Prefix, resource, object.Generation) {
-			return permanent(fmt.Errorf("OSS checkpoint closed generation %d has an invalid object layout", object.Generation))
+			return api.Permanent(fmt.Errorf("OSS checkpoint closed generation %d has an invalid object layout", object.Generation))
 		}
 	}
 	if stream.CurrentClosed {
 		current := stream.ClosedObjects[len(stream.ClosedObjects)-1]
 		if current.Key != stream.ObjectKey || current.Size != stream.Position {
-			return permanent(errors.New("closed OSS checkpoint does not match the current generation"))
+			return api.Permanent(errors.New("closed OSS checkpoint does not match the current generation"))
 		}
 	}
 	return nil
@@ -725,23 +719,23 @@ func (s *Sink) validateStreamLayout(stream state.SinkStream, streamRef api.Strea
 func existingObjectError(operation, key string, err error) error {
 	err = classifyOSSError(err)
 	if isNotFound(err) {
-		return permanent(fmt.Errorf("%s: OSS object %q is missing: %w", operation, key, err))
+		return api.Permanent(fmt.Errorf("%s: OSS object %q is missing: %w", operation, key, err))
 	}
 	return err
 }
 
 func (s *Sink) validateObjectIdentity(metadata objectMetadata, stream state.SinkStream, streamRef api.StreamRef, resource api.Resource) error {
 	if metadata.ObjectType != appendableObjectType {
-		return permanent(fmt.Errorf("OSS object type %q is not Appendable", metadata.ObjectType))
+		return api.Permanent(fmt.Errorf("OSS object type %q is not Appendable", metadata.ObjectType))
 	}
 	if metadata.SealedTime != "" {
-		return permanent(errors.New("OSS appendable object is sealed"))
+		return api.Permanent(errors.New("OSS appendable object is sealed"))
 	}
 	if metadata.NextAppendPosition == nil {
-		return permanent(errors.New("OSS appendable object is missing its next append position"))
+		return api.Permanent(errors.New("OSS appendable object is missing its next append position"))
 	}
 	if *metadata.NextAppendPosition != metadata.Size {
-		return permanent(fmt.Errorf("OSS next append position %d does not match object size %d", *metadata.NextAppendPosition, metadata.Size))
+		return api.Permanent(fmt.Errorf("OSS next append position %d does not match object size %d", *metadata.NextAppendPosition, metadata.Size))
 	}
 	expected := map[string]string{
 		"nodeagent-writer-id":  s.cfg.WriterID,
@@ -759,16 +753,10 @@ func (s *Sink) validateObjectIdentity(metadata objectMetadata, stream state.Sink
 	}
 	for key, value := range expected {
 		if metadata.Metadata[key] != value {
-			return permanent(fmt.Errorf("OSS object metadata %s does not match stream identity", key))
+			return api.Permanent(fmt.Errorf("OSS object metadata %s does not match stream identity", key))
 		}
 	}
 	return nil
-}
-
-func sameResourceIdentity(left, right api.Resource) bool {
-	return left.SandboxID == right.SandboxID && left.ClusterName == right.ClusterName &&
-		left.Namespace == right.Namespace && left.PodName == right.PodName && left.PodUID == right.PodUID &&
-		left.NodeName == right.NodeName && left.Container == right.Container && left.LogDirectory == right.LogDirectory
 }
 
 func (s *Sink) cachedStream(streamRef string) (state.SinkStream, api.Resource, bool) {
@@ -794,13 +782,13 @@ func (s *Sink) deleteCachedStream(streamRef string) {
 
 func validateOSSObjectKey(key string) error {
 	if !utf8.ValidString(key) {
-		return permanent(errors.New("OSS object key must be valid UTF-8"))
+		return api.Permanent(errors.New("OSS object key must be valid UTF-8"))
 	}
 	if strings.HasPrefix(key, "/") || strings.HasPrefix(key, `\`) {
-		return permanent(errors.New("OSS object key must not start with a slash or backslash"))
+		return api.Permanent(errors.New("OSS object key must not start with a slash or backslash"))
 	}
 	if len(key) == 0 || len(key) > maxOSSObjectKeyBytes {
-		return permanent(fmt.Errorf("OSS object key must contain 1 to %d UTF-8 bytes, got %d", maxOSSObjectKeyBytes, len(key)))
+		return api.Permanent(fmt.Errorf("OSS object key must contain 1 to %d UTF-8 bytes, got %d", maxOSSObjectKeyBytes, len(key)))
 	}
 	return nil
 }
@@ -831,7 +819,7 @@ func classifyOSSError(err error) error {
 			"ObjectNotAppendable",
 			"SecurityTokenExpired",
 			"SignatureDoesNotMatch":
-			return permanent(err)
+			return api.Permanent(err)
 		}
 	}
 	return err

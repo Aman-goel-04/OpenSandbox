@@ -48,16 +48,16 @@ func TestStructuralFileErrorsAreNonRetryable(t *testing.T) {
 			if file != nil {
 				_ = file.Close()
 			}
-			if err == nil || api.IsRetryableSinkError(err) || !strings.Contains(err.Error(), test.path) {
-				t.Fatalf("error=%v retryable=%v, want permanent error containing %q", err, api.IsRetryableSinkError(err), test.path)
+			if err == nil || api.IsRetryableError(err) || !strings.Contains(err.Error(), test.path) {
+				t.Fatalf("error=%v retryable=%v, want permanent error containing %q", err, api.IsRetryableError(err), test.path)
 			}
 		})
 	}
 
 	for _, errno := range []error{unix.EACCES, unix.EPERM, unix.EROFS, unix.ENOTDIR, unix.EINVAL} {
 		err := classifyPathError("open", regular, errno)
-		if api.IsRetryableSinkError(err) || !errors.Is(err, errno) {
-			t.Fatalf("error=%v retryable=%v, want permanent wrapped %v", err, api.IsRetryableSinkError(err), errno)
+		if api.IsRetryableError(err) || !errors.Is(err, errno) {
+			t.Fatalf("error=%v retryable=%v, want permanent wrapped %v", err, api.IsRetryableError(err), errno)
 		}
 	}
 }
@@ -77,8 +77,8 @@ func TestCreateNoFollowExclusiveRejectsExistingSymlink(t *testing.T) {
 	if file != nil {
 		_ = file.Close()
 	}
-	if err == nil || api.IsRetryableSinkError(err) {
-		t.Fatalf("exclusive marker creation error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+	if err == nil || api.IsRetryableError(err) {
+		t.Fatalf("exclusive marker creation error=%v retryable=%v", err, api.IsRetryableError(err))
 	}
 	raw, readErr := os.ReadFile(target)
 	if readErr != nil {
@@ -134,8 +134,8 @@ func TestRenameNoReplaceRejectsSymlinkedParent(t *testing.T) {
 	}
 
 	err := renameNoReplace(source, filepath.Join(symlinkedParent, "marker.json"))
-	if err == nil || api.IsRetryableSinkError(err) {
-		t.Fatalf("rename error=%v retryable=%v, want permanent error", err, api.IsRetryableSinkError(err))
+	if err == nil || api.IsRetryableError(err) {
+		t.Fatalf("rename error=%v retryable=%v, want permanent error", err, api.IsRetryableError(err))
 	}
 	if _, err := os.Stat(source); err != nil {
 		t.Fatalf("source changed after rejected rename: %v", err)
@@ -162,8 +162,8 @@ func TestRenameNoReplaceRejectsSymlinkedSourceParent(t *testing.T) {
 	target := filepath.Join(root, "marker.json")
 
 	err := renameNoReplace(filepath.Join(symlinkedParent, "marker.tmp"), target)
-	if err == nil || api.IsRetryableSinkError(err) {
-		t.Fatalf("rename error=%v retryable=%v, want permanent error", err, api.IsRetryableSinkError(err))
+	if err == nil || api.IsRetryableError(err) {
+		t.Fatalf("rename error=%v retryable=%v, want permanent error", err, api.IsRetryableError(err))
 	}
 	if _, err := os.Stat(source); err != nil {
 		t.Fatalf("source changed after rejected rename: %v", err)
@@ -186,8 +186,8 @@ func TestSyncDirRejectsSymlinkedParent(t *testing.T) {
 	}
 
 	err := syncDir(filepath.Join(symlinkedParent, "data"))
-	if err == nil || api.IsRetryableSinkError(err) {
-		t.Fatalf("sync error=%v retryable=%v, want permanent error", err, api.IsRetryableSinkError(err))
+	if err == nil || api.IsRetryableError(err) {
+		t.Fatalf("sync error=%v retryable=%v, want permanent error", err, api.IsRetryableError(err))
 	}
 }
 
@@ -199,7 +199,7 @@ func TestFamilyDirRejectsUnsafeContainer(t *testing.T) {
 		PodUID:      "pod",
 		Container:   "../../escape",
 	})
-	if err == nil || api.IsRetryableSinkError(err) {
-		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+	if err == nil || api.IsRetryableError(err) {
+		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableError(err))
 	}
 }

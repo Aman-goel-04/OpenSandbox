@@ -47,16 +47,16 @@ func TestPartialAssemblerSeparatesContainerRestarts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if record := assembler.consume(partialZero, sourceSpan{FileID: "zero-rotated", Path: "0.log.20260723", EndOffset: 10}, now); record != nil {
+	if record := assembler.consume(partialZero, sourceSpan{FileID: "zero-rotated", Path: "0.log.20260723", EndOffset: 10, restart: "0"}, now); record != nil {
 		t.Fatalf("restart zero partial emitted early: %+v", record)
 	}
-	if record := assembler.consume(partialOne, sourceSpan{FileID: "one", Path: "1.log", EndOffset: 10}, now); record != nil {
+	if record := assembler.consume(partialOne, sourceSpan{FileID: "one", Path: "1.log", EndOffset: 10, restart: "1"}, now); record != nil {
 		t.Fatalf("restart one partial emitted early: %+v", record)
 	}
-	if got := assembler.consume(final, sourceSpan{FileID: "one", Path: "1.log", StartOffset: 10, EndOffset: 20}, now); got == nil || string(got.body) != "one-done" {
+	if got := assembler.consume(final, sourceSpan{FileID: "one", Path: "1.log", StartOffset: 10, EndOffset: 20, restart: "1"}, now); got == nil || string(got.body) != "one-done" {
 		t.Fatalf("restart one record=%+v", got)
 	}
-	if got := assembler.consume(final, sourceSpan{FileID: "zero-base", Path: "0.log", StartOffset: 10, EndOffset: 20}, now); got == nil || string(got.body) != "zero-done" {
+	if got := assembler.consume(final, sourceSpan{FileID: "zero-base", Path: "0.log", StartOffset: 10, EndOffset: 20, restart: "0"}, now); got == nil || string(got.body) != "zero-done" {
 		t.Fatalf("restart zero record=%+v", got)
 	}
 }
@@ -123,7 +123,7 @@ func TestContinuationMarkersAreBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	for restart := 0; restart < maxContinuationMarkers+32; restart++ {
-		assembler.consume(line, sourceSpan{FileID: fmt.Sprintf("file-%d", restart), Path: fmt.Sprintf("%d.log", restart), EndOffset: 1}, now)
+		assembler.consume(line, sourceSpan{FileID: fmt.Sprintf("file-%d", restart), Path: fmt.Sprintf("%d.log", restart), EndOffset: 1, restart: fmt.Sprintf("%d", restart)}, now)
 	}
 	assembler.expired(now.Add(2 * time.Second))
 	if len(assembler.continuation) != maxContinuationMarkers {
@@ -249,7 +249,7 @@ func TestDiscoverFilesOrdersRotationsBeforeBase(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	got, err := discoverFiles(dir)
+	got, _, err := discoverDirectory(dir)
 	if err != nil {
 		t.Fatal(err)
 	}

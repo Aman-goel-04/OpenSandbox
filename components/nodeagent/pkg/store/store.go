@@ -19,7 +19,6 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
-	"sort"
 	"sync"
 	"time"
 
@@ -40,20 +39,27 @@ const (
 )
 
 type View interface {
-	List() []api.Resource
-	GetByUID(string) (api.Resource, bool)
+	List() []Resource
+	GetByUID(string) (Resource, bool)
+	Forget(string)
 	Changes() <-chan struct{}
+}
+
+// Resource combines the stable identity exposed to the pipeline with the
+// Kubernetes lifecycle state used only by the Store and Sources.
+type Resource struct {
+	api.Resource
+	Terminated bool
 }
 
 type Store struct {
 	nodeName  string
 	clusterID string
 	logRoot   string
-	client    kubernetes.Interface
 	informer  cache.SharedIndexInformer
 
 	mu            sync.RWMutex
-	resources     map[string]api.Resource
+	resources     map[string]Resource
 	changes       chan struct{}
 	watchFailedAt time.Time
 }
@@ -63,8 +69,7 @@ func New(client kubernetes.Interface, nodeName, clusterID, logRoot string) *Stor
 		nodeName:  nodeName,
 		clusterID: clusterID,
 		logRoot:   logRoot,
-		client:    client,
-		resources: make(map[string]api.Resource),
+		resources: make(map[string]Resource),
 		changes:   make(chan struct{}, 1),
 	}
 	selector := fields.OneTermEqualSelector("spec.nodeName", nodeName).String()
@@ -73,7 +78,7 @@ func New(client kubernetes.Interface, nodeName, clusterID, logRoot string) *Stor
 			options.FieldSelector = selector
 			pods, err := client.CoreV1().Pods(metav1.NamespaceAll).List(ctx, options)
 			if err == nil {
-				s.markListSuccessful()
+				s.markWatchSuccessful()
 			} else {
 				s.markWatchFailed()
 			}
@@ -124,28 +129,23 @@ func (s *Store) markWatchFailed() {
 	s.mu.Unlock()
 }
 
-func (s *Store) markListSuccessful() {
-	s.markWatchSuccessful()
-}
-
 func (s *Store) markWatchSuccessful() {
 	s.mu.Lock()
 	s.watchFailedAt = time.Time{}
 	s.mu.Unlock()
 }
 
-func (s *Store) List() []api.Resource {
+func (s *Store) List() []Resource {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]api.Resource, 0, len(s.resources))
+	out := make([]Resource, 0, len(s.resources))
 	for _, resource := range s.resources {
 		out = append(out, resource)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].PodUID < out[j].PodUID })
 	return out
 }
 
-func (s *Store) GetByUID(uid string) (api.Resource, bool) {
+func (s *Store) GetByUID(uid string) (Resource, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	resource, ok := s.resources[uid]
@@ -173,16 +173,18 @@ func (s *Store) upsert(obj any) {
 		return
 	}
 	terminated := pod.DeletionTimestamp != nil || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed
-	resource := api.Resource{
-		SandboxID:    sandboxID,
-		ClusterName:  s.clusterID,
-		Namespace:    pod.Namespace,
-		PodName:      pod.Name,
-		PodUID:       string(pod.UID),
-		NodeName:     pod.Spec.NodeName,
-		Container:    ContainerName,
-		LogDirectory: filepath.Join(s.logRoot, fmt.Sprintf("%s_%s_%s", pod.Namespace, pod.Name, pod.UID), ContainerName),
-		Terminated:   terminated,
+	resource := Resource{
+		Resource: api.Resource{
+			SandboxID:    sandboxID,
+			ClusterName:  s.clusterID,
+			Namespace:    pod.Namespace,
+			PodName:      pod.Name,
+			PodUID:       string(pod.UID),
+			NodeName:     pod.Spec.NodeName,
+			Container:    ContainerName,
+			LogDirectory: filepath.Join(s.logRoot, fmt.Sprintf("%s_%s_%s", pod.Namespace, pod.Name, pod.UID), ContainerName),
+		},
+		Terminated: terminated,
 	}
 	s.mu.Lock()
 	if previous, exists := s.resources[resource.PodUID]; exists && previous.SandboxID != resource.SandboxID {

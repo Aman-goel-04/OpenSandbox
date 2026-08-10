@@ -133,7 +133,6 @@ type SourceStream struct {
 	LatePending          bool               `json:"late_pending,omitempty"`
 	Ended                bool               `json:"ended,omitempty"`
 	RepairDeadline       *time.Time         `json:"repair_deadline,omitempty"`
-	TerminalWatermark    []byte             `json:"terminal_watermark,omitempty"`
 }
 
 type OutcomeSnapshot struct {
@@ -258,7 +257,7 @@ func (d *DB) initialize() error {
 		} else if string(raw) != d.targetID {
 			return fmt.Errorf("state target mismatch: stored %q, configured %q", raw, d.targetID)
 		}
-		if err := rebuildSourceFileIndex(tx); err != nil {
+		if err := validateSourceFileIndex(tx); err != nil {
 			return err
 		}
 		return validateStoredState(tx, d.targetID)
@@ -278,19 +277,6 @@ func (d *DB) GetFileCheckpoint(streamRef, path string) (FileCheckpoint, bool, er
 		err = validateFileCheckpoint(out)
 	}
 	return out, found, err
-}
-
-func (d *DB) PutFileCheckpoint(checkpoint FileCheckpoint) error {
-	if err := validateFileCheckpoint(checkpoint); err != nil {
-		return err
-	}
-	raw, err := json.Marshal(checkpoint)
-	if err != nil {
-		return err
-	}
-	return d.db.Update(func(tx *bolt.Tx) error {
-		return putFileCheckpoint(tx.Bucket(bucketSource), tx.Bucket(bucketSourceFileIndex), checkpoint, raw)
-	})
 }
 
 func (d *DB) ListFileCheckpoints(streamRef string) ([]FileCheckpoint, error) {
@@ -489,7 +475,7 @@ func (d *DB) DeleteStream(streamRef string) error {
 				return nil
 			}
 			sourceKeys = append(sourceKeys, append([]byte(nil), key...))
-			if identity.FileID != "" && identity.Path != "" {
+			if identity.Path != "" {
 				indexKeys = append(indexKeys, sourceFileIndexKey(streamRef, identity.FileID))
 			}
 			return nil
@@ -533,22 +519,10 @@ func (d *DB) DeleteStream(streamRef string) error {
 	})
 }
 
-type checkpointIndexCandidate struct {
-	key        []byte
-	checkpoint FileCheckpoint
-}
-
-func rebuildSourceFileIndex(tx *bolt.Tx) error {
+func validateSourceFileIndex(tx *bolt.Tx) error {
 	source := tx.Bucket(bucketSource)
-	if err := tx.DeleteBucket(bucketSourceFileIndex); err != nil && !errors.Is(err, bolt.ErrBucketNotFound) {
-		return err
-	}
-	index, err := tx.CreateBucket(bucketSourceFileIndex)
-	if err != nil {
-		return err
-	}
-	candidates := make(map[string]checkpointIndexCandidate)
-	var staleKeys [][]byte
+	index := tx.Bucket(bucketSourceFileIndex)
+	expected := make(map[string][]byte)
 	if err := source.ForEach(func(key, raw []byte) error {
 		checkpoint, isCheckpoint, err := decodeFileCheckpoint(raw)
 		if err != nil {
@@ -557,40 +531,31 @@ func rebuildSourceFileIndex(tx *bolt.Tx) error {
 		if !isCheckpoint {
 			return nil
 		}
-		if expected := stateKey(checkpoint.StreamRef, checkpoint.Path); !bytes.Equal(key, expected) {
-			return fmt.Errorf("source checkpoint for stream_ref=%q path=%q is stored under non-canonical key %s (expected %s)", checkpoint.StreamRef, checkpoint.Path, key, expected)
-		}
-		if checkpoint.FileID == "" {
-			return nil
+		if canonicalKey := stateKey(checkpoint.StreamRef, checkpoint.Path); !bytes.Equal(key, canonicalKey) {
+			return fmt.Errorf("source checkpoint for stream_ref=%q path=%q is stored under non-canonical key %s (expected %s)", checkpoint.StreamRef, checkpoint.Path, key, canonicalKey)
 		}
 		indexKey := sourceFileIndexKey(checkpoint.StreamRef, checkpoint.FileID)
-		candidate := checkpointIndexCandidate{key: append([]byte(nil), key...), checkpoint: checkpoint}
-		existing, found := candidates[string(indexKey)]
-		if !found {
-			candidates[string(indexKey)] = candidate
-			return nil
+		if previous, found := expected[string(indexKey)]; found {
+			return fmt.Errorf("source file index %q has duplicate checkpoints %q and %q", indexKey, previous, key)
 		}
-		if preferCheckpoint(candidate.checkpoint, existing.checkpoint) {
-			staleKeys = append(staleKeys, existing.key)
-			candidates[string(indexKey)] = candidate
-		} else {
-			staleKeys = append(staleKeys, candidate.key)
+		expected[string(indexKey)] = append([]byte(nil), key...)
+		if indexedKey := index.Get(indexKey); !bytes.Equal(indexedKey, key) {
+			return fmt.Errorf("source file index for stream_ref=%q file_id=%q does not match checkpoint key %q", checkpoint.StreamRef, checkpoint.FileID, key)
 		}
 		return nil
 	}); err != nil {
 		return err
 	}
-	for _, key := range staleKeys {
-		if err := source.Delete(key); err != nil {
-			return err
+	return index.ForEach(func(indexKey, checkpointKey []byte) error {
+		expectedKey, found := expected[string(indexKey)]
+		if !found {
+			return fmt.Errorf("source file index %q has no checkpoint", indexKey)
 		}
-	}
-	for rawIndexKey, candidate := range candidates {
-		if err := index.Put([]byte(rawIndexKey), candidate.key); err != nil {
-			return err
+		if !bytes.Equal(checkpointKey, expectedKey) {
+			return fmt.Errorf("source file index %q points to %q, expected %q", indexKey, checkpointKey, expectedKey)
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 func putFileCheckpoint(source, index *bolt.Bucket, checkpoint FileCheckpoint, raw []byte) error {
@@ -608,32 +573,30 @@ func putFileCheckpoint(source, index *bolt.Bucket, checkpoint FileCheckpoint, ra
 		existingAtPath = existing
 		hasExistingAtPath = true
 	}
-	if checkpoint.FileID != "" {
-		indexKey := sourceFileIndexKey(checkpoint.StreamRef, checkpoint.FileID)
-		indexedKey := index.Get(indexKey)
-		if indexedKey != nil {
-			indexed, err := indexedFileCheckpoint(source, indexedKey, checkpoint.StreamRef, checkpoint.FileID)
-			if err != nil {
-				return err
-			}
-			if bytes.Equal(indexedKey, checkpointKey) {
-				if checkpointCursorRegresses(checkpoint, indexed) {
-					return checkpointSupersededError(checkpoint, indexed)
-				}
-			} else {
-				if !preferCheckpoint(checkpoint, indexed) {
-					return checkpointSupersededError(checkpoint, indexed)
-				}
-				if err := source.Delete(indexedKey); err != nil {
-					return err
-				}
-			}
-		}
-		if err := index.Put(indexKey, checkpointKey); err != nil {
+	indexKey := sourceFileIndexKey(checkpoint.StreamRef, checkpoint.FileID)
+	indexedKey := index.Get(indexKey)
+	if indexedKey != nil {
+		indexed, err := indexedFileCheckpoint(source, indexedKey, checkpoint.StreamRef, checkpoint.FileID)
+		if err != nil {
 			return err
 		}
+		if bytes.Equal(indexedKey, checkpointKey) {
+			if checkpointCursorRegresses(checkpoint, indexed) {
+				return checkpointSupersededError(checkpoint, indexed)
+			}
+		} else {
+			if !preferCheckpoint(checkpoint, indexed) {
+				return checkpointSupersededError(checkpoint, indexed)
+			}
+			if err := source.Delete(indexedKey); err != nil {
+				return err
+			}
+		}
 	}
-	if hasExistingAtPath && existingAtPath.FileID != "" && existingAtPath.FileID != checkpoint.FileID {
+	if err := index.Put(indexKey, checkpointKey); err != nil {
+		return err
+	}
+	if hasExistingAtPath && existingAtPath.FileID != checkpoint.FileID {
 		oldIndexKey := sourceFileIndexKey(existingAtPath.StreamRef, existingAtPath.FileID)
 		if bytes.Equal(index.Get(oldIndexKey), checkpointKey) {
 			if err := index.Delete(oldIndexKey); err != nil {
@@ -663,10 +626,6 @@ func normalizeFileCheckpoints(checkpoints []FileCheckpoint) []FileCheckpoint {
 	normalized := make([]FileCheckpoint, 0, len(checkpoints))
 	byFileID := make(map[string]int)
 	for _, checkpoint := range checkpoints {
-		if checkpoint.FileID == "" {
-			normalized = append(normalized, checkpoint)
-			continue
-		}
 		key := string(sourceFileIndexKey(checkpoint.StreamRef, checkpoint.FileID))
 		index, found := byFileID[key]
 		if !found {
@@ -720,8 +679,8 @@ func decodeFileCheckpoint(raw []byte) (FileCheckpoint, bool, error) {
 }
 
 func validateFileCheckpoint(checkpoint FileCheckpoint) error {
-	if checkpoint.StreamRef == "" || checkpoint.Path == "" || checkpoint.Offset < 0 {
-		return fmt.Errorf("invalid source checkpoint stream_ref=%q path=%q offset=%d", checkpoint.StreamRef, checkpoint.Path, checkpoint.Offset)
+	if checkpoint.StreamRef == "" || checkpoint.FileID == "" || checkpoint.Path == "" || checkpoint.Offset < 0 {
+		return fmt.Errorf("invalid source checkpoint stream_ref=%q file_id=%q path=%q offset=%d", checkpoint.StreamRef, checkpoint.FileID, checkpoint.Path, checkpoint.Offset)
 	}
 	if checkpoint.HashBytes < 0 || checkpoint.HashBytes > maxCheckpointHashBytes {
 		return fmt.Errorf("invalid source checkpoint hash_bytes %d for stream_ref=%q path=%q", checkpoint.HashBytes, checkpoint.StreamRef, checkpoint.Path)

@@ -8,7 +8,6 @@ package registry
 
 import (
 	"errors"
-	"sync"
 
 	"github.com/alibaba/opensandbox/internal/logger"
 	"github.com/alibaba/opensandbox/nodeagent/pkg/api"
@@ -27,59 +26,64 @@ type Dependencies struct {
 
 type SourceFactory func(Dependencies) (api.Source, error)
 type SinkFactory func(Dependencies) (api.Sink, error)
+type SinkTargetID func(config.Config) (string, error)
 
-var factories = struct {
-	sync.RWMutex
-	sources map[string]SourceFactory
-	sinks   map[string]SinkFactory
-}{sources: make(map[string]SourceFactory), sinks: make(map[string]SinkFactory)}
+type sinkRegistration struct {
+	targetID SinkTargetID
+	factory  SinkFactory
+}
+
+var (
+	sources = make(map[string]SourceFactory)
+	sinks   = make(map[string]sinkRegistration)
+)
 
 func RegisterSource(name string, factory SourceFactory) {
 	if name == "" || factory == nil {
 		panic("nodeagent: invalid Source factory registration")
 	}
-	factories.Lock()
-	defer factories.Unlock()
-	if _, exists := factories.sources[name]; exists {
+	if _, exists := sources[name]; exists {
 		panic("nodeagent: duplicate Source factory " + name)
 	}
-	factories.sources[name] = factory
+	sources[name] = factory
 }
 
-func RegisterSink(name string, factory SinkFactory) {
-	if name == "" || factory == nil {
+func RegisterSink(name string, targetID SinkTargetID, factory SinkFactory) {
+	if name == "" || targetID == nil || factory == nil {
 		panic("nodeagent: invalid Sink factory registration")
 	}
-	factories.Lock()
-	defer factories.Unlock()
-	if _, exists := factories.sinks[name]; exists {
+	if _, exists := sinks[name]; exists {
 		panic("nodeagent: duplicate Sink factory " + name)
 	}
-	factories.sinks[name] = factory
+	sinks[name] = sinkRegistration{targetID: targetID, factory: factory}
 }
 
 func BuildSource(name string, dependencies Dependencies) (api.Source, error) {
 	if dependencies.State == nil || dependencies.Store == nil || dependencies.Logger == nil {
-		return nil, errors.New("Source dependencies require State, Store, and Logger")
+		return nil, errors.New("source dependencies require State, Store, and Logger")
 	}
-	factories.RLock()
-	factory := factories.sources[name]
-	factories.RUnlock()
+	factory := sources[name]
 	if factory == nil {
-		return nil, errors.New("Source is not compiled into Node Agent: " + name)
+		return nil, errors.New("source is not compiled into Node Agent: " + name)
 	}
 	return factory(dependencies)
 }
 
+func TargetID(name string, cfg config.Config) (string, error) {
+	registration, ok := sinks[name]
+	if !ok {
+		return "", errors.New("sink is not compiled into Node Agent: " + name)
+	}
+	return registration.targetID(cfg)
+}
+
 func BuildSink(name string, dependencies Dependencies) (api.Sink, error) {
 	if dependencies.State == nil {
-		return nil, errors.New("Sink dependencies require State")
+		return nil, errors.New("sink dependencies require State")
 	}
-	factories.RLock()
-	factory := factories.sinks[name]
-	factories.RUnlock()
-	if factory == nil {
-		return nil, errors.New("Sink is not compiled into Node Agent: " + name)
+	registration, ok := sinks[name]
+	if !ok {
+		return nil, errors.New("sink is not compiled into Node Agent: " + name)
 	}
-	return factory(dependencies)
+	return registration.factory(dependencies)
 }

@@ -14,6 +14,10 @@
 {{- default .Release.Namespace .Values.namespaceOverride -}}
 {{- end -}}
 
+{{- define "opensandbox-node-agent.rbacName" -}}
+{{- printf "%s-%s" (include "opensandbox-node-agent.namespace" .) (include "opensandbox-node-agent.fullname" .) | trunc 253 | trimSuffix "-" -}}
+{{- end -}}
+
 {{- define "opensandbox-node-agent.labels" -}}
 helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" }}
 app.kubernetes.io/name: {{ include "opensandbox-node-agent.name" . }}

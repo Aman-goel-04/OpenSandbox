@@ -22,6 +22,9 @@ var pipelineTestCoverageStartedAt = time.Date(2026, 7, 23, 9, 58, 0, 0, time.UTC
 
 type fakeSource struct {
 	acked         chan []api.AckResult
+	ackMu         sync.Mutex
+	ackErrs       []error
+	ackCalls      int
 	ended         chan api.EndToken
 	endMu         sync.Mutex
 	endErrs       []error
@@ -31,12 +34,20 @@ type fakeSource struct {
 	endAckStarted chan api.EndToken
 }
 
-func (*fakeSource) Name() string { return "fake" }
 func (*fakeSource) Capabilities() api.Capabilities {
 	return api.Capabilities{RecordKinds: []api.RecordKind{api.RecordKindContainerLog}}
 }
 func (*fakeSource) Start(context.Context, chan<- api.SourceEvent) error { return nil }
 func (s *fakeSource) Acknowledge(_ context.Context, results []api.AckResult) error {
+	s.ackMu.Lock()
+	s.ackCalls++
+	if len(s.ackErrs) > 0 {
+		err := s.ackErrs[0]
+		s.ackErrs = s.ackErrs[1:]
+		s.ackMu.Unlock()
+		return err
+	}
+	s.ackMu.Unlock()
 	s.acked <- results
 	return nil
 }
@@ -101,7 +112,6 @@ func (s *nonRetryableAckSource) Acknowledge(context.Context, []api.AckResult) er
 	return nonRetryableAckError{}
 }
 
-func (*fakeSink) Name() string { return "fake" }
 func (*fakeSink) Capabilities() api.Capabilities {
 	return api.Capabilities{RecordKinds: []api.RecordKind{api.RecordKindContainerLog}}
 }
@@ -191,6 +201,56 @@ func TestPipelineAcknowledgesOnlyAfterSink(t *testing.T) {
 	defer sink.mu.Unlock()
 	if len(sink.batches) != 1 || len(sink.finalized) != 1 {
 		t.Fatalf("batches=%d finalized=%d", len(sink.batches), len(sink.finalized))
+	}
+}
+
+func TestPipelineRetriesSourceAcknowledgeWithoutReconsuming(t *testing.T) {
+	db, err := state.Open(t.TempDir(), "target", 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	source := &fakeSource{
+		acked:   make(chan []api.AckResult, 1),
+		ackErrs: []error{errors.New("retry one"), errors.New("retry two")},
+		ended:   make(chan api.EndToken, 1),
+	}
+	sink := &fakeSink{}
+	log, _ := logger.New(logger.Config{OutputPaths: []string{"stdout"}})
+	cfg := testConfig()
+	cfg.RetryMaxInterval = 10 * time.Millisecond
+	p, err := New(cfg, source, sink, db, "target", log, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	events := make(chan api.SourceEvent, 1)
+	done := make(chan error, 1)
+	go func() { done <- p.Run(ctx, events) }()
+	streamRef := api.StreamRef{ID: "stream"}
+	events <- api.SourceEvent{Delivery: &api.Delivery{StreamRef: streamRef, AckToken: api.AckToken{ID: "ack", Source: "fake", StreamRef: streamRef}, RecordID: "record", Record: api.Record{Kind: api.RecordKindContainerLog, Resource: api.Resource{SandboxID: "sb"}}}}
+	select {
+	case <-source.acked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("source acknowledgement retry timed out")
+	}
+	source.ackMu.Lock()
+	ackCalls := source.ackCalls
+	source.ackMu.Unlock()
+	sink.mu.Lock()
+	consumeCalls := sink.consumeCalls
+	sink.mu.Unlock()
+	if ackCalls != 3 || consumeCalls != 1 {
+		t.Fatalf("acknowledge calls=%d consume calls=%d, want 3 and 1", ackCalls, consumeCalls)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer closeCancel()
+	if err := p.Close(closeCtx); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -541,15 +601,15 @@ func TestPipelineStopsOnNonRetryableSinkFailure(t *testing.T) {
 	}
 }
 
-func TestPipelineReportsRetryStateUntilSinkRecovers(t *testing.T) {
+func TestPipelineKeepsRetryStateAcrossSinkAndSourceRecovery(t *testing.T) {
 	db, err := state.Open(t.TempDir(), "target", 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	source := &fakeSource{acked: make(chan []api.AckResult, 1), ended: make(chan api.EndToken, 1)}
+	source := &fakeSource{acked: make(chan []api.AckResult, 1), ackErrs: []error{errors.New("temporary source failure")}, ended: make(chan api.EndToken, 1)}
 	sink := &fakeSink{consumeErrs: []error{errors.New("temporary sink failure")}}
-	states := make(chan bool, 2)
+	states := make(chan bool, 4)
 	cfg := testConfig()
 	cfg.OnRetryStateChange = func(active bool) { states <- active }
 	log, _ := logger.New(logger.Config{OutputPaths: []string{"stdout"}})
@@ -574,7 +634,7 @@ func TestPipelineReportsRetryStateUntilSinkRecovers(t *testing.T) {
 	select {
 	case <-source.acked:
 	case <-time.After(2 * time.Second):
-		t.Fatal("sink retry did not recover")
+		t.Fatal("sink and source retries did not recover")
 	}
 	select {
 	case active := <-states:
@@ -583,6 +643,11 @@ func TestPipelineReportsRetryStateUntilSinkRecovers(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("retry state was not cleared")
+	}
+	select {
+	case active := <-states:
+		t.Fatalf("retry state oscillated between sink and source recovery: %t", active)
+	default:
 	}
 	cancel()
 	if err := <-done; !errors.Is(err, context.Canceled) {
@@ -968,9 +1033,7 @@ func TestPipelineCloseTimeoutCancelsStalledSendAndRun(t *testing.T) {
 	source := &fakeSource{acked: make(chan []api.AckResult, 1), ended: make(chan api.EndToken, 1)}
 	sink := &fakeSink{consumeErr: errors.New("retryable failure"), consumeStart: make(chan struct{}, 1)}
 	log, _ := logger.New(logger.Config{OutputPaths: []string{"stdout"}})
-	cfg := testConfig()
-	cfg.PerStreamQueueSize = 2
-	p, err := New(cfg, source, sink, db, "target", log, nil)
+	p, err := New(testConfig(), source, sink, db, "target", log, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -979,7 +1042,7 @@ func TestPipelineCloseTimeoutCancelsStalledSendAndRun(t *testing.T) {
 	go func() { runDone <- p.Run(context.Background(), events) }()
 	streamRef := api.StreamRef{ID: "stream"}
 	delivery := api.Delivery{StreamRef: streamRef, AckToken: api.AckToken{Source: "fake", StreamRef: streamRef}, Record: api.Record{Kind: api.RecordKindContainerLog, Body: []byte("record"), Resource: api.Resource{SandboxID: "sb"}}}
-	for index := 0; index < 4; index++ {
+	for index := 0; index < 3; index++ {
 		eventDelivery := delivery
 		eventDelivery.AckToken.ID = fmt.Sprintf("ack-%d", index)
 		eventDelivery.RecordID = fmt.Sprintf("record-%d", index)
@@ -991,7 +1054,7 @@ func TestPipelineCloseTimeoutCancelsStalledSendAndRun(t *testing.T) {
 		t.Fatal("sink consume did not start")
 	}
 	wantQueued := int64(0)
-	for index := 0; index < 4; index++ {
+	for index := 0; index < 3; index++ {
 		eventDelivery := delivery
 		eventDelivery.AckToken.ID = fmt.Sprintf("ack-%d", index)
 		eventDelivery.RecordID = fmt.Sprintf("record-%d", index)
@@ -1006,7 +1069,7 @@ func TestPipelineCloseTimeoutCancelsStalledSendAndRun(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("fourth send did not stall: queued=%d want=%d", queued, wantQueued)
+			t.Fatalf("third send did not stall: queued=%d want=%d", queued, wantQueued)
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -1039,7 +1102,7 @@ func TestPipelineCloseTimeoutCancelsStalledSendAndRun(t *testing.T) {
 }
 
 func testConfig() Config {
-	return Config{BatchMaxItems: 1, FlushInterval: time.Second, SinkTimeout: time.Second, RetryMaxInterval: time.Second, PerStreamQueueSize: 2, MemoryBudgetBytes: 1 << 20, PerSandboxQueueBytes: 1 << 19, DropPolicy: "block"}
+	return Config{BatchMaxItems: 1, FlushInterval: time.Second, SinkTimeout: time.Second, RetryMaxInterval: time.Second, MemoryBudgetBytes: 1 << 20, PerSandboxQueueBytes: 1 << 19, DropPolicy: "block"}
 }
 
 func containsReason(reasons []string, want string) bool {

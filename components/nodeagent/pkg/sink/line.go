@@ -21,6 +21,10 @@ import (
 	"github.com/alibaba/opensandbox/nodeagent/pkg/api"
 )
 
+func SameResourceIdentity(left, right api.Resource) bool {
+	return left == right
+}
+
 func EncodeBatch(batch api.Batch) []byte {
 	var out bytes.Buffer
 	for _, item := range batch.Items {

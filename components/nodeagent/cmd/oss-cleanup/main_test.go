@@ -4,13 +4,17 @@
 package main
 
 import (
+	"bytes"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/alibaba/opensandbox/nodeagent/pkg/api"
+	"github.com/alibaba/opensandbox/nodeagent/pkg/identity"
 	"github.com/alibaba/opensandbox/nodeagent/pkg/marker"
+	"github.com/alibaba/opensandbox/nodeagent/pkg/objectlayout"
 	"github.com/alibaba/opensandbox/nodeagent/pkg/state"
 	bolt "go.etcd.io/bbolt"
 )
@@ -22,12 +26,12 @@ func TestCleanupManifestPersistsAndResumes(t *testing.T) {
 	}
 	defer db.Close()
 	key := []byte(taskKey("https://oss.example.com", "bucket", "target", "logs/prod/ns/sb/uid", "sandbox"))
-	want := manifest{Endpoint: "https://oss.example.com", Bucket: "bucket", TargetID: "target", FamilyPrefix: "logs/prod/ns/sb/uid", Container: "sandbox", MarkerKeys: []string{"marker"}, DataKeys: []string{"data"}, MarkerDigest: "digest", Phase: "markers-deleted"}
+	want := manifest{Endpoint: "https://oss.example.com", Bucket: "bucket", TargetID: "target", FamilyPrefix: "logs/prod/ns/sb/uid", Container: "sandbox", MarkerKeys: []string{"marker"}, DataKeys: []string{"data"}, UnmarkedDataKeys: []string{"data"}, MarkerDigest: "digest", Phase: "markers-deleted"}
 	if err := writeManifest(db, key, want); err != nil {
 		t.Fatal(err)
 	}
 	got, found, err := readManifest(db, key)
-	if err != nil || !found || got.Phase != want.Phase || got.MarkerDigest != want.MarkerDigest {
+	if err != nil || !found || got.Phase != want.Phase || got.MarkerDigest != want.MarkerDigest || !sameKeys(got.UnmarkedDataKeys, want.UnmarkedDataKeys) {
 		t.Fatalf("manifest=%+v found=%v err=%v", got, found, err)
 	}
 }
@@ -93,43 +97,21 @@ func TestLoadOrRefreshManifestRefreshesOnlyUnappliedPlans(t *testing.T) {
 	}
 }
 
-func TestCanonicalizeEndpoint(t *testing.T) {
-	got, err := canonicalizeEndpoint("HTTPS://OSS.Example.COM:443/")
-	if err != nil || got != "https://oss.example.com" {
-		t.Fatalf("canonicalizeEndpoint() = %q, %v", got, err)
-	}
-	if got, err := canonicalizeEndpoint("https://[2001:DB8::1]:443/"); err != nil || got != "https://[2001:db8::1]" {
-		t.Fatalf("canonicalizeEndpoint(IPv6) = %q, %v", got, err)
-	}
-	if got, err := canonicalizeEndpoint("https://OSS.Example.COM:8443/"); err != nil || got != "https://oss.example.com:8443" {
-		t.Fatalf("canonicalizeEndpoint(non-default port) = %q, %v", got, err)
-	}
-	for _, endpoint := range []string{
-		"http://oss.example.com",
-		"https://user:password@oss.example.com",
-		"https://oss.example.com/path",
-		"https://oss.example.com?query=value",
-		"https://oss.example.com#fragment",
-	} {
-		if _, err := canonicalizeEndpoint(endpoint); err == nil {
-			t.Fatalf("canonicalizeEndpoint(%q) unexpectedly succeeded", endpoint)
-		}
-	}
-}
-
 func TestValidateMarkerIdentityMatchesObjectFamily(t *testing.T) {
 	familyPrefix := "logs/prod/ns/sb/uid"
 	container := "sandbox"
 	resource := api.Resource{SandboxID: "sb", ClusterName: "prod", Namespace: "ns", PodName: "pod", PodUID: "uid", NodeName: "node", Container: container}
-	request := api.FinalizeRequest{FinalizeID: "f1", TargetID: "target", StreamRef: api.StreamRef{ID: "container-logs/uid/sandbox"}, Revision: 1, CoverageStartedAt: time.Date(2026, 7, 23, 9, 58, 0, 0, time.UTC), Resource: resource, FinalizedAt: time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC)}
+	streamRef := objectlayout.StreamRef(resource.PodUID, container)
+	request := api.FinalizeRequest{FinalizeID: identity.FinalizeID(streamRef, 1, "target"), TargetID: "target", StreamRef: api.StreamRef{ID: streamRef}, Revision: 1, CoverageStartedAt: time.Date(2026, 7, 23, 9, 58, 0, 0, time.UTC), Resource: resource, FinalizedAt: time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC)}
 	value := marker.New(request, nil)
-	key := familyPrefix + "/sandbox.finalized.1.json"
+	key := objectlayout.MarkerKey(familyPrefix, container, 1)
 	if err := validateMarkerIdentity(value, key, "target", familyPrefix, container, 1); err != nil {
 		t.Fatal(err)
 	}
 
 	mutations := []func(*marker.Marker){
 		func(value *marker.Marker) { value.TargetID = "other" },
+		func(value *marker.Marker) { value.FinalizeID = "sha256:other" },
 		func(value *marker.Marker) { value.Revision = 2 },
 		func(value *marker.Marker) { value.StreamRef = "container-logs/other/sandbox" },
 		func(value *marker.Marker) { value.Resource.ClusterName = "other" },
@@ -175,9 +157,6 @@ func TestValidateCumulativeMarkers(t *testing.T) {
 	if err := validateCumulative(first, second); err == nil {
 		t.Fatal("changed coverage boundary accepted")
 	}
-	if got := expectedDataKey("logs/prod/ns/sb/uid", "sandbox", 2); got != "logs/prod/ns/sb/uid/sandbox.2.log" {
-		t.Fatalf("key=%q", got)
-	}
 }
 
 func TestNormalizeFamilyPrefix(t *testing.T) {
@@ -211,6 +190,7 @@ func TestValidateManifestRejectsUnsafeState(t *testing.T) {
 		func(value *manifest) { value.Phase = "markers-gone-maybe" },
 		func(value *manifest) { value.MarkerKeys[0] = "logs/other/sandbox.finalized.1.json" },
 		func(value *manifest) { value.DataKeys[0] = "logs/other/sandbox.log" },
+		func(value *manifest) { value.UnmarkedDataKeys = []string{"logs/prod/ns/sb/uid/sandbox.1.log"} },
 		func(value *manifest) { value.MarkerDigest = "bad" },
 	} {
 		value := base
@@ -241,5 +221,116 @@ func TestMarkerDeletionOrderIsNewestFirst(t *testing.T) {
 		if got[index] != want[index] {
 			t.Fatalf("reversedKeys()=%v", got)
 		}
+	}
+}
+
+func TestMarkerPatternAcceptsOnlyCanonicalRevisions(t *testing.T) {
+	familyPrefix := "logs/prod/ns/sb/uid"
+	container := "sandbox"
+	pattern := markerKeyPattern(familyPrefix, container)
+	canonical := objectlayout.MarkerKey(familyPrefix, container, 12)
+	if !pattern.MatchString(canonical) {
+		t.Fatalf("canonical marker %q did not match", canonical)
+	}
+	for _, key := range []string{
+		objectlayout.MarkerPrefix(familyPrefix, container) + "0.json",
+		objectlayout.MarkerPrefix(familyPrefix, container) + "01.json",
+		objectlayout.MarkerPrefix(familyPrefix, container) + "nested/sandbox.finalized.1.json",
+		familyPrefix + "/other.finalized.1.json",
+	} {
+		if pattern.MatchString(key) {
+			t.Fatalf("non-canonical marker %q matched", key)
+		}
+	}
+	if revision, err := markerRevision(pattern, canonical); err != nil || revision != 12 {
+		t.Fatalf("revision=%d err=%v", revision, err)
+	}
+	overflow := objectlayout.MarkerPrefix(familyPrefix, container) + strings.Repeat("9", 32) + ".json"
+	if !pattern.MatchString(overflow) {
+		t.Fatalf("overflow marker %q should reach revision validation", overflow)
+	}
+	if _, err := markerRevision(pattern, overflow); err == nil {
+		t.Fatalf("overflow marker %q was accepted", overflow)
+	}
+}
+
+func TestMergeRemainingDataKeysRequiresExplicitExtension(t *testing.T) {
+	plan := testCleanupPlan("markers-deleted")
+	lateKey := objectlayout.DataKey(plan.FamilyPrefix, plan.Container, 1)
+	if changed, err := mergeRemainingDataKeys(&plan, []string{lateKey}, false); err == nil || changed {
+		t.Fatalf("unplanned data changed manifest without consent: changed=%v err=%v", changed, err)
+	}
+	if containsKey(plan.DataKeys, lateKey) || plan.Phase != "markers-deleted" {
+		t.Fatalf("rejected extension mutated plan=%+v", plan)
+	}
+	if changed, err := mergeRemainingDataKeys(&plan, []string{lateKey, lateKey}, true); err != nil || !changed {
+		t.Fatalf("explicit extension changed=%v err=%v", changed, err)
+	}
+	if len(plan.DataKeys) != 2 || len(plan.UnmarkedDataKeys) != 1 || !containsKey(plan.DataKeys, lateKey) || !containsKey(plan.UnmarkedDataKeys, lateKey) {
+		t.Fatalf("explicit extension did not record unmarked data: %+v", plan)
+	}
+	if changed, err := mergeRemainingDataKeys(&plan, []string{lateKey}, false); err != nil || changed {
+		t.Fatalf("known data changed manifest: changed=%v err=%v", changed, err)
+	}
+}
+
+func TestMergeRemainingDataKeysOnlyReopensUnfinishedPlan(t *testing.T) {
+	plan := testCleanupPlan("objects-deleted")
+	if changed, err := mergeRemainingDataKeys(&plan, plan.DataKeys, false); err == nil || !strings.Contains(err.Error(), "reappeared") || changed || plan.Phase != "objects-deleted" {
+		t.Fatalf("deleted phase reopened without consent: changed=%v err=%v plan=%+v", changed, err, plan)
+	}
+	lateKey := objectlayout.DataKey(plan.FamilyPrefix, plan.Container, 1)
+	if changed, err := mergeRemainingDataKeys(&plan, []string{lateKey}, false); err == nil || !strings.Contains(err.Error(), "unplanned") || changed || plan.Phase != "objects-deleted" {
+		t.Fatalf("new object was reported as reappeared: changed=%v err=%v plan=%+v", changed, err, plan)
+	}
+	if changed, err := mergeRemainingDataKeys(&plan, plan.DataKeys, true); err != nil || !changed || plan.Phase != "markers-deleted" {
+		t.Fatalf("explicit resume failed: changed=%v err=%v plan=%+v", changed, err, plan)
+	}
+	if len(plan.UnmarkedDataKeys) != 0 {
+		t.Fatalf("authorized data became unmarked: %+v", plan.UnmarkedDataKeys)
+	}
+
+	complete := testCleanupPlan("complete")
+	if changed, err := mergeRemainingDataKeys(&complete, complete.DataKeys, true); err == nil || changed || complete.Phase != "complete" {
+		t.Fatalf("completed cleanup reopened: changed=%v err=%v plan=%+v", changed, err, complete)
+	}
+	if changed, err := mergeRemainingDataKeys(&complete, nil, true); err == nil || changed || complete.Phase != "complete" {
+		t.Fatalf("empty completed cleanup was accepted: changed=%v err=%v plan=%+v", changed, err, complete)
+	}
+}
+
+func TestPrintManifestListsKeysAndLatestMarkerCoverage(t *testing.T) {
+	plan := testCleanupPlan("planned")
+	unmarked := objectlayout.DataKey(plan.FamilyPrefix, plan.Container, 1)
+	plan.DataKeys = append(plan.DataKeys, unmarked)
+	sort.Strings(plan.DataKeys)
+	plan.UnmarkedDataKeys = []string{unmarked}
+	var output bytes.Buffer
+	printManifest(&output, plan)
+	text := output.String()
+	for _, want := range []string{
+		"marker key=\"" + plan.MarkerKeys[0] + "\"",
+		"data key=\"" + objectlayout.DataKey(plan.FamilyPrefix, plan.Container, 0) + "\" latest-marker=covered",
+		"data key=\"" + unmarked + "\" latest-marker=not-covered",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("output %q does not contain %q", text, want)
+		}
+	}
+}
+
+func testCleanupPlan(phase string) manifest {
+	familyPrefix := "logs/prod/ns/sb/uid"
+	container := "sandbox"
+	return manifest{
+		Endpoint:     "https://oss.example.com",
+		Bucket:       "bucket",
+		TargetID:     "target",
+		FamilyPrefix: familyPrefix,
+		Container:    container,
+		MarkerKeys:   []string{objectlayout.MarkerKey(familyPrefix, container, 1)},
+		DataKeys:     []string{objectlayout.DataKey(familyPrefix, container, 0)},
+		MarkerDigest: strings.Repeat("0", 64),
+		Phase:        phase,
 	}
 }

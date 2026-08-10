@@ -19,18 +19,23 @@ import (
 	"fmt"
 	"math"
 	"net"
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/alibaba/opensandbox/nodeagent/pkg/identity"
 )
 
 const (
 	SinkFile = "file"
 	SinkOSS  = "oss"
+
+	InternalReconcileInterval  = 30 * time.Second
+	InternalBatchMaxItems      = 256
+	InternalBatchFlushInterval = time.Second
 )
 
 var clusterIDPattern = regexp.MustCompile(`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$`)
@@ -62,13 +67,9 @@ type Config struct {
 	DropPolicy           string
 	SinkTimeout          time.Duration
 	RetryMaxInterval     time.Duration
-	ReconcileInterval    time.Duration
 	EndedStateRetention  time.Duration
-	BatchMaxItems        int
-	BatchFlushInterval   time.Duration
 	ServerAddr           string
 	PprofAddr            string
-	ContainerNames       []string
 }
 
 type listenAddress struct {
@@ -94,26 +95,31 @@ func Load() (Config, error) {
 		DropPolicy:         envDefault("NODEAGENT_DROP_POLICY", "block"),
 		ServerAddr:         envDefault("NODEAGENT_SERVER_ADDR", ":8080"),
 		PprofAddr:          strings.TrimSpace(os.Getenv("NODEAGENT_PPROF_ADDR")),
-		ContainerNames:     splitCSV(envDefault("NODEAGENT_CONTAINER_NAMES", "sandbox")),
 	}
 
 	var errs []error
 	cfg.StateMaxBytes = parseInt64("NODEAGENT_STATE_MAX_BYTES", 1<<30, true, &errs)
-	cfg.FileMaxBytes = parseInt64("NODEAGENT_FILE_MAX_BYTES", 1<<30, true, &errs)
-	cfg.FileMaxFiles = int(parseInt64("NODEAGENT_FILE_MAX_FILES", 16, true, &errs))
-	cfg.FileMaxTotalBytes = parseInt64("NODEAGENT_FILE_MAX_TOTAL_BYTES", 10<<30, true, &errs)
 	cfg.MemoryBudgetBytes = parseInt64("NODEAGENT_MEMORY_BUDGET_BYTES", 256<<20, true, &errs)
 	cfg.PerSandboxQueueBytes = parseInt64("NODEAGENT_PER_SANDBOX_QUEUE_BYTES", 16<<20, true, &errs)
 	cfg.PerSandboxRateLimit = parseFloat("NODEAGENT_PER_SANDBOX_RATE_LIMIT", 0, false, &errs)
 	cfg.MaxLineBytes = int(parseInt64("NODEAGENT_MAX_LINE_BYTES", 1<<20, true, &errs))
-	cfg.BatchMaxItems = int(parseInt64("NODEAGENT_BATCH_MAX_ITEMS", 256, true, &errs))
-	cfg.FileRetention = parseDuration("NODEAGENT_FILE_RETENTION", 24*time.Hour, false, &errs)
 	cfg.PartialTimeout = parseDuration("NODEAGENT_PARTIAL_TIMEOUT", 5*time.Second, true, &errs)
 	cfg.SinkTimeout = parseDuration("NODEAGENT_SINK_TIMEOUT", 30*time.Second, true, &errs)
 	cfg.RetryMaxInterval = parseDuration("NODEAGENT_RETRY_MAX_INTERVAL", 30*time.Second, true, &errs)
-	cfg.ReconcileInterval = parseDuration("NODEAGENT_RECONCILE_INTERVAL", 30*time.Second, true, &errs)
 	cfg.EndedStateRetention = parseDuration("NODEAGENT_ENDED_STATE_RETENTION", 24*time.Hour, true, &errs)
-	cfg.BatchFlushInterval = parseDuration("NODEAGENT_BATCH_FLUSH_INTERVAL", time.Second, true, &errs)
+	if cfg.Sink == SinkFile {
+		cfg.FileMaxBytes = parseInt64("NODEAGENT_FILE_MAX_BYTES", 1<<30, true, &errs)
+		cfg.FileMaxFiles = int(parseInt64("NODEAGENT_FILE_MAX_FILES", 16, true, &errs))
+		cfg.FileMaxTotalBytes = parseInt64("NODEAGENT_FILE_MAX_TOTAL_BYTES", 10<<30, true, &errs)
+		cfg.FileRetention = parseDuration("NODEAGENT_FILE_RETENTION", 24*time.Hour, false, &errs)
+	} else if cfg.Sink == SinkOSS && cfg.OSSEndpoint != "" {
+		canonical, err := identity.CanonicalOSSEndpoint(cfg.OSSEndpoint)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("NODEAGENT_OSS_ENDPOINT: %w", err))
+		} else {
+			cfg.OSSEndpoint = canonical
+		}
+	}
 
 	errs = append(errs, cfg.validate()...)
 	return cfg, errors.Join(errs...)
@@ -126,12 +132,6 @@ func (c Config) validate() []error {
 	}
 	if !clusterIDPattern.MatchString(c.ClusterID) {
 		errs = append(errs, errors.New("NODEAGENT_CLUSTER_ID must be a DNS label"))
-	}
-	if c.Source != "container-logs" {
-		errs = append(errs, fmt.Errorf("unsupported source %q", c.Source))
-	}
-	if len(c.ContainerNames) != 1 || c.ContainerNames[0] != "sandbox" {
-		errs = append(errs, errors.New("NODEAGENT_CONTAINER_NAMES must be exactly sandbox in v1"))
 	}
 	if c.DropPolicy != "block" && c.DropPolicy != "drop" {
 		errs = append(errs, errors.New("NODEAGENT_DROP_POLICY must be block or drop"))
@@ -163,17 +163,10 @@ func (c Config) validate() []error {
 	case SinkOSS:
 		if c.OSSEndpoint == "" || c.OSSBucket == "" || c.OSSAccessKeyID == "" || c.OSSAccessKeySecret == "" {
 			errs = append(errs, errors.New("OSS endpoint, bucket, access key ID, and access key secret are required"))
-		} else if err := validateOSSEndpoint(c.OSSEndpoint); err != nil {
-			errs = append(errs, err)
 		}
 		if c.OSSKeyPrefix == "" || unsafeObjectPrefix(c.OSSKeyPrefix) {
 			errs = append(errs, errors.New("NODEAGENT_OSS_KEY_PREFIX must be a non-empty safe object prefix"))
 		}
-		if c.FileMaxBytes > 5<<30 {
-			errs = append(errs, errors.New("OSS object size limit must not exceed 5 GiB"))
-		}
-	default:
-		errs = append(errs, fmt.Errorf("unsupported sink %q", c.Sink))
 	}
 	if c.PerSandboxQueueBytes > c.MemoryBudgetBytes {
 		errs = append(errs, errors.New("per-sandbox queue budget cannot exceed global memory budget"))
@@ -183,8 +176,8 @@ func (c Config) validate() []error {
 	} else if int64(c.MaxLineBytes)+512 > c.PerSandboxQueueBytes {
 		errs = append(errs, errors.New("NODEAGENT_MAX_LINE_BYTES plus record overhead must fit the per-sandbox queue budget"))
 	}
-	if c.BatchMaxItems > 1<<20 || c.FileMaxFiles > 1<<20 {
-		errs = append(errs, errors.New("batch and file-count limits must not exceed 1048576"))
+	if c.FileMaxFiles > 1<<20 {
+		errs = append(errs, errors.New("file-count limit must not exceed 1048576"))
 	}
 	serverAddress, serverErr := parseListenAddress(c.ServerAddr)
 	if serverErr != nil {
@@ -292,14 +285,6 @@ func validateAbsolutePath(path string) error {
 	return nil
 }
 
-func validateOSSEndpoint(raw string) error {
-	u, err := url.Parse(raw)
-	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
-		return errors.New("NODEAGENT_OSS_ENDPOINT must be an HTTPS origin without credentials, path, query, or fragment")
-	}
-	return nil
-}
-
 func envDefault(key, fallback string) string {
 	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
 		return value
@@ -344,14 +329,4 @@ func parseDuration(key string, fallback time.Duration, positive bool, errs *[]er
 		return fallback
 	}
 	return value
-}
-
-func splitCSV(value string) []string {
-	var out []string
-	for _, item := range strings.Split(value, ",") {
-		if item = strings.TrimSpace(item); item != "" {
-			out = append(out, item)
-		}
-	}
-	return out
 }

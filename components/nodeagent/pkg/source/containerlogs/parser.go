@@ -114,11 +114,7 @@ func newAssembler(maxLineBytes int, timeout time.Duration) *assembler {
 }
 
 func (a *assembler) consume(line criLine, span sourceSpan, now time.Time) *assembled {
-	restart := span.restart
-	if restart == "" {
-		restart = restartIdentity(span.Path)
-	}
-	key := partialKey{restart: restart, stream: line.Stream, repairGapID: span.RepairGapID}
+	key := partialKey{restart: span.restart, stream: line.Stream, repairGapID: span.RepairGapID}
 	current := a.streams[key]
 	if line.Partial {
 		if current == nil {

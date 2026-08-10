@@ -45,12 +45,13 @@ type Config struct {
 	SinkTimeout          time.Duration
 	RetryMaxInterval     time.Duration
 	OnRetryStateChange   func(bool)
-	PerStreamQueueSize   int
 	MemoryBudgetBytes    int64
 	PerSandboxQueueBytes int64
 	PerSandboxRateLimit  float64
 	DropPolicy           string
 }
+
+const perStreamQueueSize = 1
 
 type Pipeline struct {
 	cfg      Config
@@ -114,8 +115,33 @@ type pending struct {
 	sandboxID string
 }
 
+type retryOperation struct {
+	call             func(context.Context) error
+	timeout          time.Duration
+	nonRetryableText string
+	retryText        string
+	scope            *retryScope
+}
+
+type retryScope struct {
+	end func()
+}
+
+func (s *retryScope) activate(p *Pipeline) {
+	if s.end == nil {
+		s.end = p.beginRetry()
+	}
+}
+
+func (s *retryScope) close() {
+	if s.end != nil {
+		s.end()
+		s.end = nil
+	}
+}
+
 func New(cfg Config, source api.Source, sink api.Sink, store finalizeStore, targetID string, log logger.Logger, onError func(error)) (*Pipeline, error) {
-	if cfg.BatchMaxItems <= 0 || cfg.FlushInterval <= 0 || cfg.SinkTimeout <= 0 || cfg.RetryMaxInterval <= 0 || cfg.PerStreamQueueSize <= 0 || cfg.MemoryBudgetBytes <= 0 || cfg.PerSandboxQueueBytes <= 0 {
+	if cfg.BatchMaxItems <= 0 || cfg.FlushInterval <= 0 || cfg.SinkTimeout <= 0 || cfg.RetryMaxInterval <= 0 || cfg.MemoryBudgetBytes <= 0 || cfg.PerSandboxQueueBytes <= 0 {
 		return nil, errors.New("pipeline limits and durations must be positive")
 	}
 	if cfg.PerSandboxQueueBytes > cfg.MemoryBudgetBytes {
@@ -251,7 +277,7 @@ func (p *Pipeline) getWorker(streamRef api.StreamRef) (*worker, error) {
 	}
 	predecessor := p.handoffs[streamRef.ID]
 	delete(p.handoffs, streamRef.ID)
-	w := &worker{streamRef: streamRef, input: make(chan admittedEvent, p.cfg.PerStreamQueueSize), done: make(chan struct{}), predecessor: predecessor}
+	w := &worker{streamRef: streamRef, input: make(chan admittedEvent, perStreamQueueSize), done: make(chan struct{}), predecessor: predecessor}
 	p.workers[streamRef.ID] = w
 	p.wg.Add(1)
 	safego.Go(func() {
@@ -353,82 +379,41 @@ func (p *Pipeline) runWorker(ctx context.Context, worker *worker) error {
 }
 
 func (p *Pipeline) consumeWithRetry(ctx context.Context, streamRef api.StreamRef, pendingItems []pending) error {
+	scope := &retryScope{}
+	defer scope.close()
 	batch := api.Batch{StreamRef: streamRef, Items: make([]api.BatchItem, len(pendingItems))}
 	for i := range pendingItems {
 		batch.Items[i] = pendingItems[i].item
 	}
-	var endRetry func()
-	defer func() {
-		if endRetry != nil {
-			endRetry()
-		}
-	}()
-	delay := 100 * time.Millisecond
-	for {
-		started := time.Now()
-		callCtx, cancel := context.WithTimeout(ctx, p.cfg.SinkTimeout)
-		err := p.sink.Consume(callCtx, batch)
-		cancel()
-		p.metrics.consumeMillis.Record(context.Background(), float64(time.Since(started).Microseconds())/1000)
-		if err == nil {
-			results := make([]api.AckResult, len(pendingItems))
-			for i := range pendingItems {
-				results[i] = api.AckResult{Token: pendingItems[i].token, Disposition: api.AckDelivered, Guarantee: p.sink.Guarantee()}
-			}
-			return p.acknowledgeWithRetry(ctx, results)
-		}
-		if !api.IsRetryableSinkError(err) {
-			return fmt.Errorf("non-retryable sink consume failure: %w", err)
-		}
-		if endRetry == nil {
-			endRetry = p.beginRetry()
-		}
-		p.log.Warnf("sink consume failed; retrying: %v", err)
-		p.metrics.retries.Add(context.Background(), 1)
-		jitter := time.Duration(rand.Int64N(max(int64(delay/4), 1)))
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(delay + jitter):
-		}
-		delay *= 2
-		if delay > p.cfg.RetryMaxInterval {
-			delay = p.cfg.RetryMaxInterval
-		}
+	err := p.retry(ctx, retryOperation{
+		call: func(callCtx context.Context) error {
+			started := time.Now()
+			err := p.sink.Consume(callCtx, batch)
+			p.metrics.consumeMillis.Record(context.Background(), float64(time.Since(started).Microseconds())/1000)
+			return err
+		},
+		timeout:          p.cfg.SinkTimeout,
+		nonRetryableText: "non-retryable sink consume failure",
+		retryText:        "sink consume failed; retrying",
+		scope:            scope,
+	})
+	if err != nil {
+		return err
 	}
+	results := make([]api.AckResult, len(pendingItems))
+	for i := range pendingItems {
+		results[i] = api.AckResult{Token: pendingItems[i].token, Disposition: api.AckDelivered, Guarantee: p.sink.Guarantee()}
+	}
+	return p.acknowledgeWithRetry(ctx, results, scope)
 }
 
-func (p *Pipeline) acknowledgeWithRetry(ctx context.Context, results []api.AckResult) error {
-	var endRetry func()
-	defer func() {
-		if endRetry != nil {
-			endRetry()
-		}
-	}()
-	delay := 100 * time.Millisecond
-	for {
-		if err := p.source.Acknowledge(ctx, results); err == nil {
-			return nil
-		} else {
-			if !api.IsRetryableSourceError(err) {
-				return fmt.Errorf("non-retryable source acknowledge failure: %w", err)
-			}
-			if endRetry == nil {
-				endRetry = p.beginRetry()
-			}
-			p.log.Warnf("source acknowledge failed; retrying without re-consuming: %v", err)
-		}
-		jitter := time.Duration(rand.Int64N(max(int64(delay/4), 1)))
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(delay + jitter):
-		}
-		delay *= 2
-		if delay > p.cfg.RetryMaxInterval {
-			delay = p.cfg.RetryMaxInterval
-		}
-	}
+func (p *Pipeline) acknowledgeWithRetry(ctx context.Context, results []api.AckResult, scope *retryScope) error {
+	return p.retry(ctx, retryOperation{
+		call:             func(callCtx context.Context) error { return p.source.Acknowledge(callCtx, results) },
+		nonRetryableText: "non-retryable source acknowledge failure",
+		retryText:        "source acknowledge failed; retrying without re-consuming",
+		scope:            scope,
+	})
 }
 
 func (p *Pipeline) finalize(ctx context.Context, worker *worker, end *api.StreamEnd) error {
@@ -479,61 +464,45 @@ func (p *Pipeline) finalize(ctx context.Context, worker *worker, end *api.Stream
 }
 
 func (p *Pipeline) acknowledgeEndWithRetry(ctx context.Context, token api.EndToken) error {
-	var endRetry func()
-	defer func() {
-		if endRetry != nil {
-			endRetry()
-		}
-	}()
-	delay := 100 * time.Millisecond
-	for {
-		if err := p.source.AcknowledgeEnd(ctx, token); err == nil {
-			return nil
-		} else {
-			if !api.IsRetryableSourceError(err) {
-				return fmt.Errorf("non-retryable source end acknowledgement failure: %w", err)
-			}
-			if endRetry == nil {
-				endRetry = p.beginRetry()
-			}
-			p.log.Warnf("source end acknowledgement failed; retrying: %v", err)
-		}
-		p.metrics.retries.Add(context.Background(), 1)
-		jitter := time.Duration(rand.Int64N(max(int64(delay/4), 1)))
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(delay + jitter):
-		}
-		delay *= 2
-		if delay > p.cfg.RetryMaxInterval {
-			delay = p.cfg.RetryMaxInterval
-		}
-	}
+	return p.retry(ctx, retryOperation{
+		call:             func(callCtx context.Context) error { return p.source.AcknowledgeEnd(callCtx, token) },
+		nonRetryableText: "non-retryable source end acknowledgement failure",
+		retryText:        "source end acknowledgement failed; retrying",
+	})
 }
 
 func (p *Pipeline) finalizeSinkWithRetry(ctx context.Context, request api.FinalizeRequest) error {
-	var endRetry func()
-	defer func() {
-		if endRetry != nil {
-			endRetry()
-		}
-	}()
+	return p.retry(ctx, retryOperation{
+		call:             func(callCtx context.Context) error { return p.sink.Finalize(callCtx, request) },
+		timeout:          p.cfg.SinkTimeout,
+		nonRetryableText: "non-retryable sink finalize failure",
+		retryText:        "sink finalize failed; retrying",
+	})
+}
+
+func (p *Pipeline) retry(ctx context.Context, operation retryOperation) error {
+	scope := operation.scope
+	if scope == nil {
+		scope = &retryScope{}
+		defer scope.close()
+	}
 	delay := 100 * time.Millisecond
 	for {
-		callCtx, cancel := context.WithTimeout(ctx, p.cfg.SinkTimeout)
-		err := p.sink.Finalize(callCtx, request)
+		callCtx := ctx
+		cancel := func() {}
+		if operation.timeout > 0 {
+			callCtx, cancel = context.WithTimeout(ctx, operation.timeout)
+		}
+		err := operation.call(callCtx)
 		cancel()
 		if err == nil {
 			return nil
 		}
-		if !api.IsRetryableSinkError(err) {
-			return fmt.Errorf("non-retryable sink finalize failure: %w", err)
+		if !api.IsRetryableError(err) {
+			return fmt.Errorf("%s: %w", operation.nonRetryableText, err)
 		}
-		if endRetry == nil {
-			endRetry = p.beginRetry()
-		}
-		p.log.Warnf("sink finalize failed; retrying: %v", err)
+		scope.activate(p)
+		p.log.Warnf("%s: %v", operation.retryText, err)
 		p.metrics.retries.Add(context.Background(), 1)
 		jitter := time.Duration(rand.Int64N(max(int64(delay/4), 1)))
 		select {
@@ -718,7 +687,7 @@ func (p *Pipeline) admit(ctx context.Context, worker *worker, event api.SourceEv
 
 func (p *Pipeline) drop(ctx context.Context, worker *worker, delivery *api.Delivery, reason string) error {
 	result := api.AckResult{Token: delivery.AckToken, Disposition: api.AckIntentionalDrop, Reason: reason, Guarantee: p.sink.Guarantee()}
-	if err := p.acknowledgeWithRetry(ctx, []api.AckResult{result}); err != nil {
+	if err := p.acknowledgeWithRetry(ctx, []api.AckResult{result}, nil); err != nil {
 		return err
 	}
 	worker.outcomeMu.Lock()

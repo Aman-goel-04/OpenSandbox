@@ -22,7 +22,7 @@ func (unsupportedFileInfo) Sys() any           { return struct{}{} }
 
 func TestSourceFileIdentityClassifiesUnsupportedStatType(t *testing.T) {
 	_, _, err := sourceFileIdentity(unsupportedFileInfo{})
-	if err == nil || api.IsRetryableSourceError(err) {
-		t.Fatalf("error=%v retryable=%v, want permanent error", err, api.IsRetryableSourceError(err))
+	if err == nil || api.IsRetryableError(err) {
+		t.Fatalf("error=%v retryable=%v, want permanent error", err, api.IsRetryableError(err))
 	}
 }

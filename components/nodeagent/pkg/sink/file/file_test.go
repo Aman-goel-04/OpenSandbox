@@ -160,8 +160,8 @@ func TestDurableFilePermanentCapacityErrorsAreNonRetryable(t *testing.T) {
 			resource := api.Resource{SandboxID: "sb", ClusterName: "cluster", Namespace: "ns", PodUID: "uid", Container: "sandbox"}
 			batch := api.Batch{StreamRef: api.StreamRef{ID: "stream"}, Items: []api.BatchItem{{RecordID: "record", Record: api.Record{Kind: api.RecordKindContainerLog, Timestamp: time.Now().UTC(), Body: []byte("data"), Resource: resource, Attributes: map[string]string{"stream": "stdout"}}}}}
 			err = sink.Consume(context.Background(), batch)
-			if err == nil || api.IsRetryableSinkError(err) {
-				t.Fatalf("error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+			if err == nil || api.IsRetryableError(err) {
+				t.Fatalf("error=%v retryable=%v", err, api.IsRetryableError(err))
 			}
 		})
 	}
@@ -185,8 +185,8 @@ func TestDurableFileCapacityExhaustionIsRetryable(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = sink.Consume(context.Background(), batch)
-	if err == nil || !api.IsRetryableSinkError(err) {
-		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+	if err == nil || !api.IsRetryableError(err) {
+		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableError(err))
 	}
 }
 
@@ -208,8 +208,8 @@ func TestDurableFileGenerationLimitPrecedesRetryableCapacityError(t *testing.T) 
 	sink.writers["stream"] = &writer{stream: state.SinkStream{StreamRef: "stream", CurrentClosed: true}, resource: resource}
 	batch := api.Batch{StreamRef: api.StreamRef{ID: "stream"}, Items: []api.BatchItem{{RecordID: "record", Record: api.Record{Kind: api.RecordKindContainerLog, Timestamp: time.Now().UTC(), Body: []byte("data"), Resource: resource, Attributes: map[string]string{"stream": "stdout"}}}}}
 	err = sink.Consume(context.Background(), batch)
-	if err == nil || api.IsRetryableSinkError(err) || !strings.Contains(err.Error(), "generation limit") {
-		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+	if err == nil || api.IsRetryableError(err) || !strings.Contains(err.Error(), "generation limit") {
+		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableError(err))
 	}
 }
 
@@ -230,8 +230,8 @@ func TestDurableFileRejectsInconsistentBatchResources(t *testing.T) {
 	}}
 	batch.Items[1].Record.Resource.PodUID = "other-pod"
 	err = sink.Consume(context.Background(), batch)
-	if err == nil || api.IsRetryableSinkError(err) {
-		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+	if err == nil || api.IsRetryableError(err) {
+		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableError(err))
 	}
 }
 
@@ -253,8 +253,8 @@ func TestDurableFileRejectsPersistedObjectKeyOutsideStreamLayout(t *testing.T) {
 	}
 	batch := api.Batch{StreamRef: streamRef, Items: []api.BatchItem{{RecordID: "record", Record: api.Record{Resource: resource}}}}
 	err = sink.Consume(context.Background(), batch)
-	if err == nil || api.IsRetryableSinkError(err) || !strings.Contains(err.Error(), "object key") {
-		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+	if err == nil || api.IsRetryableError(err) || !strings.Contains(err.Error(), "object key") {
+		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableError(err))
 	}
 }
 
@@ -277,8 +277,8 @@ func TestDurableFileRejectsClosedObjectCountMismatchBeforeAppend(t *testing.T) {
 	}
 	batch := api.Batch{StreamRef: streamRef, Items: []api.BatchItem{{RecordID: "record", Record: api.Record{Resource: resource}}}}
 	err = sink.Consume(context.Background(), batch)
-	if err == nil || api.IsRetryableSinkError(err) || !strings.Contains(err.Error(), "closed objects") {
-		t.Fatalf("layout error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+	if err == nil || api.IsRetryableError(err) || !strings.Contains(err.Error(), "closed objects") {
+		t.Fatalf("layout error=%v retryable=%v", err, api.IsRetryableError(err))
 	}
 	if _, err := os.Stat(filepath.Join(root, "cluster", "ns", "sb", "uid", "sandbox.1.log")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("invalid checkpoint created a new generation: %v", err)
@@ -302,8 +302,8 @@ func TestDurableFileRejectsResourceChangeAcrossBatches(t *testing.T) {
 	}
 	batch.Items[0].Record.Resource.PodName = "different-pod"
 	err = sink.Consume(context.Background(), batch)
-	if err == nil || api.IsRetryableSinkError(err) || !strings.Contains(err.Error(), "resource identity changed") {
-		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+	if err == nil || api.IsRetryableError(err) || !strings.Contains(err.Error(), "resource identity changed") {
+		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableError(err))
 	}
 }
 
@@ -327,8 +327,8 @@ func TestDurableFileRejectsResourceChangeAtFinalize(t *testing.T) {
 	resource.PodName = "different-pod"
 	request := api.FinalizeRequest{FinalizeID: "final", TargetID: "target", StreamRef: streamRef, Revision: 1, CoverageStartedAt: time.Now().UTC().Add(-time.Minute).Truncate(time.Second), Resource: resource, FinalizedAt: time.Now().UTC()}
 	err = sink.Finalize(context.Background(), request)
-	if err == nil || api.IsRetryableSinkError(err) || !strings.Contains(err.Error(), "resource identity changed") {
-		t.Fatalf("finalize error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+	if err == nil || api.IsRetryableError(err) || !strings.Contains(err.Error(), "resource identity changed") {
+		t.Fatalf("finalize error=%v retryable=%v", err, api.IsRetryableError(err))
 	}
 	if _, err := os.Stat(filepath.Join(root, "cluster", "ns", "sb", "uid", "sandbox.finalized.1.json")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("resource mismatch published a marker: %v", err)
@@ -363,7 +363,13 @@ func TestDurableFileRecoversPartialAppendIntent(t *testing.T) {
 	replay := api.Batch{StreamRef: streamRef, Items: []api.BatchItem{{RecordID: "r2", Record: api.Record{Kind: api.RecordKindContainerLog, Timestamp: time.Date(2026, 7, 23, 10, 0, 1, 0, time.UTC), Body: []byte("second"), Resource: resource, Attributes: map[string]string{"stream": "stdout"}}}}}
 	encoded := lineBytes(replay)
 	digest := sha256.Sum256(encoded)
-	stream.AppendIntent = &state.AppendIntent{Position: stream.Position, Length: int64(len(encoded)), SHA256: hex.EncodeToString(digest[:]), Device: stream.Device, Inode: stream.Inode}
+	stream.AppendIntent = &state.AppendIntent{
+		Position: stream.Position,
+		Length:   int64(len(encoded)),
+		SHA256:   hex.EncodeToString(digest[:]),
+		Device:   stream.Device,
+		Inode:    stream.Inode,
+	}
 	if err := db.PutSinkStream(name, stream); err != nil {
 		t.Fatal(err)
 	}
@@ -744,8 +750,8 @@ func TestDurableFileCleanupCheckpointConflictsAreNonRetryable(t *testing.T) {
 
 			sink := &Sink{cfg: Config{Root: root}, state: db, writers: make(map[string]*writer)}
 			err = sink.CollectExpired(context.Background(), time.Now())
-			if err == nil || api.IsRetryableSinkError(err) {
-				t.Fatalf("CollectExpired() error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+			if err == nil || api.IsRetryableError(err) {
+				t.Fatalf("CollectExpired() error=%v retryable=%v", err, api.IsRetryableError(err))
 			}
 		})
 	}
@@ -791,8 +797,8 @@ func TestDurableFileCleanupContinuesAfterPoisonedStream(t *testing.T) {
 	}
 	sink := &Sink{cfg: Config{Root: root}, state: db, writers: make(map[string]*writer)}
 	err = sink.CollectExpired(context.Background(), time.Now())
-	if err == nil || api.IsRetryableSinkError(err) || !strings.Contains(err.Error(), poisonedRef) {
-		t.Fatalf("CollectExpired() error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+	if err == nil || api.IsRetryableError(err) || !strings.Contains(err.Error(), poisonedRef) {
+		t.Fatalf("CollectExpired() error=%v retryable=%v", err, api.IsRetryableError(err))
 	}
 	if _, found, err := db.GetSourceStream(cleanRef); err != nil || found {
 		t.Fatalf("clean source found=%v err=%v", found, err)
@@ -812,8 +818,8 @@ func TestStartNextGenerationRejectsOverflowedCheckpoint(t *testing.T) {
 	sink := &Sink{cfg: Config{MaxFiles: 2}}
 	w := &writer{stream: state.SinkStream{Generation: ^uint64(0)}}
 	err := sink.startNextGeneration(w)
-	if err == nil || api.IsRetryableSinkError(err) || !strings.Contains(err.Error(), "generation limit") {
-		t.Fatalf("startNextGeneration() error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+	if err == nil || api.IsRetryableError(err) || !strings.Contains(err.Error(), "generation limit") {
+		t.Fatalf("startNextGeneration() error=%v retryable=%v", err, api.IsRetryableError(err))
 	}
 }
 

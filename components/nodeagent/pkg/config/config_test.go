@@ -82,17 +82,37 @@ func TestValidateAbsolutePathRejectsSegmentsNotNames(t *testing.T) {
 	}
 }
 
-func TestValidateOSSEndpointRejectsCredentials(t *testing.T) {
-	if err := validateOSSEndpoint("https://oss.example.com"); err != nil {
-		t.Fatalf("validateOSSEndpoint() rejected a valid origin: %v", err)
+func TestLoadValidatesOSSEndpoint(t *testing.T) {
+	t.Setenv("NODE_NAME", "node-1")
+	t.Setenv("NODEAGENT_CLUSTER_ID", "prod-a")
+	t.Setenv("NODEAGENT_SINKS", SinkOSS)
+	t.Setenv("NODEAGENT_LOG_ROOT", t.TempDir())
+	t.Setenv("NODEAGENT_STATE_DIR", t.TempDir())
+	t.Setenv("NODEAGENT_OSS_ENDPOINT", "HTTPS://OSS.Example.COM:443/")
+	t.Setenv("NODEAGENT_OSS_BUCKET", "bucket")
+	t.Setenv("NODEAGENT_OSS_KEY_PREFIX", "logs")
+	t.Setenv("OSS_ACCESS_KEY_ID", "id")
+	t.Setenv("OSS_ACCESS_KEY_SECRET", "secret")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
 	}
-	for _, endpoint := range []string{
-		"https://user@oss.example.com",
-		"https://user:password@oss.example.com",
-	} {
-		if err := validateOSSEndpoint(endpoint); err == nil {
-			t.Fatalf("validateOSSEndpoint(%q) unexpectedly succeeded", endpoint)
-		}
+	if cfg.OSSEndpoint != "https://oss.example.com" {
+		t.Fatalf("OSS endpoint = %q", cfg.OSSEndpoint)
+	}
+	t.Setenv("NODEAGENT_OSS_ENDPOINT", "http://oss.example.com")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "NODEAGENT_OSS_ENDPOINT") {
+		t.Fatalf("Load() error = %v, want endpoint setting context", err)
+	}
+}
+
+func TestValidateAllowsCompiledExtensionNames(t *testing.T) {
+	cfg := validConfig()
+	cfg.Source = "custom-source"
+	cfg.Sink = "custom-sink"
+	if errs := cfg.validate(); len(errs) != 0 {
+		t.Fatalf("validate() rejected extension selectors: %v", errs)
 	}
 }
 
@@ -108,10 +128,8 @@ func validConfig() Config {
 		PerSandboxQueueBytes: 1024,
 		MaxLineBytes:         1,
 		DropPolicy:           "block",
-		BatchMaxItems:        1,
 		FileMaxFiles:         1,
 		ServerAddr:           ":8080",
-		ContainerNames:       []string{"sandbox"},
 	}
 }
 

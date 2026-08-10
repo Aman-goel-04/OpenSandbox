@@ -8,9 +8,11 @@ package containerlogs
 import (
 	"errors"
 	"os"
+
+	"github.com/alibaba/opensandbox/nodeagent/pkg/api"
 )
 
-var errUnsupportedFileIdentity = permanent(errors.New("container log fingerprinting is supported only on Linux and Darwin"))
+var errUnsupportedFileIdentity = api.Permanent(errors.New("container log fingerprinting is supported only on Linux and Darwin"))
 
 func sourceFileIdentity(os.FileInfo) (uint64, uint64, error) {
 	return 0, 0, errUnsupportedFileIdentity

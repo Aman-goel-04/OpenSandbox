@@ -37,7 +37,7 @@ func TestStoreStaleOnlyAfterThresholdAndClearsOnRelist(t *testing.T) {
 	if !s.Stale(time.Now().Add(2*time.Hour), time.Hour) {
 		t.Fatal("watch did not become stale after threshold")
 	}
-	s.markListSuccessful()
+	s.markWatchSuccessful()
 	if s.Stale(time.Now().Add(2*time.Hour), time.Hour) {
 		t.Fatal("successful relist did not clear stale state")
 	}

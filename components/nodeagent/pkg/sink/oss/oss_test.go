@@ -268,8 +268,8 @@ func TestParseObjectMetadataRejectsInvalidProtocolPositions(t *testing.T) {
 			header.Set("Content-Length", test.contentLength)
 			header.Set(aliyunoss.HTTPHeaderOssNextAppendPosition, test.nextPosition)
 			_, err := parseObjectMetadata(header)
-			if err == nil || api.IsRetryableSinkError(err) {
-				t.Fatalf("error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+			if err == nil || api.IsRetryableError(err) {
+				t.Fatalf("error=%v retryable=%v", err, api.IsRetryableError(err))
 			}
 		})
 	}
@@ -385,8 +385,8 @@ func TestOSSRecoversUnexpectedNextPosition(t *testing.T) {
 					t.Fatal(err)
 				}
 			} else {
-				if err == nil || !api.IsRetryableSinkError(err) {
-					t.Fatalf("first consume error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+				if err == nil || !api.IsRetryableError(err) {
+					t.Fatalf("first consume error=%v retryable=%v", err, api.IsRetryableError(err))
 				}
 				if _, cached := sink.streams[batch.StreamRef.ID]; cached {
 					t.Fatal("stream with an unresolved append result remained cached")
@@ -413,8 +413,8 @@ func TestOSSRejectsUnexpectedRemotePositionAsNonRetryable(t *testing.T) {
 	sink := newWithBackend(testOSSConfig(db), db, backend)
 	batch, _ := testOSSBatch()
 	err = sink.Consume(context.Background(), batch)
-	if err == nil || api.IsRetryableSinkError(err) || !strings.Contains(err.Error(), "position conflict") {
-		t.Fatalf("consume error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+	if err == nil || api.IsRetryableError(err) || !strings.Contains(err.Error(), "position conflict") {
+		t.Fatalf("consume error=%v retryable=%v", err, api.IsRetryableError(err))
 	}
 	if _, cached := sink.streams[batch.StreamRef.ID]; cached {
 		t.Fatal("conflicting stream remained cached")
@@ -469,8 +469,8 @@ func TestOSSRestartRejectsConflictingPosition(t *testing.T) {
 		t.Fatal(err)
 	}
 	sink := newWithBackend(cfg, db, backend)
-	if err := sink.Consume(context.Background(), batch); err == nil || api.IsRetryableSinkError(err) {
-		t.Fatalf("conflicting remote position error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+	if err := sink.Consume(context.Background(), batch); err == nil || api.IsRetryableError(err) {
+		t.Fatalf("conflicting remote position error=%v retryable=%v", err, api.IsRetryableError(err))
 	}
 }
 
@@ -498,8 +498,8 @@ func TestOSSRestartRejectsForeignZeroLengthObject(t *testing.T) {
 			backend.objects[key] = memoryObject{metadata: map[string]string{"nodeagent-writer-id": "foreign"}, objectType: appendableObjectType}
 			sink := newWithBackend(cfg, db, backend)
 			err = sink.Consume(context.Background(), batch)
-			if err == nil || api.IsRetryableSinkError(err) || !strings.Contains(err.Error(), "metadata") {
-				t.Fatalf("foreign zero-length object error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+			if err == nil || api.IsRetryableError(err) || !strings.Contains(err.Error(), "metadata") {
+				t.Fatalf("foreign zero-length object error=%v retryable=%v", err, api.IsRetryableError(err))
 			}
 			if len(backend.objects[key].data) != 0 {
 				t.Fatalf("foreign object was modified: %q", backend.objects[key].data)
@@ -544,8 +544,8 @@ func TestOSSRestartTreatsMissingCommittedObjectAsNonRetryable(t *testing.T) {
 	}
 	sink := newWithBackend(testOSSConfig(db), db, newFakeBackend())
 	err = sink.Consume(context.Background(), batch)
-	if err == nil || api.IsRetryableSinkError(err) || !strings.Contains(err.Error(), "missing") {
-		t.Fatalf("missing object error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+	if err == nil || api.IsRetryableError(err) || !strings.Contains(err.Error(), "missing") {
+		t.Fatalf("missing object error=%v retryable=%v", err, api.IsRetryableError(err))
 	}
 }
 
@@ -564,8 +564,8 @@ func TestOSSRejectsClosedObjectCountMismatchBeforeAppend(t *testing.T) {
 	}
 	sink := newWithBackend(testOSSConfig(db), db, backend)
 	err = sink.Consume(context.Background(), batch)
-	if err == nil || api.IsRetryableSinkError(err) || !strings.Contains(err.Error(), "closed objects") {
-		t.Fatalf("layout error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+	if err == nil || api.IsRetryableError(err) || !strings.Contains(err.Error(), "closed objects") {
+		t.Fatalf("layout error=%v retryable=%v", err, api.IsRetryableError(err))
 	}
 	if len(backend.objects) != 0 {
 		t.Fatalf("invalid checkpoint created objects: %+v", backend.objects)
@@ -659,7 +659,7 @@ func TestOSSRejectsBatchLargerThanObjectLimit(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "exceeds per-generation limit") {
 		t.Fatalf("consume error=%v", err)
 	}
-	if api.IsRetryableSinkError(err) {
+	if api.IsRetryableError(err) {
 		t.Fatalf("oversized batch error is retryable: %v", err)
 	}
 	if len(backend.objects) != 0 {
@@ -696,7 +696,7 @@ func TestOSSRejectsOversizedMetadataAsNonRetryable(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "metadata exceeds 8 KiB") {
 		t.Fatalf("consume error=%v", err)
 	}
-	if api.IsRetryableSinkError(err) {
+	if api.IsRetryableError(err) {
 		t.Fatalf("oversized metadata error is retryable: %v", err)
 	}
 	if len(backend.objects) != 0 {
@@ -780,7 +780,7 @@ func TestOSSDeterministicServiceErrorsAreNonRetryable(t *testing.T) {
 		{StatusCode: http.StatusBadRequest, Code: "InvalidObjectName"},
 	} {
 		err := classifyOSSError(serviceErr)
-		if api.IsRetryableSinkError(err) {
+		if api.IsRetryableError(err) {
 			t.Fatalf("service error %s remained retryable", serviceErr.Code)
 		}
 	}
@@ -790,7 +790,7 @@ func TestOSSDeterministicServiceErrorsAreNonRetryable(t *testing.T) {
 		{StatusCode: http.StatusInternalServerError, Code: "InternalError"},
 	} {
 		err := classifyOSSError(serviceErr)
-		if !api.IsRetryableSinkError(err) {
+		if !api.IsRetryableError(err) {
 			t.Fatalf("service error %s became non-retryable: %v", serviceErr.Code, err)
 		}
 	}
@@ -811,8 +811,8 @@ func TestOSSNoSuchBucketIsNotTreatedAsAMissingObject(t *testing.T) {
 	sink := newWithBackend(testOSSConfig(db), db, backend)
 	batch, _ := testOSSBatch()
 	err = sink.Consume(context.Background(), batch)
-	if err == nil || api.IsRetryableSinkError(err) || !strings.Contains(err.Error(), "NoSuchBucket") {
-		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+	if err == nil || api.IsRetryableError(err) || !strings.Contains(err.Error(), "NoSuchBucket") {
+		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableError(err))
 	}
 	if _, found, stateErr := db.GetSinkStream(name, batch.StreamRef.ID); stateErr != nil || found {
 		t.Fatalf("found=%v state error=%v", found, stateErr)
@@ -858,8 +858,8 @@ func TestOSSDeterministicAppendFailureStopsRetryingAtCommittedPosition(t *testin
 	backend.objects[key] = memoryObject{metadata: testOSSMetadata(cfg, batch.StreamRef, resource, 0), objectType: appendableObjectType}
 	sink := newWithBackend(cfg, db, backend)
 	err = sink.Consume(context.Background(), batch)
-	if err == nil || api.IsRetryableSinkError(err) || !strings.Contains(err.Error(), "ObjectNotAppendable") {
-		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+	if err == nil || api.IsRetryableError(err) || !strings.Contains(err.Error(), "ObjectNotAppendable") {
+		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableError(err))
 	}
 }
 
@@ -896,8 +896,8 @@ func TestOSSRejectsInvalidAppendObjectProtocolHeaders(t *testing.T) {
 			}
 			sink := newWithBackend(cfg, db, backend)
 			err = sink.Consume(context.Background(), batch)
-			if err == nil || api.IsRetryableSinkError(err) || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+			if err == nil || api.IsRetryableError(err) || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error=%v retryable=%v", err, api.IsRetryableError(err))
 			}
 		})
 	}
@@ -914,8 +914,8 @@ func TestOSSRejectsUnsafeObjectKeyResource(t *testing.T) {
 	batch, _ := testOSSBatch()
 	batch.Items[0].Record.Resource.Container = "../../escape"
 	err = sink.Consume(context.Background(), batch)
-	if err == nil || api.IsRetryableSinkError(err) {
-		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+	if err == nil || api.IsRetryableError(err) {
+		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableError(err))
 	}
 	if len(backend.objects) != 0 {
 		t.Fatalf("unsafe resource created objects: %+v", backend.objects)
@@ -934,8 +934,8 @@ func TestOSSRejectsOversizedDataObjectKeyBeforeCreatingState(t *testing.T) {
 	sink := newWithBackend(cfg, db, backend)
 	batch, _ := testOSSBatch()
 	err = sink.Consume(context.Background(), batch)
-	if err == nil || api.IsRetryableSinkError(err) || !strings.Contains(err.Error(), "object key") {
-		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+	if err == nil || api.IsRetryableError(err) || !strings.Contains(err.Error(), "object key") {
+		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableError(err))
 	}
 	if _, found, stateErr := db.GetSinkStream(name, batch.StreamRef.ID); stateErr != nil || found {
 		t.Fatalf("found=%v state error=%v", found, stateErr)
@@ -964,8 +964,8 @@ func TestOSSRejectsObjectFamilyWhoseFutureMarkerKeyWouldBeOversized(t *testing.T
 	}
 	sink := newWithBackend(cfg, db, backend)
 	err = sink.Consume(context.Background(), batch)
-	if err == nil || api.IsRetryableSinkError(err) || !strings.Contains(err.Error(), "object key") {
-		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+	if err == nil || api.IsRetryableError(err) || !strings.Contains(err.Error(), "object key") {
+		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableError(err))
 	}
 	if _, found, stateErr := db.GetSinkStream(name, batch.StreamRef.ID); stateErr != nil || found {
 		t.Fatalf("found=%v state error=%v", found, stateErr)
@@ -978,8 +978,8 @@ func TestOSSRejectsObjectFamilyWhoseFutureMarkerKeyWouldBeOversized(t *testing.T
 func TestOSSObjectKeyValidationRejectsInvalidEncodingAndLeadingSeparators(t *testing.T) {
 	for _, key := range []string{"/leading-slash", `\leading-backslash`, string([]byte{0xff})} {
 		err := validateOSSObjectKey(key)
-		if err == nil || api.IsRetryableSinkError(err) {
-			t.Fatalf("key=%q error=%v retryable=%v", key, err, api.IsRetryableSinkError(err))
+		if err == nil || api.IsRetryableError(err) {
+			t.Fatalf("key=%q error=%v retryable=%v", key, err, api.IsRetryableError(err))
 		}
 	}
 }
@@ -997,8 +997,8 @@ func TestOSSRejectsInconsistentBatchResources(t *testing.T) {
 	second.Record.Resource.PodUID = "other-pod"
 	batch.Items = append(batch.Items, second)
 	err = sink.Consume(context.Background(), batch)
-	if err == nil || api.IsRetryableSinkError(err) {
-		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+	if err == nil || api.IsRetryableError(err) {
+		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableError(err))
 	}
 }
 
@@ -1014,8 +1014,8 @@ func TestOSSRejectsPersistedObjectKeyOutsideStreamLayout(t *testing.T) {
 	}
 	sink := newWithBackend(testOSSConfig(db), db, newFakeBackend())
 	err = sink.Consume(context.Background(), batch)
-	if err == nil || api.IsRetryableSinkError(err) || !strings.Contains(err.Error(), "object key") {
-		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+	if err == nil || api.IsRetryableError(err) || !strings.Contains(err.Error(), "object key") {
+		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableError(err))
 	}
 }
 
@@ -1030,8 +1030,8 @@ func TestOSSRejectsForeignMetadataAfterUnknownAppend(t *testing.T) {
 	sink := newWithBackend(testOSSConfig(db), db, backend)
 	batch, _ := testOSSBatch()
 	err = sink.Consume(context.Background(), batch)
-	if err == nil || api.IsRetryableSinkError(err) || !strings.Contains(err.Error(), "stream-ref") {
-		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+	if err == nil || api.IsRetryableError(err) || !strings.Contains(err.Error(), "stream-ref") {
+		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableError(err))
 	}
 }
 
@@ -1063,8 +1063,8 @@ func TestOSSRetryAfterFinalCheckpointFailureUsesPersistedIntent(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-			} else if err == nil || api.IsRetryableSinkError(err) || !strings.Contains(err.Error(), "persisted intent") {
-				t.Fatalf("retry error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+			} else if err == nil || api.IsRetryableError(err) || !strings.Contains(err.Error(), "persisted intent") {
+				t.Fatalf("retry error=%v retryable=%v", err, api.IsRetryableError(err))
 			}
 			if got := backend.objects[objectKey("logs", resource, 0)].data; !bytes.Equal(got, original) {
 				t.Fatalf("retry changed remote bytes: got=%q want=%q", got, original)
@@ -1086,8 +1086,8 @@ func TestOSSRejectsResourceChangeAcrossBatches(t *testing.T) {
 	}
 	batch.Items[0].Record.Resource.PodName = "different-pod"
 	err = sink.Consume(context.Background(), batch)
-	if err == nil || api.IsRetryableSinkError(err) || !strings.Contains(err.Error(), "resource identity changed") {
-		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+	if err == nil || api.IsRetryableError(err) || !strings.Contains(err.Error(), "resource identity changed") {
+		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableError(err))
 	}
 }
 
@@ -1101,8 +1101,8 @@ func TestOSSRejectsUnsafeMetadataValue(t *testing.T) {
 	batch, _ := testOSSBatch()
 	batch.Items[0].Record.Resource.NodeName = "node\r\ninjected: value"
 	err = sink.Consume(context.Background(), batch)
-	if err == nil || api.IsRetryableSinkError(err) || !strings.Contains(err.Error(), "non-visible-ASCII") {
-		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableSinkError(err))
+	if err == nil || api.IsRetryableError(err) || !strings.Contains(err.Error(), "non-visible-ASCII") {
+		t.Fatalf("error=%v retryable=%v", err, api.IsRetryableError(err))
 	}
 }
 

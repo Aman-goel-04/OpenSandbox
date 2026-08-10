@@ -52,3 +52,31 @@ func TestOSSTargetRejectsNonOrigin(t *testing.T) {
 		}
 	}
 }
+
+func TestCanonicalOSSEndpoint(t *testing.T) {
+	for _, test := range []struct {
+		raw  string
+		want string
+	}{
+		{raw: "HTTPS://OSS.Example.COM:443/", want: "https://oss.example.com"},
+		{raw: "https://[2001:DB8::1]:443/", want: "https://[2001:db8::1]"},
+		{raw: "https://OSS.Example.COM:8443/", want: "https://oss.example.com:8443"},
+	} {
+		got, err := CanonicalOSSEndpoint(test.raw)
+		if err != nil || got != test.want {
+			t.Fatalf("CanonicalOSSEndpoint(%q) = %q, %v; want %q", test.raw, got, err, test.want)
+		}
+	}
+	for _, endpoint := range []string{
+		"http://oss.example.com",
+		"https://user:password@oss.example.com",
+		"https://oss.example.com/path",
+		"https://oss.example.com?query=value",
+		"https://oss.example.com#fragment",
+		"https://:443",
+	} {
+		if _, err := CanonicalOSSEndpoint(endpoint); err == nil {
+			t.Fatalf("CanonicalOSSEndpoint(%q) unexpectedly succeeded", endpoint)
+		}
+	}
+}
