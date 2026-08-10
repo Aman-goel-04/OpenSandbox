@@ -375,10 +375,16 @@ func ptyViewerWebSocket(ctx *gin.Context, session runtime.PTYSession, id string)
 		return
 	}
 
-	// The exit watcher waits for the viewer pump to flush its final replay
-	// snapshot. Without this handoff, a short-lived shell can close doneCh before
-	// the pump handles its last changed notification, dropping trailing output.
+	// The exit watcher waits for the viewer pump to flush after the runtime's
+	// output broadcasters finish. This prevents a short-lived pipe-mode shell
+	// from closing doneCh while stdout or stderr is still being appended to replay.
 	viewerOutputDrained := make(chan struct{})
+	outputDoneCh := session.Done()
+	if outputSession, ok := session.(interface{ OutputDone() <-chan struct{} }); ok {
+		if ch := outputSession.OutputDone(); ch != nil {
+			outputDoneCh = ch
+		}
+	}
 	workerWg.Add(3)
 	safego.Go(func() {
 		defer workerWg.Done()
@@ -386,7 +392,7 @@ func ptyViewerWebSocket(ctx *gin.Context, session runtime.PTYSession, id string)
 	})
 	safego.Go(func() {
 		defer workerWg.Done()
-		ptyViewerStreamPump(session, nextOffset, changed, session.Done(), viewerOutputDrained, id, conn, &connMu, cancelCh, cancelOnce)
+		ptyViewerStreamPump(session, nextOffset, changed, outputDoneCh, viewerOutputDrained, id, conn, &connMu, cancelCh, cancelOnce)
 	})
 	safego.Go(func() {
 		defer workerWg.Done()
@@ -403,7 +409,7 @@ func ptyViewerStreamPump(
 	session runtime.PTYSession,
 	nextOffset int64,
 	changed <-chan struct{},
-	doneCh <-chan struct{},
+	outputDoneCh <-chan struct{},
 	outputDrained chan<- struct{},
 	id string,
 	conn *websocket.Conn,
@@ -439,7 +445,7 @@ func ptyViewerStreamPump(
 			if !drain() {
 				return
 			}
-		case <-doneCh:
+		case <-outputDoneCh:
 			if !drain() {
 				return
 			}

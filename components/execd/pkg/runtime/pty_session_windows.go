@@ -85,6 +85,7 @@ func (s *ptySession) IsRunning() bool                              { return fals
 func (s *ptySession) IsPTY() bool                                  { return false }
 func (s *ptySession) ExitCode() int                                { return -1 }
 func (s *ptySession) Done() <-chan struct{}                        { return nil }
+func (s *ptySession) OutputDone() <-chan struct{}                  { return nil }
 func (s *ptySession) ReplayBuffer() *replayBuffer                  { return nil }
 func (s *ptySession) StartPTY() error                              { return errPTYSessionNotSupported }
 func (s *ptySession) StartPipe() error                             { return errPTYSessionNotSupported }
