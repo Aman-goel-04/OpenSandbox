@@ -1370,6 +1370,26 @@ class TestEnsurePvcVolumes:
         assert exc_info.value.status_code == 500
         k8s_service.k8s_client.create_pvc.assert_not_called()
 
+    def test_pvc_create_server_error_returns_internal_error(self, k8s_service):
+        """Unexpected PVC create errors must stay structured HTTP failures."""
+        from kubernetes.client import ApiException
+
+        k8s_service.k8s_client.get_pvc.return_value = None
+        k8s_service.k8s_client.create_pvc.side_effect = ApiException(
+            status=500, reason="Internal Server Error"
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            k8s_service._ensure_pvc_volumes(
+                [self._make_volume("data-claim")], sandbox_id="sandbox-xyz"
+            )
+
+        assert exc_info.value.status_code == 500
+        assert exc_info.value.detail == {
+            "code": SandboxErrorCodes.INTERNAL_ERROR,
+            "message": "Failed to auto-create PVC 'data-claim': Internal Server Error",
+        }
+
     def test_create_race_409_fails_closed_when_winner_pvc_already_gone(
         self, k8s_service
     ):
