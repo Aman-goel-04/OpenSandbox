@@ -90,6 +90,23 @@ helm install opensandbox-server ./kubernetes/charts/opensandbox-server \
 
 Optional: override gateway image, replicas, or resources (see `server.gateway.*` in Configuration).
 
+### OSEP-0011 secure-access keys
+
+To enable signed, expiring sandbox routes, provide the signing keys either
+inline (plaintext in values — fine for local dev only):
+
+```bash
+--set server.gateway.secureAccess.activeKey=a \
+--set 'server.gateway.secureAccess.keys[0].key_id=a' \
+--set 'server.gateway.secureAccess.keys[0].key=<base64-secret>'
+```
+
+or from an existing Secret (`server.gateway.secureAccess.existingSecret`) with
+two data entries: `keys` (`a=<base64-secret>[,b=...]`) and `active-key` (`a`).
+The chart delivers the Secret to the server and gateway containers as
+environment variables, so key material stays out of values, the server
+ConfigMap, and pod args. The two forms are mutually exclusive.
+
 ## Configuration
 
 | Parameter | Description | Default |
@@ -105,6 +122,8 @@ Optional: override gateway image, replicas, or resources (see `server.gateway.*`
 | `server.gateway.host` | config `gateway.address` (address returned to clients) | `opensandbox.example.com` |
 | `server.gateway.gatewayRouteMode` | server config and gateway route mode (header/uri) | `header` |
 | `server.gateway.env` | Additional environment variables for the ingress-gateway container (e.g. `OTEL_EXPORTER_OTLP_ENDPOINT`) | `[]` |
+| `server.gateway.secureAccess.keys` | OSEP-0011 signing key ring, plaintext in values | `[]` |
+| `server.gateway.secureAccess.existingSecret` | Name of a Secret holding `keys` + `active-key`; alternative to plaintext `keys` | `""` |
 | `server.gateway.*` | Gateway image, replicas, port, dataplaneNamespace, providerType, resources | See values.yaml |
 
 Versioning note:
