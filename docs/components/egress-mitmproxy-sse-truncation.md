@@ -79,3 +79,15 @@ There is no code fix in mitmproxy or OpenSandbox that prevents this — the byte
 - **Prefer keep-alive**: complete the chunked body with `0\r\n\r\n` and keep the connection open instead of closing after every response.
 - **Verify in the field**: if sandboxes still truncate, capture the connection state / packets at the gateway (`ss -t` for `RST` states, tcpdump for RST flags) to confirm the upstream is resetting.
 - **Use HTTP/2 upstreams** for large streaming responses where possible (h2 framing is not close-delimited and is unaffected).
+
+### Why not a bigger read buffer on the egress side?
+
+Measured (4 MiB SSE event, RST-closing upstream, 6 runs per cell):
+
+| Upstream pacing (simulated network rate) | Loss with 64 KiB reads | Loss with 1 MiB reads |
+|---|---|---|
+| Burst (loopback-like) | ~188 KiB | ~117 KiB |
+| ~128 MB/s (0.5 ms / 64 KiB) | 8 B | 8 B |
+| ~32 MB/s (2 ms / 64 KiB) | 8 B | 8 B |
+
+Faster reads shrink the loss window at burst rate, and on any realistically paced path the loss collapses to the last few bytes — but even those few bytes cut the trailing SSE event, so the client stream breaks either way. The mitigation does not change the user-visible outcome, so no patch is shipped.
