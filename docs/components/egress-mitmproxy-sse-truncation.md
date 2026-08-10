@@ -77,6 +77,16 @@ There is no code fix in mitmproxy or OpenSandbox that prevents this — the byte
 
 ### 1. Confirm the gateway is sending RST
 
+The A/B/C experiment below is the definitive confirmation that **RST vs FIN on the upstream close is the only variable that matters** (identical server code, payload, proxy and client in all three cells):
+
+| Variant | Upstream close behavior | mitmproxy's TCP signature | Client result (via mitmproxy) |
+|---|---|---|---|
+| A | Closes with unread request data → kernel RST | `ConnectionResetError` (ECONNRESET) | Truncated, 5/5 |
+| B | Consumes the request, closes → clean FIN | clean EOF | Complete, 5/5 |
+| C | Consumes the request + `SO_LINGER=0` (forces RST with an empty receive buffer) | `ConnectionResetError` (ECONNRESET) | Truncated, 4/5 |
+
+Cell C is the smoking gun: even with **no** unread data, forcing the close to be a RST reproduces the truncation; switching the close to a FIN makes it disappear. A direct, slow-reading client (no proxy) loses the whole body against the A server and nothing against the B server — the loss is purely a function of how much of the tail is still unread when the RST lands.
+
 Run these on (or in front of) the gateway while a sandbox reproduces the truncation:
 
 ```bash
