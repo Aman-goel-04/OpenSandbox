@@ -235,7 +235,8 @@ func TestPTYWS_ConcurrentViewersReceiveReplayAndLiveOutput(t *testing.T) {
 	viewer2 := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "mode=viewer&since=0")
 	for _, viewer := range []*websocket.Conn{viewer1, viewer2} {
 		ptyOutputContains(t, viewer, "viewer_replay_marker", 8*time.Second)
-		ptyWaitFrame(t, viewer, "connected", 8*time.Second)
+		f := ptyWaitFrame(t, viewer, "connected", 8*time.Second)
+		require.Equal(t, "viewer", f.Role)
 	}
 
 	// Viewers do not release or replace the exclusive read/write holder.
@@ -291,6 +292,28 @@ func TestPTYWS_ViewerRejectsMutatingFrames(t *testing.T) {
 	ptyOutputContains(t, holder, "24 80", 8*time.Second)
 }
 
+func TestPTYWS_ViewerClosesAfterReadOnlyViolationLimit(t *testing.T) {
+	requireBash(t)
+	srv := newPTYTestServer(t)
+	defer srv.Close()
+
+	id := ptyCreateSession(t, srv)
+	holder := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "")
+	ptyWaitFrame(t, holder, "connected", 10*time.Second)
+	viewer := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "mode=viewer")
+	ptyWaitFrame(t, viewer, "connected", 8*time.Second)
+
+	for range ptyViewerReadOnlyViolationLimit {
+		ptyWriteStdin(t, viewer, "ignored\n")
+		f := ptyWaitFrame(t, viewer, "error", 5*time.Second)
+		require.Equal(t, model.WSErrCodeReadOnly, f.Code)
+	}
+
+	_ = viewer.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, _, err := viewer.ReadMessage()
+	require.Error(t, err, "viewer should close after repeated read-only violations")
+}
+
 func TestPTYWS_ViewerDisconnectDoesNotAffectSessionOrOtherViewers(t *testing.T) {
 	requireBash(t)
 	srv := newPTYTestServer(t)
@@ -340,6 +363,7 @@ func TestPTYWS_ViewerPipeModeReceivesCombinedOutput(t *testing.T) {
 	viewer := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "mode=viewer")
 	f = ptyWaitFrame(t, viewer, "connected", 8*time.Second)
 	require.Equal(t, "pipe", f.Mode)
+	require.Equal(t, "viewer", f.Role)
 
 	ptyWriteStdin(t, holder, "echo viewer_pipe_output\n")
 	ptyOutputContains(t, viewer, "viewer_pipe_output", 8*time.Second)
@@ -357,6 +381,7 @@ func TestPTYWS_ConnectedFramePTYMode(t *testing.T) {
 	require.Equal(t, "connected", f.Type)
 	require.Equal(t, id, f.SessionID)
 	require.Equal(t, "pty", f.Mode)
+	require.Equal(t, "holder", f.Role)
 }
 
 func TestPTYWS_StdinForwarding(t *testing.T) {

@@ -28,6 +28,7 @@ type ServerFrame struct {
 	Type      string `json:"type"`
 	SessionID string `json:"session_id,omitempty"`
 	Mode      string `json:"mode,omitempty"`
+	Role      string `json:"role,omitempty"`
 	Data      string `json:"data,omitempty"`
 	Offset    int64  `json:"offset,omitempty"`
 	ExitCode  *int   `json:"exit_code,omitempty"`

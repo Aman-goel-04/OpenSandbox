@@ -251,6 +251,7 @@ func PTYSessionWebSocket(ctx *gin.Context) {
 		Type:      "connected",
 		SessionID: id,
 		Mode:      mode,
+		Role:      "holder",
 	}); err2 != nil {
 		log.Warn("pty ws send connected for session %s: %v", id, err2)
 		return
@@ -368,6 +369,7 @@ func ptyViewerWebSocket(ctx *gin.Context, session runtime.PTYSession, id string)
 		Type:      "connected",
 		SessionID: id,
 		Mode:      mode,
+		Role:      "viewer",
 	}); err2 != nil {
 		log.Warn("pty viewer ws send connected for session %s: %v", id, err2)
 		return
@@ -429,22 +431,33 @@ func ptyViewerStreamPump(
 	}
 }
 
+const ptyViewerReadOnlyViolationLimit = 5
+
 // ptyViewerClientReadLoop accepts ping frames but rejects every operation that
-// could mutate the session. The connection stays open after a READ_ONLY error.
+// could mutate the session. It closes a connection that repeatedly sends
+// mutating frames to bound server-to-client error traffic.
 func ptyViewerClientReadLoop(
 	conn *websocket.Conn,
 	writeJSON func(any) error,
 	cancelCh <-chan struct{},
 	cancelOnce func(),
 ) {
-	readOnlyError := func() {
+	readOnlyViolations := 0
+	readOnlyError := func() bool {
+		readOnlyViolations++
 		if err := writeJSON(model.ServerFrame{
 			Type:  "error",
 			Code:  model.WSErrCodeReadOnly,
 			Error: "viewer connections are read-only",
 		}); err != nil {
 			cancelOnce()
+			return false
 		}
+		if readOnlyViolations >= ptyViewerReadOnlyViolationLimit {
+			cancelOnce()
+			return false
+		}
+		return true
 	}
 
 	for {
@@ -464,7 +477,9 @@ func ptyViewerClientReadLoop(
 		switch msgType {
 		case websocket.BinaryMessage:
 			if len(data) > 0 && data[0] == model.BinStdin {
-				readOnlyError()
+				if !readOnlyError() {
+					return
+				}
 			}
 		case websocket.TextMessage:
 			var frame model.ClientFrame
@@ -473,7 +488,9 @@ func ptyViewerClientReadLoop(
 			}
 			switch frame.Type {
 			case "stdin", "signal", "resize":
-				readOnlyError()
+				if !readOnlyError() {
+					return
+				}
 			case "ping":
 				if err := writeJSON(model.ServerFrame{Type: "pong"}); err != nil {
 					cancelOnce()

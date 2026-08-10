@@ -86,12 +86,24 @@ ws://localhost:44772/pty/{session_id}/ws?mode=viewer&since=0
 ```
 
 Viewer connections receive the retained replay followed by live output, but
-they never acquire or evict the read/write holder. Binary stdin and JSON
-`stdin`, `signal`, or `resize` frames are rejected with a `READ_ONLY` error;
-`ping` remains available. WebSocket backpressure from a slow or disconnected
-viewer does not block the interactive holder's live output pipe. In pipe mode,
-viewer output uses the combined replay stream because replay does not preserve
-stdout/stderr channel boundaries.
+they never acquire or evict the read/write holder. The JSON `connected` frame
+sets `role` to `viewer` (holders receive `role: "holder"`) so clients can use
+the appropriate binary-frame decoder. Holders receive `0x01` stdout and, in
+pipe mode, `0x02` stderr frames. Viewers receive `0x03` replay frames for both
+retained and live output: an 8-byte big-endian offset followed by raw bytes.
+
+Binary stdin and JSON `stdin`, `signal`, or `resize` frames are rejected with
+a `READ_ONLY` error; `ping` remains available. The server closes a viewer after
+five rejected mutating frames to bound error traffic from a misbehaving client.
+WebSocket backpressure from a slow or disconnected viewer does not block the
+interactive holder's live output pipe. In pipe mode, viewer output uses the
+combined replay stream because replay does not preserve stdout/stderr channel
+boundaries.
+
+A viewer can attach only while the shell is running. When the shell exits,
+viewers receive the `exit` frame and close. If a holder later starts the same
+session again, its bounded replay buffer is retained, so a viewer reconnecting
+with `since=0` can receive retained output from the preceding shell lifetime.
 
 ## Isolated Sessions
 
