@@ -14,44 +14,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Repro/regression test for: large SSE bodies are truncated at the tail when
-# the upstream closes the connection with unread request data in its receive
-# buffer, causing the kernel to send TCP RST which flushes the receiver's
-# kernel receive buffer (RFC 793). This is standard TCP behavior, not a
-# mitmproxy bug.
+# Repro/regression test: upstream closes with unread request data -> kernel
+# sends TCP RST -> RST flushes the receiver's kernel buffer -> the SSE tail is
+# lost and the client stream is truncated. Standard TCP behavior (RFC 793),
+# not a mitmproxy bug. See docs/components/egress-mitmproxy-sse-truncation.md.
 #
-# The default (TLS upstream, "speaks first", immediate close) reproduces the
-# truncation: the client sees a truncated SSE stream and mitmdump logs
-# "HTTP/1 protocol error: ... incomplete chunked read". Controls that must
-# NOT truncate: --plain (still RST, but the plain client path drains the
-# kernel fast enough), --delay-close 1 (server keeps the socket open, so the
-# request bytes are consumed and the close is a clean FIN), and a server that
-# reads the request first (--read-request; clean FIN, never truncates).
-#
-# See docs/components/egress-mitmproxy-sse-truncation.md for background.
+# Default mode (TLS upstream, "speaks first", immediate close) reproduces the
+# truncation. Controls that must NOT truncate: --plain, --delay-close 1,
+# --read-request (clean FIN).
 #
 # Usage:
 #   ./tests/mitm-sse-truncation/run.sh
 #
 # Options:
 #   --size BYTES          SSE event payload size (default 4194304; truncation
-#                         is reliable at >= 4 MiB, smaller sizes are
-#                         timing-dependent)
+#                         reliable at >= 4 MiB, smaller is timing-dependent)
 #   --iterations N        client runs per mode (default 4)
-#   --delay-close SECONDS keep the upstream connection open for SECONDS after
-#                         the body before closing (default 0; a positive
-#                         value is a control that must not truncate)
-#   --plain               run the plain-TCP control instead of the TLS repro
-#   --read-request        upstream that reads the request first (clean FIN,
-#                         control that must not truncate)
-#   --probe               load probe.py so the error hook is visible in the log
+#   --delay-close SECONDS keep the upstream open SECONDS after the body
+#                         (default 0; positive value is a control)
+#   --plain               plain-TCP control instead of the TLS repro
+#   --read-request        upstream reads the request first (clean-FIN control)
+#   --probe               load probe.py to surface the error hook in the log
 #   --mitmdump PATH       path to the mitmdump binary (default: from PATH)
 #   --port N              mitmdump listen port (default 19080)
 #   --upstream-port N     upstream SSE server port (default 19011)
 #   --workdir DIR         scratch dir for certs/logs (default: mktemp -d)
 #   --keep-workdir        do not remove the scratch dir on exit
 #
-# Requires: python3, openssl, mitmdump (any 10+/11.x version).
+# Requires: python3, openssl, mitmdump.
 #
 # Exit status: 0 if every client run matched the expected outcome
 # (TRUNCATED for the TLS repro, OK for the controls), 1 otherwise.
@@ -122,7 +112,12 @@ else
   # awk performs the float comparison bash cannot do (e.g. --delay-close 0.5)
   if awk -v v="$DELAY_CLOSE" 'BEGIN{exit !(v>0)}'; then EXPECT="OK"; else EXPECT="TRUNCATED"; fi
   UPSTREAM_ARGS=(--delay-close "$DELAY_CLOSE" --cert "$CERT" --key "$KEY")
-  [[ "$READ_REQUEST" -eq 1 ]] && UPSTREAM_ARGS+=(--read-request)
+  if [[ "$READ_REQUEST" -eq 1 ]]; then
+    # clean-FIN control: must not truncate
+    UPSTREAM_ARGS+=(--read-request)
+    EXPECT="OK"
+    MODE_LABEL="TLS HTTP/1.1 upstream, reads request first (clean-FIN control)"
+  fi
 fi
 
 if [[ ! "$DELAY_CLOSE" =~ ^[0-9]*\.?[0-9]+$ ]]; then

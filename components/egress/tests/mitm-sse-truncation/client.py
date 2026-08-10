@@ -15,9 +15,8 @@
 
 """Client for the mitmproxy truncation repro (tests/mitm-sse-truncation).
 
-Connects through a mitmdump instance in regular mode, requests the SSE
-stream from upstream_server.py, de-chunks the response and verifies that
-the full expected body plus the terminating chunk arrived.
+Requests the SSE stream from upstream_server.py through a local mitmdump
+(regular mode), de-chunks the response and verifies the full body arrived.
 
 Prints one line: `<encoded-bytes> bytes, <chunks> chunks, <data-bytes> data,
 terminated=<yes|no>, expected=<n> -> OK|TRUNCATED` and exits 0 on OK.

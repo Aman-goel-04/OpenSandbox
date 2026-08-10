@@ -14,16 +14,14 @@
 
 """Diagnostic mitmproxy addon for the SSE truncation repro.
 
-Logs the responseheaders/response/error hooks of each flow so the truncation
-root cause (an HTTP/1 protocol error instead of a clean response end) is
+Logs the responseheaders/response/error hooks so the truncation signature is
 visible in the mitmdump log:
 
     PROBE error hook fired: HTTP/1 protocol error: peer closed connection
     without sending complete message body (incomplete chunked read)
 
-This is the symptom of an upstream that closes its connection with unread
-request data (kernel sends TCP RST, which flushes the receiver's kernel
-receive buffer and loses the tail of the response) — see the repro README.
+This is the symptom of an upstream closing with unread request data (TCP RST
+flushes the receiver's kernel buffer and loses the response tail).
 
 Load with: mitmdump ... -s probe.py
 """

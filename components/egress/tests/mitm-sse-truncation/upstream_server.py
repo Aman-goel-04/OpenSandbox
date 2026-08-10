@@ -13,19 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SSE upstream used by the mitmproxy truncation repro (tests/mitm-sse-truncation).
+"""SSE upstream for the mitmproxy truncation repro (tests/mitm-sse-truncation).
 
-Serves a single large SSE event over HTTP/1.1 and closes the connection,
-optionally after a delay. TLS and plain-TCP variants are supported.
-
-By default the response is sent immediately after the TLS handshake without
-waiting for the request ("server speaks first"). Closing the connection while
-the client's request is still unread in the receive buffer makes the kernel
-send TCP RST instead of a clean FIN; the RST discards the receiver's kernel
-receive buffer, so the tail of the response is lost and the client's SSE
-stream is truncated (mitmproxy reports "incomplete chunked read"). This is
-standard TCP behavior, not a mitmproxy bug — a server that reads the request
-and closes cleanly (--read-request) never truncates.
+Serves a single large SSE event over HTTP/1.1 and closes the connection.
+By default the response is sent without reading the client's request, so the
+close happens with unread data in the receive buffer and the kernel sends TCP
+RST — which flushes the receiver's kernel receive buffer and truncates the
+SSE stream (standard TCP semantics, not a mitmproxy bug). --read-request
+consumes the request first, making the close a clean FIN that never truncates.
 
 See docs/components/egress-mitmproxy-sse-truncation.md.
 """
