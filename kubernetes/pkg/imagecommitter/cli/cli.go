@@ -174,8 +174,17 @@ func shouldUseInsecureRegistry(targetImage string, errorOutput io.Writer) bool {
 	return shouldUseInsecureRegistryEnv(targetImage, "SNAPSHOT_REGISTRY_INSECURE", errorOutput)
 }
 
-func shouldUseInsecureSourceRegistry(sourceImage string, errorOutput io.Writer) bool {
-	return shouldUseInsecureRegistryEnv(sourceImage, "SOURCE_IMAGE_REGISTRY_INSECURE", errorOutput)
+func shouldUseInsecureSourceRegistry(_ string, errorOutput io.Writer) bool {
+	raw := strings.TrimSpace(os.Getenv("SOURCE_IMAGE_REGISTRY_INSECURE"))
+	if raw == "" {
+		return false
+	}
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		fmt.Fprintf(errorOutput, "WARNING: invalid SOURCE_IMAGE_REGISTRY_INSECURE=%q; using secure transport\n", raw)
+		return false
+	}
+	return value
 }
 
 func shouldUseInsecureRegistryEnv(imageReference, environmentVariable string, errorOutput io.Writer) bool {

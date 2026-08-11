@@ -15,6 +15,7 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -117,10 +118,33 @@ func TestShouldUseInsecureRegistry(t *testing.T) {
 			t.Fatal("source registry must not inherit the snapshot target policy")
 		}
 	})
+	t.Run("source defaults to secure transport", func(t *testing.T) {
+		t.Setenv("SOURCE_IMAGE_REGISTRY_INSECURE", "")
+		for _, source := range []string{
+			"registry.local/source:test",
+			"10.0.0.2:5000/source:test",
+			"172.16.0.2:5000/source:test",
+			"192.168.0.2:5000/source:test",
+		} {
+			if shouldUseInsecureSourceRegistry(source, os.Stderr) {
+				t.Fatalf("source registry %q should use secure transport by default", source)
+			}
+		}
+	})
 	t.Run("explicit source insecure", func(t *testing.T) {
 		t.Setenv("SOURCE_IMAGE_REGISTRY_INSECURE", "true")
 		if !shouldUseInsecureSourceRegistry("registry.example.com/source:test", os.Stderr) {
 			t.Fatal("explicit source policy should enable insecure transport")
+		}
+	})
+	t.Run("invalid source policy fails closed", func(t *testing.T) {
+		t.Setenv("SOURCE_IMAGE_REGISTRY_INSECURE", "invalid")
+		var warnings bytes.Buffer
+		if shouldUseInsecureSourceRegistry("registry.local/source:test", &warnings) {
+			t.Fatal("invalid source policy should use secure transport")
+		}
+		if warnings.Len() == 0 {
+			t.Fatal("invalid source policy should emit a warning")
 		}
 	})
 }
