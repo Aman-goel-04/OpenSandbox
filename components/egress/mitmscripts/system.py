@@ -33,6 +33,13 @@
 #      the same ignore_hosts patterns against the SNI hostname at the
 #      tls_clienthello layer and sets ignore_connection=True when a match is
 #      found, ensuring domain-based TLS pass-through works reliably.
+#   4. Passes through TLS connections that carry no SNI. Without a hostname,
+#      upstream hostname verification falls back to the destination IP, which
+#      fails for any public certificate lacking an IP SAN (hostname mismatch),
+#      so every no-SNI connection would otherwise become a broken MITM attempt.
+#      Pass-through is skipped when ssl_insecure is enabled, keeping the
+#      explicit insecure-MITM escape hatch working for no-SNI clients.
+#      TCP-layer enforcement (deny/allow rules) still applies to these flows.
 #
 # User-defined addons can be loaded alongside this script via
 # OPENSANDBOX_EGRESS_MITMPROXY_SCRIPT (comma-separated for multiple scripts).
@@ -108,9 +115,21 @@ def tls_clienthello(data: ClientHelloData) -> None:
     destination IP:port before the TLS handshake.  If the check fails at
     that stage (SNI not yet available), we get a second chance here with
     the actual hostname from the ClientHello SNI extension.
+
+    Connections without SNI cannot be matched against hostname patterns and
+    cannot be safely MITM'd: with no hostname available, upstream hostname
+    verification falls back to the destination IP, which fails for any public
+    certificate without an IP SAN (hostname mismatch), turning every no-SNI
+    connection into a broken MITM attempt. Such connections are passed through
+    untouched, unless the operator explicitly opted into insecure upstream
+    verification (OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE), in which case
+    MITM remains possible and the escape hatch keeps working. TCP-layer
+    enforcement (deny/allow rules) still applies.
     """
     sni = data.client_hello.sni
     if not sni:
+        if not ctx.options.ssl_insecure:
+            data.ignore_connection = True
         return
 
     patterns = ctx.options.ignore_hosts
