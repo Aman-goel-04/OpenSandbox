@@ -56,6 +56,55 @@ async def test_async_acquire_fail_fast_empty_raises_pool_empty() -> None:
 
 
 @pytest.mark.asyncio
+async def test_release_all_idle_bounds_kills_and_cleans_up_before_store_failure() -> (
+    None
+):
+    class FailingStore(InMemoryAsyncPoolStateStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.takes = 0
+
+        async def try_take_idle(self, pool_name: str) -> str | None:
+            if self.takes == 55:
+                raise RuntimeError("injected store failure")
+            self.takes += 1
+            return await super().try_take_idle(pool_name)
+
+    store = FailingStore()
+    for index in range(55):
+        await store.put_idle("pool", f"idle-{index}")
+
+    class ConcurrentManager(FakeAsyncManager):
+        def __init__(self) -> None:
+            super().__init__()
+            self.active = 0
+            self.max_active = 0
+            self.ready = asyncio.Event()
+
+        async def kill_sandbox(self, sandbox_id: str) -> None:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            if self.active == 50:
+                self.ready.set()
+            await self.ready.wait()
+            self.killed.append(sandbox_id)
+            self.active -= 1
+            if sandbox_id == "idle-0":
+                raise RuntimeError("injected kill failure")
+
+    manager = ConcurrentManager()
+    pool = _create_pool(max_idle=0, store=store, manager=manager)
+
+    with pytest.raises(RuntimeError, match="injected store failure"):
+        await asyncio.wait_for(pool.release_all_idle(), timeout=2)
+
+    assert manager.max_active == 50
+    assert len(manager.killed) == 55
+    assert (await store.snapshot_counters("pool")).idle_count == 0
+    assert manager.closed
+
+
+@pytest.mark.asyncio
 async def test_async_reconcile_batch_failures_only_advance_backoff_once() -> None:
     store = InMemoryAsyncPoolStateStore()
     config = AsyncPoolConfig(

@@ -109,6 +109,55 @@ def test_acquire_fail_fast_empty_raises_pool_empty() -> None:
         pool.shutdown(False)
 
 
+def test_release_all_idle_bounds_kills_and_cleans_up_before_store_failure() -> None:
+    class FailingStore(InMemoryPoolStateStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.takes = 0
+
+        def try_take_idle(self, pool_name: str) -> str | None:
+            if self.takes == 55:
+                raise RuntimeError("injected store failure")
+            self.takes += 1
+            return super().try_take_idle(pool_name)
+
+    store = FailingStore()
+    for index in range(55):
+        store.put_idle("pool", f"idle-{index}")
+
+    class ConcurrentManager(FakeManager):
+        def __init__(self) -> None:
+            super().__init__()
+            self.active = 0
+            self.max_active = 0
+            self.lock = threading.Lock()
+            self.ready = threading.Event()
+
+        def kill_sandbox(self, sandbox_id: str) -> None:
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                if self.active == 50:
+                    self.ready.set()
+            assert self.ready.wait(timeout=2)
+            with self.lock:
+                self.killed.append(sandbox_id)
+                self.active -= 1
+            if sandbox_id == "idle-0":
+                raise RuntimeError("injected kill failure")
+
+    manager = ConcurrentManager()
+    pool = _create_pool(max_idle=0, store=store, manager=manager)
+
+    with pytest.raises(RuntimeError, match="injected store failure"):
+        pool.release_all_idle()
+
+    assert manager.max_active == 50
+    assert len(manager.killed) == 55
+    assert store.snapshot_counters("pool").idle_count == 0
+    assert manager.closed
+
+
 def test_acquire_fail_fast_stale_idle_raises_and_kills_candidate() -> None:
     store = InMemoryPoolStateStore()
     store.put_idle("pool", "stale-1")

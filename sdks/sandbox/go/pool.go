@@ -556,24 +556,47 @@ func adaptHealthCheck(userCheck func(context.Context, *Sandbox) error) func(cont
 	}
 }
 
-// ReleaseAllIdle drains all idle sandboxes and kills them.
+// ReleaseAllIdle drains all idle sandboxes and kills them with bounded concurrency.
 func (p *DefaultSandboxPool) ReleaseAllIdle(ctx context.Context) (int, error) {
-	count := 0
+	sandboxIDs := make([]string, 0)
+	var drainErr error
 	for {
 		if err := ctx.Err(); err != nil {
-			return count, err
+			drainErr = err
+			break
 		}
 		sandboxID, err := p.config.StateStore.TryTakeIdle(ctx, p.config.PoolName)
 		if err != nil {
-			return count, err
+			drainErr = err
+			break
 		}
 		if sandboxID == "" {
 			break
 		}
-		go p.killSandboxBestEffort(sandboxID)
-		count++
+		sandboxIDs = append(sandboxIDs, sandboxID)
 	}
-	return count, nil
+
+	jobs := make(chan string)
+	var workers sync.WaitGroup
+	workerCount := len(sandboxIDs)
+	if workerCount > releaseAllIdleConcurrency {
+		workerCount = releaseAllIdleConcurrency
+	}
+	workers.Add(workerCount)
+	for i := 0; i < workerCount; i++ {
+		go func() {
+			defer workers.Done()
+			for sandboxID := range jobs {
+				p.killSandboxBestEffort(sandboxID)
+			}
+		}()
+	}
+	for _, sandboxID := range sandboxIDs {
+		jobs <- sandboxID
+	}
+	close(jobs)
+	workers.Wait()
+	return len(sandboxIDs), drainErr
 }
 
 // Resize dynamically changes the idle target.
@@ -753,12 +776,20 @@ done:
 	return nil
 }
 
-const killSandboxTimeout = 30 * time.Second
+const (
+	killSandboxTimeout        = 30 * time.Second
+	releaseAllIdleConcurrency = 50
+)
 
 func (p *DefaultSandboxPool) killSandboxBestEffort(sandboxID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), killSandboxTimeout)
 	defer cancel()
-	_ = p.manager.KillSandbox(ctx, sandboxID)
+	if err := p.manager.KillSandbox(ctx, sandboxID); err != nil {
+		p.config.Logger.Warn("failed to kill sandbox (best-effort)",
+			"pool_name", p.config.PoolName,
+			"sandbox_id", sandboxID,
+			"error", err)
+	}
 }
 
 func (p *DefaultSandboxPool) killDiscardedAliveSandboxes(ids []string) {

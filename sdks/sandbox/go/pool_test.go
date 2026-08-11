@@ -471,6 +471,21 @@ type failingTakeStore struct {
 	takeErr error
 }
 
+type failAfterTakeStore struct {
+	*InMemoryPoolStateStore
+	successfulTakes int
+	takes           int
+	err             error
+}
+
+func (s *failAfterTakeStore) TryTakeIdle(ctx context.Context, poolName string) (string, error) {
+	if s.takes >= s.successfulTakes {
+		return "", s.err
+	}
+	s.takes++
+	return s.InMemoryPoolStateStore.TryTakeIdle(ctx, poolName)
+}
+
 func (s *failingTakeStore) TryTakeIdle(_ context.Context, _ string) (string, error) {
 	return "", s.takeErr
 }
@@ -835,6 +850,69 @@ func TestPool_Shutdown_DoesNotReleaseIdle(t *testing.T) {
 	}
 	if counters.IdleCount != 2 {
 		t.Errorf("idle count after shutdown = %d, want 2 (shutdown should not release idle)", counters.IdleCount)
+	}
+}
+
+func TestPool_ReleaseAllIdle_BoundsConcurrentKills(t *testing.T) {
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	var deleted atomic.Int32
+	ready := make(chan struct{})
+	var readyOnce sync.Once
+	lifecycleSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		current := active.Add(1)
+		for {
+			observed := maxActive.Load()
+			if current <= observed || maxActive.CompareAndSwap(observed, current) {
+				break
+			}
+		}
+		if current == releaseAllIdleConcurrency {
+			readyOnce.Do(func() { close(ready) })
+		}
+		select {
+		case <-ready:
+		case <-time.After(2 * time.Second):
+			t.Error("concurrent kills did not reach configured limit")
+		}
+		active.Add(-1)
+		deleted.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(lifecycleSrv.Close)
+	storeErr := errors.New("injected store failure")
+	store := &failAfterTakeStore{
+		InMemoryPoolStateStore: NewInMemoryPoolStateStore(),
+		successfulTakes:        55,
+		err:                    storeErr,
+	}
+	pool := newTestPool(t, lifecycleSrv.URL, func(b *SandboxPoolBuilder) {
+		b.MaxIdle(0).StateStore(store)
+	})
+	ctx := context.Background()
+	for i := 0; i < 55; i++ {
+		if err := pool.config.StateStore.PutIdle(ctx, "test-pool", fmt.Sprintf("idle-%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	released, err := pool.ReleaseAllIdle(ctx)
+
+	if !errors.Is(err, storeErr) {
+		t.Fatalf("ReleaseAllIdle() error = %v, want injected store failure", err)
+	}
+	if released != 55 {
+		t.Fatalf("released = %d, want 55", released)
+	}
+	if maxActive.Load() != releaseAllIdleConcurrency {
+		t.Errorf("max concurrent kills = %d, want %d", maxActive.Load(), releaseAllIdleConcurrency)
+	}
+	if deleted.Load() != 55 {
+		t.Errorf("deleted = %d, want 55", deleted.Load())
 	}
 }
 
