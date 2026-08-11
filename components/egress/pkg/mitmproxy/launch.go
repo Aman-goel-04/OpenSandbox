@@ -176,13 +176,30 @@ func forwardMitmdumpOutput(r io.ReadCloser) {
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		line := strings.TrimRight(scanner.Text(), " \t\r")
-		if !strings.HasPrefix(line, "credential proxy:") {
+		msg, ok := credentialProxyMessage(line)
+		if !ok {
 			continue
 		}
-		log.Warnf("[mitmproxy] %s", line)
+		log.Warnf("[mitmproxy] %s", msg)
 	}
 	// On ErrTooLong (a newline-free line over the buffer limit) Scan stops
 	// early; closing the read end makes the exec copy goroutine fail with
 	// ErrClosedPipe so cmd.Wait returns instead of hanging forever.
 	_ = r.Close()
+}
+
+// credentialProxyMessage returns the message of a credential proxy log line,
+// stripping the leading [HH:MM:SS.mmm] timestamp that mitmproxy 11.x terminal
+// logger prepends to ctx.log.* records. It reports false for any other line,
+// so mitmproxy's own high-volume flow logs stay filtered out.
+func credentialProxyMessage(line string) (string, bool) {
+	if strings.HasPrefix(line, "[") {
+		if end := strings.Index(line, "] "); end != -1 {
+			line = line[end+2:]
+		}
+	}
+	if !strings.HasPrefix(line, "credential proxy:") {
+		return "", false
+	}
+	return line, true
 }
