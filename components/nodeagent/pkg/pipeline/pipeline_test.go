@@ -96,6 +96,7 @@ type fakeSink struct {
 	consumeErr   error
 	consumeErrs  []error
 	finalizeErrs []error
+	finalizeWait time.Duration
 	consumeCalls int
 	consumeStart chan struct{}
 }
@@ -148,7 +149,14 @@ func (s *fakeSink) Consume(_ context.Context, batch api.Batch) error {
 	s.batches = append(s.batches, batch)
 	return nil
 }
-func (s *fakeSink) Finalize(_ context.Context, request api.FinalizeRequest) error {
+func (s *fakeSink) Finalize(ctx context.Context, request api.FinalizeRequest) error {
+	if s.finalizeWait > 0 {
+		select {
+		case <-time.After(s.finalizeWait):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.finalized = append(s.finalized, request)
@@ -158,6 +166,48 @@ func (s *fakeSink) Finalize(_ context.Context, request api.FinalizeRequest) erro
 		return err
 	}
 	return nil
+}
+
+func TestPipelineFinalizeIsNotBoundedBySingleRequestTimeout(t *testing.T) {
+	db, err := state.Open(t.TempDir(), "target", 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	source := &fakeSource{acked: make(chan []api.AckResult, 1), ended: make(chan api.EndToken, 1)}
+	sink := &fakeSink{finalizeWait: 50 * time.Millisecond}
+	log, _ := logger.New(logger.Config{OutputPaths: []string{"stdout"}})
+	cfg := testConfig()
+	cfg.SinkTimeout = 10 * time.Millisecond
+	p, err := New(cfg, source, sink, db, "target", log, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	events := make(chan api.SourceEvent, 1)
+	done := make(chan error, 1)
+	go func() { done <- p.Run(ctx, events) }()
+	streamRef := api.StreamRef{ID: "stream"}
+	events <- api.SourceEvent{End: &api.StreamEnd{StreamRef: streamRef, EndToken: api.EndToken{ID: "end", Source: "fake", StreamRef: streamRef}, Revision: 1, CoverageStartedAt: pipelineTestCoverageStartedAt}}
+	select {
+	case <-source.ended:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Finalize remained limited by the per-request Sink timeout")
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer closeCancel()
+	if err := p.Close(closeCtx); err != nil {
+		t.Fatal(err)
+	}
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	if len(sink.finalized) != 1 {
+		t.Fatalf("finalize calls=%d, want 1", len(sink.finalized))
+	}
 }
 func (*fakeSink) Close(context.Context) error { return nil }
 

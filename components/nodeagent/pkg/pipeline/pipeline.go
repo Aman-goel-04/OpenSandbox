@@ -474,7 +474,6 @@ func (p *Pipeline) acknowledgeEndWithRetry(ctx context.Context, token api.EndTok
 func (p *Pipeline) finalizeSinkWithRetry(ctx context.Context, request api.FinalizeRequest) error {
 	return p.retry(ctx, retryOperation{
 		call:             func(callCtx context.Context) error { return p.sink.Finalize(callCtx, request) },
-		timeout:          p.cfg.SinkTimeout,
 		nonRetryableText: "non-retryable sink finalize failure",
 		retryText:        "sink finalize failed; retrying",
 	})

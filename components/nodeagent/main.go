@@ -213,9 +213,15 @@ func run() (exitCode int) {
 	})
 	var runErr error
 	pipelineFinished := false
+	runtimeFailure := false
 	select {
 	case runErr = <-pipelineDone:
 		pipelineFinished = true
+		runtimeFailure = runErr != nil && signalCtx.Err() == nil
+		if runtimeFailure {
+			readiness.Replace("runtime-error")
+			log.Errorf("collection stopped after an unrecoverable runtime error: %v", runErr)
+		}
 	case <-signalCtx.Done():
 	}
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.SinkTimeout)
@@ -231,11 +237,25 @@ func run() (exitCode int) {
 		}
 	}
 	closeErr := p.Close(shutdownCtx)
-	if err := errors.Join(ignoreCanceled(runErr), stopErr, closeErr); err != nil {
-		log.Errorf("shutdown incomplete: %v", err)
+	shutdownErr := errors.Join(stopErr, closeErr)
+	if !runtimeFailure {
+		shutdownErr = errors.Join(ignoreCanceled(runErr), shutdownErr)
+	}
+	if shutdownErr != nil {
+		log.Errorf("shutdown incomplete: %v", shutdownErr)
+		if runtimeFailure {
+			waitForRuntimeFailureSignal(signalCtx)
+		}
 		return 1
 	}
+	if runtimeFailure {
+		waitForRuntimeFailureSignal(signalCtx)
+	}
 	return 0
+}
+
+func waitForRuntimeFailureSignal(ctx context.Context) {
+	<-ctx.Done()
 }
 
 var errPipelinePanicked = errors.New("pipeline goroutine panicked")
