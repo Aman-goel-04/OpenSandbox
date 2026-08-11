@@ -116,6 +116,10 @@ func (o *Orchestrator) Commit(ctx context.Context, request CommitRequest) (Resul
 	result := Result{Containers: make([]ContainerResult, 0, len(localImages))}
 	var pushErrors []error
 	for i, image := range localImages {
+		if image.Config.Digest == "" {
+			pushErrors = append(pushErrors, fmt.Errorf("push container %q: committed image has no config digest", request.Containers[i].Name))
+			continue
+		}
 		descriptor, err := o.Pusher.Push(ctx, image)
 		if err != nil {
 			pushErrors = append(pushErrors, fmt.Errorf("push container %q: %w", request.Containers[i].Name, err))
@@ -124,9 +128,9 @@ func (o *Orchestrator) Commit(ctx context.Context, request CommitRequest) (Resul
 		result.Containers = append(result.Containers, ContainerResult{
 			Name:   request.Containers[i].Name,
 			Image:  image.Reference,
-			Digest: descriptor.Digest.String(),
+			Digest: image.Config.Digest.String(),
 		})
-		o.logf("Pushed image %s (%s)\n", image.Reference, descriptor.Digest)
+		o.logf("Pushed image %s (manifest %s, config %s)\n", image.Reference, descriptor.Digest, image.Config.Digest)
 	}
 	if len(pushErrors) > 0 {
 		return Result{}, errors.Join(pushErrors...)

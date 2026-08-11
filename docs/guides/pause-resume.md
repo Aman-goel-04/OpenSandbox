@@ -395,7 +395,7 @@ curl http://localhost:8080/v1/sandboxes/{sandbox_id}
 | `conditions` | list | `Ready` / `Failed` conditions with reason and message |
 | `sourcePodName` | string | Pod name used for commit |
 | `sourceNodeName` | string | Node where commit Job runs |
-| `containers` | list | `{containerName, imageUri, imageDigest}` per container |
+| `containers` | list | `{containerName, imageUri, imageDigest}` per container. `imageDigest` is the image config digest, preserving the image ID semantics of earlier image-committer versions. |
 | `observedGeneration` | int | Last processed spec generation |
 
 ---

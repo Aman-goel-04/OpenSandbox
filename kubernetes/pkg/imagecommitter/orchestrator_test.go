@@ -76,7 +76,11 @@ func (f fakeBuilder) Commit(_ context.Context, container ResolvedContainer, targ
 	if container.Name == f.fail {
 		return LocalImage{}, errors.New("commit failed")
 	}
-	return LocalImage{Reference: target, Target: ocispec.Descriptor{Digest: digest.FromString(target)}}, nil
+	return LocalImage{
+		Reference: target,
+		Target:    ocispec.Descriptor{Digest: digest.FromString("manifest:" + target)},
+		Config:    ocispec.Descriptor{Digest: digest.FromString("config:" + target)},
+	}, nil
 }
 
 type fakePusher struct {
@@ -128,6 +132,14 @@ func TestCommitResolvesBeforePauseAndResumesBeforePush(t *testing.T) {
 	}
 	if len(result.Containers) != 2 || result.Containers[0].Name != "main" || result.Containers[1].Name != "stopped" {
 		t.Fatalf("unexpected result: %#v", result)
+	}
+	wantDigest := digest.FromString("config:registry.example.com/main:snap").String()
+	if result.Containers[0].Digest != wantDigest {
+		t.Fatalf("reported digest = %q, want config digest %q", result.Containers[0].Digest, wantDigest)
+	}
+	manifestDigest := digest.FromString("manifest:registry.example.com/main:snap").String()
+	if result.Containers[0].Digest == manifestDigest {
+		t.Fatalf("reported digest unexpectedly used manifest digest %q", manifestDigest)
 	}
 }
 

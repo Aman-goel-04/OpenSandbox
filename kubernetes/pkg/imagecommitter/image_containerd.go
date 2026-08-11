@@ -193,7 +193,7 @@ func (b *ContainerdImageBuilder) Commit(ctx context.Context, container ResolvedC
 		}
 	}
 
-	return LocalImage{Reference: target, Target: manifestDesc}, nil
+	return LocalImage{Reference: target, Target: manifestDesc, Config: configDesc}, nil
 }
 
 func (b *ContainerdImageBuilder) ensureBaseImageContent(ctx context.Context, image containerd.Image) error {

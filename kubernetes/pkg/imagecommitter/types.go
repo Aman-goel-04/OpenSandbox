@@ -80,7 +80,11 @@ type ExecResult struct {
 // LocalImage identifies image content assembled in containerd.
 type LocalImage struct {
 	Reference string
-	Target    ocispec.Descriptor
+	// Target is the manifest descriptor pushed to the registry.
+	Target ocispec.Descriptor
+	// Config is the image config descriptor reported as the snapshot image
+	// digest for compatibility with the previous image-committer behavior.
+	Config ocispec.Descriptor
 }
 
 // RegistryCredential supports standard OCI Distribution authentication forms.
@@ -93,8 +97,10 @@ type RegistryCredential struct {
 
 // ContainerResult is written to the Kubernetes termination message.
 type ContainerResult struct {
-	Name   string `json:"name"`
-	Image  string `json:"image"`
+	Name  string `json:"name"`
+	Image string `json:"image"`
+	// Digest is the image config digest, preserving the image ID semantics of
+	// the previous image-committer implementation.
 	Digest string `json:"digest"`
 }
 
