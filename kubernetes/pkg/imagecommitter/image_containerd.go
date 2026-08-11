@@ -74,6 +74,11 @@ func (b *ContainerdImageBuilder) Commit(ctx context.Context, container ResolvedC
 	if err := b.ensureBaseImageContent(leaseCtx, baseImage); err != nil {
 		return LocalImage{}, fmt.Errorf("recover source image content for container %s: %w", container.ID, err)
 	}
+	// Commit Jobs are pinned to the source sandbox's node and use that node's
+	// containerd socket, so under the supported native execution model the
+	// committer process platform matches the platform selected for the source
+	// container. Cross-architecture emulation is not a supported snapshot mode.
+	// ensureBaseImageContent intentionally uses the same platform matcher.
 	baseManifest, err := images.Manifest(leaseCtx, store, baseImage.Target(), platforms.Default())
 	if err != nil {
 		return LocalImage{}, fmt.Errorf("read source manifest for container %s: %w", container.ID, err)
