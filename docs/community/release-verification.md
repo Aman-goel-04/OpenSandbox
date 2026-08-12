@@ -147,8 +147,8 @@ three official registries:
 | Alibaba Cloud Container Registry | `sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/<component>` |
 
 The component can be `execd`, `code-interpreter`, `ingress`, `egress`,
-`controller`, `task-executor`, or `image-committer`. The server image uses the
-component name `server`.
+`controller`, `task-executor`, `image-committer`, or `nodeagent`. The server
+image uses the component name `server`.
 
 ```bash
 IMAGE="docker.io/opensandbox/execd"
