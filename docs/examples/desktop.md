@@ -48,10 +48,67 @@ uv run python examples/desktop/main.py
 ```
 
 The script starts the desktop stack (Xvfb + XFCE + x11vnc) and also launches noVNC/websockify. It prints:
-- VNC endpoint (`endpoint.endpoint`) for native VNC clients, password from `VNC_PASSWORD` (default: `opensandbox`)
+- VNC endpoint (`endpoint.endpoint`) for native VNC clients when direct endpoint mode is enabled, password from `VNC_PASSWORD` (default: `opensandbox`)
 - noVNC URL for browsers (`/vnc.html?host=...&port=...&path=...`)
 
 The sandbox stays alive for 5 minutes by default; interrupt sooner with Ctrl+C. Uses the prebuilt desktop image by default.
+
+### Embed noVNC in an HTTPS page
+
+Browsers block an `http://` noVNC iframe inside an HTTPS page. Terminate TLS at
+a reverse proxy in front of the OpenSandbox server, then make the example use
+that HTTPS origin and the server proxy:
+
+```shell
+export SANDBOX_DOMAIN=sandbox.example.com
+export SANDBOX_PROTOCOL=https
+export SANDBOX_USE_SERVER_PROXY=true
+export VNC_PASSWORD=opensandbox
+
+uv run python examples/desktop/main.py
+```
+
+The generated URL uses the same HTTPS origin for both the noVNC page and its
+WebSocket, for example:
+
+```text
+https://sandbox.example.com/v1/sandboxes/<sandbox-id>/proxy/6080/vnc.html?host=sandbox.example.com&port=443&path=v1/sandboxes/<sandbox-id>/proxy/6080
+```
+
+The TLS reverse proxy must forward normal HTTP requests and WebSocket upgrades
+to the OpenSandbox server. For Nginx, the relevant settings are:
+
+```nginx
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 443 ssl;
+    server_name sandbox.example.com;
+    # Configure ssl_certificate and ssl_certificate_key here.
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+    }
+}
+```
+
+::: warning
+Do not expose a direct `http://<sandbox-host>:<mapped-port>` URL in an HTTPS
+iframe. That endpoint has no TLS termination and the browser will reject it as
+mixed content. Keep `SANDBOX_USE_SERVER_PROXY=true` unless the direct sandbox
+endpoint has its own trusted HTTPS gateway. Server proxy mode handles HTTP and
+WebSocket traffic, not the raw TCP protocol used by native VNC clients, so the
+example omits the native VNC endpoint in this mode.
+:::
 
 ![Desktop shell](../public/images/desktop-screenshot-shell.jpg)
 ![noVNC connect](../public/images/desktop-screenshot-connect.jpg)
@@ -62,7 +119,9 @@ The sandbox stays alive for 5 minutes by default; interrupt sooner with Ctrl+C. 
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SANDBOX_DOMAIN` | `localhost:8080` | Sandbox service address |
+| `SANDBOX_DOMAIN` | `localhost:8080` | Sandbox service address; may include an `http://` or `https://` scheme |
+| `SANDBOX_PROTOCOL` | Domain scheme, otherwise `http` | Protocol used when `SANDBOX_DOMAIN` has no scheme (`http` or `https`) |
+| `SANDBOX_USE_SERVER_PROXY` | `false` | Route noVNC HTTP and WebSocket traffic through the OpenSandbox server |
 | `SANDBOX_API_KEY` | _(optional for local)_ | API key if your server requires authentication |
 | `SANDBOX_IMAGE` | `opensandbox/desktop:latest` | Sandbox image to use |
 | `VNC_PASSWORD` | `opensandbox` | Password for VNC access |
