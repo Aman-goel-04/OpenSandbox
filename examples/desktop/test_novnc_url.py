@@ -19,6 +19,7 @@ from novnc_url import (
     build_novnc_url,
     normalize_domain,
     parse_bool,
+    resolve_api_key,
     resolve_novnc_protocol,
     resolve_protocol,
     validate_connection_mode,
@@ -56,7 +57,9 @@ class BuildNoVNCURLTest(unittest.TestCase):
 
     def test_https_server_proxy_uses_default_tls_port(self) -> None:
         self.assertEqual(
-            build_novnc_url("sandbox.example.com/v1/sandboxes/sbx-123/proxy/6080", "https"),
+            build_novnc_url(
+                "sandbox.example.com/v1/sandboxes/sbx-123/proxy/6080", "https"
+            ),
             "https://sandbox.example.com/v1/sandboxes/sbx-123/proxy/6080/vnc.html"
             "?host=sandbox.example.com&port=443"
             "&path=v1/sandboxes/sbx-123/proxy/6080",
@@ -77,6 +80,20 @@ class BuildNoVNCURLTest(unittest.TestCase):
 
 
 class EnvironmentTest(unittest.TestCase):
+    def test_example_api_key_takes_precedence(self) -> None:
+        self.assertEqual(resolve_api_key("example-key", "sdk-key"), "example-key")
+
+    def test_sdk_api_key_is_used_as_fallback(self) -> None:
+        self.assertEqual(resolve_api_key(None, "sdk-key"), "sdk-key")
+
+    def test_server_proxy_with_sdk_fallback_api_key_warns(self) -> None:
+        warning = browser_proxy_auth_warning(
+            True,
+            resolve_api_key(None, "sdk-key"),
+        )
+
+        self.assertIsNotNone(warning)
+
     def test_bool_error_lists_accepted_values(self) -> None:
         with self.assertRaisesRegex(
             RuntimeError,

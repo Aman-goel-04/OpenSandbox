@@ -62,6 +62,14 @@ def resolve_novnc_protocol(management_protocol: str, use_server_proxy: bool) -> 
     return management_protocol if use_server_proxy else "http"
 
 
+def resolve_api_key(
+    example_api_key: str | None,
+    sdk_api_key: str | None,
+) -> str | None:
+    """Prefer the example override, then use the SDK-standard fallback."""
+    return example_api_key or sdk_api_key
+
+
 def browser_proxy_auth_warning(
     use_server_proxy: bool,
     api_key: str | None,
@@ -71,7 +79,7 @@ def browser_proxy_auth_warning(
         return None
 
     return (
-        "SANDBOX_API_KEY authenticates SDK requests only. Browsers cannot attach "
+        "The configured API key authenticates SDK requests only. Browsers cannot attach "
         "OPEN-SANDBOX-API-KEY to noVNC HTTP or WebSocket requests. If the server "
         "is multi-tenant, use a trusted authenticated reverse proxy that injects "
         "the tenant key for both request types."
