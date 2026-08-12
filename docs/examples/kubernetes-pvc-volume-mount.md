@@ -152,9 +152,7 @@ spec:
     poolMin: 5
 ```
 
-The lifecycle server's `POST /v1/pools` endpoint accepts the same Kubernetes
-`PodTemplateSpec` under its `template` field, so the `containers` and `volumes`
-sections above can also be supplied when a Pool is created through the server.
+Apply the Pool manifest to the cluster before allocating sandboxes from it.
 Sandboxes then select the preconfigured Pool with `extensions.poolRef` and do
 not pass a per-sandbox `volumes` list.
 
