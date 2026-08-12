@@ -381,6 +381,35 @@ class SandboxPoolSync:
 
     def release_all_idle(self) -> int:
         pool_name = self._config.pool_name
+        count = 0
+        temporary_manager: SandboxManagerSync | None = None
+        try:
+            while True:
+                sandbox_id = self._state_store.try_take_idle(pool_name)
+                if sandbox_id is None:
+                    break
+                count += 1
+                try:
+                    manager = self._sandbox_manager or temporary_manager
+                    if manager is None:
+                        manager = self._create_sandbox_manager()
+                        temporary_manager = manager
+                    manager.kill_sandbox(sandbox_id)
+                except Exception as exc:
+                    logger.warning(
+                        f"release_all_idle: failed to kill sandbox: pool_name={pool_name} sandbox_id={sandbox_id} error={exc}"
+                    )
+        finally:
+            if temporary_manager is not None:
+                temporary_manager.close()
+        return count
+
+    def release_all_idle_parallel(
+        self, max_workers: int = _RELEASE_ALL_IDLE_CONCURRENCY
+    ) -> int:
+        if max_workers <= 0:
+            raise ValueError("max_workers must be positive")
+        pool_name = self._config.pool_name
         sandbox_ids: list[str] = []
         drain_error: Exception | None = None
         temporary_manager: SandboxManagerSync | None = None
@@ -403,7 +432,7 @@ class SandboxPoolSync:
                         temporary_manager = manager
                     except Exception as exc:
                         logger.warning(
-                            f"release_all_idle: failed to create sandbox manager; draining idle ids without remote kill: pool_name={pool_name} error={exc}"
+                            f"release_all_idle_parallel: failed to create sandbox manager; draining idle ids without remote kill: pool_name={pool_name} error={exc}"
                         )
 
                 def kill(sandbox_id: str) -> None:
@@ -413,11 +442,11 @@ class SandboxPoolSync:
                         manager.kill_sandbox(sandbox_id)
                     except Exception as exc:
                         logger.warning(
-                            f"release_all_idle: failed to kill sandbox: pool_name={pool_name} sandbox_id={sandbox_id} error={exc}"
+                            f"release_all_idle_parallel: failed to kill sandbox: pool_name={pool_name} sandbox_id={sandbox_id} error={exc}"
                         )
 
                 with ThreadPoolExecutor(
-                    max_workers=_RELEASE_ALL_IDLE_CONCURRENCY,
+                    max_workers=min(max_workers, len(sandbox_ids)),
                     thread_name_prefix="sandbox-pool-release",
                 ) as executor:
                     list(executor.map(kill, sandbox_ids))

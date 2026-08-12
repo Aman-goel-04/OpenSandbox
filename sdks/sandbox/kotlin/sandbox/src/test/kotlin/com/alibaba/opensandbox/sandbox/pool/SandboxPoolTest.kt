@@ -1642,7 +1642,8 @@ class SandboxPoolTest {
                 sandboxManagerFactory = { temporaryManager },
             )
 
-        val failure = assertThrows(RuntimeException::class.java) { pool.releaseAllIdle() }
+        assertThrows(IllegalArgumentException::class.java) { pool.releaseAllIdle(0) }
+        val failure = assertThrows(RuntimeException::class.java) { pool.releaseAllIdle(50) }
 
         assertEquals("injected store failure", failure.message)
         assertEquals(50, maxActive.get())
@@ -1680,7 +1681,7 @@ class SandboxPoolTest {
         val interruptRestored = AtomicBoolean()
         val caller =
             Thread {
-                released.set(pool.releaseAllIdle())
+                released.set(pool.releaseAllIdle(1))
                 interruptRestored.set(Thread.currentThread().isInterrupted)
             }
 

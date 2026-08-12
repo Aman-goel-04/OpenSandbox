@@ -439,6 +439,61 @@ class SandboxPool internal constructor(
      */
     fun releaseAllIdle(): Int {
         val poolName = config.poolName
+        var count = 0
+        var temporaryManager: SandboxManager? = null
+        var killUnavailableLogged = false
+        try {
+            while (true) {
+                val sandboxId = stateStore.tryTakeIdle(poolName) ?: break
+                count++
+                try {
+                    val manager =
+                        sandboxManager ?: temporaryManager ?: try {
+                            createSandboxManager().also { temporaryManager = it }
+                        } catch (e: Exception) {
+                            if (!killUnavailableLogged) {
+                                logger.warn(
+                                    "releaseAllIdle: failed to create sandbox manager; draining idle ids without remote kill: " +
+                                        "pool_name={} error={}",
+                                    poolName,
+                                    e.message,
+                                )
+                                killUnavailableLogged = true
+                            }
+                            null
+                        }
+                    if (manager == null) {
+                        continue
+                    }
+                    manager.killSandbox(sandboxId)
+                } catch (e: Exception) {
+                    logger.warn(
+                        "releaseAllIdle: failed to kill sandbox (best-effort): pool_name={} sandbox_id={} error={}",
+                        poolName,
+                        sandboxId,
+                        e.message,
+                    )
+                }
+            }
+        } finally {
+            temporaryManager?.close()
+        }
+        if (count > 0) {
+            logger.info("releaseAllIdle: released {} idle sandbox(es): pool_name={}", count, poolName)
+        }
+        return count
+    }
+
+    /**
+     * Takes all idle sandbox IDs from the store and terminates them with bounded concurrency.
+     * This method blocks until every ID taken from the store has received a best-effort kill attempt.
+     *
+     * @param concurrency Maximum number of concurrent kill requests. Must be positive.
+     * @return Number of idle sandboxes taken from the store.
+     */
+    fun releaseAllIdle(concurrency: Int): Int {
+        require(concurrency > 0) { "concurrency must be positive" }
+        val poolName = config.poolName
         val sandboxIds = mutableListOf<String>()
         var drainFailure: Exception? = null
         var temporaryManager: SandboxManager? = null
@@ -460,7 +515,8 @@ class SandboxPool internal constructor(
                         createSandboxManager().also { temporaryManager = it }
                     } catch (e: Exception) {
                         logger.warn(
-                            "releaseAllIdle: failed to create sandbox manager; draining idle ids without remote kill: " +
+                            "releaseAllIdle(concurrency): failed to create sandbox manager; " +
+                                "draining idle ids without remote kill: " +
                                 "pool_name={} error={}",
                             poolName,
                             e.message,
@@ -470,7 +526,7 @@ class SandboxPool internal constructor(
                 if (manager != null) {
                     val threadIndex = AtomicInteger()
                     val executor =
-                        Executors.newFixedThreadPool(minOf(RELEASE_ALL_IDLE_CONCURRENCY, sandboxIds.size)) { runnable ->
+                        Executors.newFixedThreadPool(minOf(concurrency, sandboxIds.size)) { runnable ->
                             Thread(
                                 runnable,
                                 "sandbox-pool-release-$poolName-${threadIndex.incrementAndGet()}",
@@ -483,7 +539,8 @@ class SandboxPool internal constructor(
                                     manager.killSandbox(sandboxId)
                                 } catch (e: Exception) {
                                     logger.warn(
-                                        "releaseAllIdle: failed to kill sandbox (best-effort): pool_name={} sandbox_id={} error={}",
+                                        "releaseAllIdle(concurrency): failed to kill sandbox (best-effort): " +
+                                            "pool_name={} sandbox_id={} error={}",
                                         poolName,
                                         sandboxId,
                                         e.message,
@@ -512,7 +569,11 @@ class SandboxPool internal constructor(
         }
         drainFailure?.let { throw it }
         if (sandboxIds.isNotEmpty()) {
-            logger.info("releaseAllIdle: released {} idle sandbox(es): pool_name={}", sandboxIds.size, poolName)
+            logger.info(
+                "releaseAllIdle(concurrency): released {} idle sandbox(es): pool_name={}",
+                sandboxIds.size,
+                poolName,
+            )
         }
         return sandboxIds.size
     }
@@ -1660,8 +1721,6 @@ class SandboxPool internal constructor(
     }
 
     companion object {
-        private const val RELEASE_ALL_IDLE_CONCURRENCY = 50
-
         @JvmStatic
         fun builder(): Builder = Builder()
 

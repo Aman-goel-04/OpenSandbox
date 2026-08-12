@@ -854,6 +854,7 @@ func TestPool_Shutdown_DoesNotReleaseIdle(t *testing.T) {
 }
 
 func TestPool_ReleaseAllIdle_BoundsConcurrentKills(t *testing.T) {
+	const maxWorkers = 50
 	var active atomic.Int32
 	var maxActive atomic.Int32
 	var deleted atomic.Int32
@@ -871,7 +872,7 @@ func TestPool_ReleaseAllIdle_BoundsConcurrentKills(t *testing.T) {
 				break
 			}
 		}
-		if current == releaseAllIdleConcurrency {
+		if current == maxWorkers {
 			readyOnce.Do(func() { close(ready) })
 		}
 		select {
@@ -900,19 +901,75 @@ func TestPool_ReleaseAllIdle_BoundsConcurrentKills(t *testing.T) {
 		}
 	}
 
-	released, err := pool.ReleaseAllIdle(ctx)
+	if _, err := pool.ReleaseAllIdleParallel(ctx, 0); err == nil {
+		t.Fatal("ReleaseAllIdleParallel() accepted maxWorkers=0")
+	}
+	released, err := pool.ReleaseAllIdleParallel(ctx, maxWorkers)
 
 	if !errors.Is(err, storeErr) {
-		t.Fatalf("ReleaseAllIdle() error = %v, want injected store failure", err)
+		t.Fatalf("ReleaseAllIdleParallel() error = %v, want injected store failure", err)
 	}
 	if released != 55 {
 		t.Fatalf("released = %d, want 55", released)
 	}
-	if maxActive.Load() != releaseAllIdleConcurrency {
-		t.Errorf("max concurrent kills = %d, want %d", maxActive.Load(), releaseAllIdleConcurrency)
+	if maxActive.Load() != maxWorkers {
+		t.Errorf("max concurrent kills = %d, want %d", maxActive.Load(), maxWorkers)
 	}
 	if deleted.Load() != 55 {
 		t.Errorf("deleted = %d, want 55", deleted.Load())
+	}
+}
+
+func TestPool_ReleaseAllIdle_PreservesFireAndForgetBehavior(t *testing.T) {
+	requestStarted := make(chan struct{})
+	releaseKill := make(chan struct{})
+	deleted := make(chan struct{})
+	lifecycleSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		close(requestStarted)
+		<-releaseKill
+		w.WriteHeader(http.StatusNoContent)
+		close(deleted)
+	}))
+	t.Cleanup(lifecycleSrv.Close)
+	pool := newTestPool(t, lifecycleSrv.URL, func(b *SandboxPoolBuilder) { b.MaxIdle(0) })
+	ctx := context.Background()
+	if err := pool.config.StateStore.PutIdle(ctx, "test-pool", "idle-1"); err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		count int
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		count, err := pool.ReleaseAllIdle(ctx)
+		done <- result{count: count, err: err}
+	}()
+
+	select {
+	case got := <-done:
+		if got.err != nil || got.count != 1 {
+			t.Fatalf("ReleaseAllIdle() = (%d, %v), want (1, nil)", got.count, got.err)
+		}
+	case <-time.After(2 * time.Second):
+		close(releaseKill)
+		t.Fatal("ReleaseAllIdle blocked on the kill request")
+	}
+	select {
+	case <-requestStarted:
+	case <-time.After(2 * time.Second):
+		close(releaseKill)
+		t.Fatal("kill request did not start")
+	}
+	close(releaseKill)
+	select {
+	case <-deleted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("kill request did not finish")
 	}
 }
 
