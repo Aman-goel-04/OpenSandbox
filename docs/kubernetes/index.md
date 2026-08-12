@@ -371,6 +371,13 @@ spec:
         image: nginx:latest
         ports:
         - containerPort: 80
+        volumeMounts:
+        - name: shared-workspace
+          mountPath: /workspace
+      volumes:
+      - name: shared-workspace
+        persistentVolumeClaim:
+          claimName: shared-workspace-pvc
   capacitySpec:
     bufferMax: 10
     bufferMin: 2
@@ -398,6 +405,15 @@ spec:
 
 ::: warning Per-request network policies
 Pool pods are created before allocation. The lifecycle API therefore rejects `networkPolicy` together with `extensions.poolRef`; it cannot inject an egress sidecar into an existing pool pod. Configure required network controls in the Pool pod template before pods are created, or use a non-pooled sandbox for per-request policies.
+:::
+
+::: tip Shared storage in Pool mode
+Static shared storage follows the same rule: pre-create a PVC (normally with a
+`ReadWriteMany`-capable storage class) and mount it in the Pool pod template as
+shown above. The lifecycle API preserves this template when creating a Pool.
+Per-sandbox `volumes` cannot be combined with `extensions.poolRef`, because an
+allocated warm pod cannot gain new volumes. See the
+[Kubernetes PVC guide](/examples/kubernetes-pvc-volume-mount#pool-mode-pre-mount-a-shared-pvc).
 :::
 
 #### Pooled Sandbox with Heterogeneous Tasks

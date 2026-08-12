@@ -161,6 +161,47 @@ class TestCreatePool:
 
         assert result.name == "ci-pool"
 
+    def test_create_pool_preserves_static_pvc_template(self):
+        svc, mock_api = _make_pool_service(namespace="opensandbox")
+        mock_api.create_namespaced_custom_object.return_value = _make_raw_pool(
+            name="shared-workspace-pool",
+            namespace="opensandbox",
+        )
+        template = {
+            "spec": {
+                "containers": [
+                    {
+                        "name": "sandbox-container",
+                        "image": "python:3.11",
+                        "volumeMounts": [
+                            {
+                                "name": "shared-workspace",
+                                "mountPath": "/workspace",
+                            }
+                        ],
+                    }
+                ],
+                "volumes": [
+                    {
+                        "name": "shared-workspace",
+                        "persistentVolumeClaim": {
+                            "claimName": "shared-workspace-pvc",
+                        },
+                    }
+                ],
+            }
+        }
+        request = CreatePoolRequest(
+            name="shared-workspace-pool",
+            template=template,
+            capacitySpec=_capacity_spec(),
+        )
+
+        svc.create_pool(request)
+
+        body = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]
+        assert body["spec"]["template"] == template
+
     def test_create_pool_returns_pool_response(self):
         svc, mock_api = _make_pool_service()
         raw = _make_raw_pool()
