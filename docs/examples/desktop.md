@@ -104,12 +104,13 @@ server {
 ::: warning
 Do not expose a direct `http://<sandbox-host>:<mapped-port>` URL in an HTTPS
 iframe. That endpoint has no TLS termination and the browser will reject it as
-mixed content. Keep `SANDBOX_USE_SERVER_PROXY=true` unless the direct sandbox
-endpoint has its own trusted HTTPS gateway. Server proxy mode handles HTTP and
-WebSocket traffic, not the raw TCP protocol used by native VNC clients, so the
-example omits the native VNC endpoint in this mode. When server proxy mode is
-disabled, the example always generates an `http://` noVNC URL for the direct
-websockify endpoint, even if the management API itself uses HTTPS.
+mixed content. This SDK configuration uses one protocol for the management API
+and sandbox service requests, so the example requires
+`SANDBOX_USE_SERVER_PROXY=true` whenever the management API uses HTTPS. This
+keeps lifecycle, execd, noVNC page, and WebSocket traffic on the HTTPS server
+origin instead of incorrectly sending HTTPS to a direct sandbox endpoint.
+Server proxy mode does not support the raw TCP protocol used by native VNC
+clients, so the example omits the native VNC endpoint in this mode.
 :::
 
 ![Desktop shell](../public/images/desktop-screenshot-shell.jpg)
@@ -123,7 +124,7 @@ websockify endpoint, even if the management API itself uses HTTPS.
 |----------|---------|-------------|
 | `SANDBOX_DOMAIN` | `localhost:8080` | Sandbox service address; may include an `http://` or `https://` scheme |
 | `SANDBOX_PROTOCOL` | Domain scheme, otherwise `http` | Protocol used when `SANDBOX_DOMAIN` has no scheme (`http` or `https`) |
-| `SANDBOX_USE_SERVER_PROXY` | `false` | Route noVNC HTTP and WebSocket traffic through the OpenSandbox server |
+| `SANDBOX_USE_SERVER_PROXY` | `false` | Route sandbox service, noVNC HTTP, and WebSocket traffic through the OpenSandbox server; required with HTTPS |
 | `SANDBOX_API_KEY` | _(optional for local)_ | API key if your server requires authentication |
 | `SANDBOX_IMAGE` | `opensandbox/desktop:latest` | Sandbox image to use |
 | `VNC_PASSWORD` | `opensandbox` | Password for VNC access |

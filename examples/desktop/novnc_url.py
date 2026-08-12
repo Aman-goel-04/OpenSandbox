@@ -48,6 +48,15 @@ def parse_bool(value: str, name: str) -> bool:
     raise RuntimeError(f"{name} must be one of: 1, true, yes, on, 0, false, no, off")
 
 
+def validate_connection_mode(management_protocol: str, use_server_proxy: bool) -> None:
+    """Require proxy mode when the management API uses HTTPS."""
+    if management_protocol == "https" and not use_server_proxy:
+        raise RuntimeError(
+            "SANDBOX_USE_SERVER_PROXY must be true when the management API uses HTTPS; "
+            "direct sandbox endpoints do not terminate TLS"
+        )
+
+
 def resolve_novnc_protocol(management_protocol: str, use_server_proxy: bool) -> str:
     """Use the management scheme only when noVNC shares the server origin."""
     return management_protocol if use_server_proxy else "http"

@@ -26,6 +26,7 @@ from novnc_url import (
     parse_bool,
     resolve_novnc_protocol,
     resolve_protocol,
+    validate_connection_mode,
 )
 
 
@@ -56,6 +57,7 @@ async def main() -> None:
     domain = normalize_domain(os.getenv("SANDBOX_DOMAIN", "localhost:8080"))
     protocol = resolve_protocol(domain, os.getenv("SANDBOX_PROTOCOL"))
     use_server_proxy = _bool_env("SANDBOX_USE_SERVER_PROXY")
+    validate_connection_mode(protocol, use_server_proxy)
     api_key = os.getenv("SANDBOX_API_KEY")
     image = os.getenv(
         "SANDBOX_IMAGE",

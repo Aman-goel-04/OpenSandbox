@@ -20,6 +20,7 @@ from novnc_url import (
     parse_bool,
     resolve_novnc_protocol,
     resolve_protocol,
+    validate_connection_mode,
 )
 
 
@@ -87,6 +88,19 @@ class EnvironmentTest(unittest.TestCase):
 
     def test_server_proxy_novnc_inherits_management_protocol(self) -> None:
         self.assertEqual(resolve_novnc_protocol("https", True), "https")
+
+    def test_https_management_api_requires_server_proxy(self) -> None:
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "SANDBOX_USE_SERVER_PROXY must be true",
+        ):
+            validate_connection_mode("https", False)
+
+    def test_https_management_api_accepts_server_proxy(self) -> None:
+        validate_connection_mode("https", True)
+
+    def test_http_management_api_accepts_direct_endpoints(self) -> None:
+        validate_connection_mode("http", False)
 
 
 if __name__ == "__main__":
