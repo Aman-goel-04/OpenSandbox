@@ -52,10 +52,9 @@ HOP_BY_HOP_HEADERS = {
     "upgrade",
 }
 
-# Uvicorn adds these to client-facing responses. Forwarding backend values as
-# well would produce duplicate fields on the wire.
+# Uvicorn adds this to client-facing responses. Forwarding the backend value as
+# well would produce a duplicate field on the wire.
 SERVER_GENERATED_RESPONSE_HEADERS = {
-    "date",
     "server",
 }
 

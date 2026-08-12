@@ -156,7 +156,7 @@ The lifecycle endpoint API returns the reachable address for a service port insi
 - A Kubernetes ingress gateway endpoint.
 - A server-proxied URL under `/sandboxes/{sandboxId}/proxy/{port}` when `use_server_proxy=true`.
 
-The server proxy supports HTTP and WebSocket traffic and is also integrated with optional renew-on-access behavior. For HTTP responses, it strips hop-by-hop headers and backend `Date`/`Server` headers; the server's Uvicorn layer generates the latter two for the client-facing response.
+The server proxy supports HTTP and WebSocket traffic and is also integrated with optional renew-on-access behavior. For HTTP responses, it strips hop-by-hop headers and the backend `Server` header while preserving an origin `Date`; the server adds a current `Date` only when the response does not already contain one.
 
 ## 4. Runtime Backends
 

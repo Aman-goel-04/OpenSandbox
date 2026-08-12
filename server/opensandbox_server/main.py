@@ -90,6 +90,7 @@ from opensandbox_server.api.proxy import router as proxy_router  # noqa: E402
 from opensandbox_server.integrations.otel import setup_otel_metrics, shutdown_otel_metrics  # noqa: E402
 from opensandbox_server.integrations.renew_intent.proxy_renew import ProxyRenewCoordinator  # noqa: E402
 from opensandbox_server.middleware.auth import AuthMiddleware  # noqa: E402
+from opensandbox_server.middleware.date_header import DateHeaderMiddleware  # noqa: E402
 from opensandbox_server.middleware.request_id import RequestIdMiddleware  # noqa: E402
 from opensandbox_server.services.extension_service import require_extension_service  # noqa: E402
 from opensandbox_server.services.runtime_resolver import (  # noqa: E402
@@ -197,9 +198,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# RequestIdMiddleware last = outermost: runs first, so every response (including
-# 401 from AuthMiddleware) gets X-Request-ID and logs have request_id in context.
+# RequestIdMiddleware wraps auth and CORS so every response (including 401 from
+# AuthMiddleware) gets X-Request-ID and logs have request_id in context.
 app.add_middleware(RequestIdMiddleware)
+# DateHeaderMiddleware outermost preserves an existing Date (including one from
+# a proxied backend) and adds a current value only when the response lacks it.
+app.add_middleware(DateHeaderMiddleware)
 
 # Include API routes at root and versioned prefix.
 # IMPORTANT: non-proxy routers MUST be registered before proxy_router
@@ -278,5 +282,6 @@ if __name__ == "__main__":
         timeout_keep_alive=app_config.server.timeout_keep_alive,
         loop=app_config.server.loop,
         http=app_config.server.http,
+        date_header=False,
         timeout_graceful_shutdown=app_config.server.timeout_graceful_shutdown,
     )

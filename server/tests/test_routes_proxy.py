@@ -208,7 +208,7 @@ def test_proxy_forwards_filtered_headers_and_query(
     assert fake_client.response.aclose_called is True
 
 
-def test_proxy_filters_server_generated_response_headers(
+def test_proxy_preserves_origin_date_and_filters_server_header(
     client: TestClient,
     auth_headers: dict,
     monkeypatch,
@@ -224,9 +224,10 @@ def test_proxy_filters_server_generated_response_headers(
     monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
 
     fake_client = _FakeAsyncClient()
+    origin_date = "Wed, 21 Oct 2015 07:28:00 GMT"
     fake_client.response = _FakeStreamingResponse(
         headers={
-            "Date": "backend-date",
+            "Date": origin_date,
             "Server": "backend-server",
             "X-Backend": "yes",
         },
@@ -241,7 +242,7 @@ def test_proxy_filters_server_generated_response_headers(
 
     assert response.status_code == 200
     assert response.headers.get("x-backend") == "yes"
-    assert "date" not in response.headers
+    assert response.headers.get("date") == origin_date
     assert "server" not in response.headers
 
 

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from email.utils import parsedate_to_datetime
+
 from fastapi.testclient import TestClient
 
 
@@ -21,6 +23,7 @@ class TestHealthCheck:
         response = client.get("/health")
         assert response.status_code == 200
         assert response.json() == {"status": "healthy"}
+        assert parsedate_to_datetime(response.headers["date"]).tzinfo is not None
 
 
 class TestVersionInfo:
