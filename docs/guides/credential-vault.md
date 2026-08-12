@@ -57,6 +57,10 @@ At a high level:
    substitutions.
 6. Secret values are redacted from vault responses and response headers.
 
+Requests that do not match any credential binding are forwarded unchanged.
+Credential path-safety checks apply only after a binding matches and the request
+would otherwise receive credentials.
+
 The active vault used by the MITM process is served over a local Unix domain
 socket inside the sidecar. The sandbox workload cannot fetch this active state
 over the normal server proxy path.
