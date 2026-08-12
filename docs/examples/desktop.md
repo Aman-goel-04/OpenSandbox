@@ -101,6 +101,20 @@ server {
 }
 ```
 
+This direct browser URL works when the OpenSandbox proxy route does not require
+browser-supplied authentication headers, including the default single-tenant
+mode. In multi-tenant mode, the proxy route requires
+`OPEN-SANDBOX-API-KEY` on both the initial noVNC HTTP request and the WebSocket
+upgrade. The SDK adds this header to its own requests, but a browser navigation
+or WebSocket cannot add it.
+
+For multi-tenant browser access, put a trusted, browser-authenticated reverse
+proxy in front of OpenSandbox. It must authorize access to the requested
+sandbox, map the browser identity to the correct tenant, and inject that
+tenant's `OPEN-SANDBOX-API-KEY` header for both HTTP and WebSocket traffic. Do
+not put the API key in the noVNC URL or expose a reverse proxy that adds one
+shared key to unauthenticated traffic.
+
 ::: warning
 Do not expose a direct `http://<sandbox-host>:<mapped-port>` URL in an HTTPS
 iframe. That endpoint has no TLS termination and the browser will reject it as

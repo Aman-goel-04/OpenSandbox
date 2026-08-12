@@ -62,6 +62,22 @@ def resolve_novnc_protocol(management_protocol: str, use_server_proxy: bool) -> 
     return management_protocol if use_server_proxy else "http"
 
 
+def browser_proxy_auth_warning(
+    use_server_proxy: bool,
+    api_key: str | None,
+) -> str | None:
+    """Warn when browser traffic may need authentication headers."""
+    if not use_server_proxy or not api_key:
+        return None
+
+    return (
+        "SANDBOX_API_KEY authenticates SDK requests only. Browsers cannot attach "
+        "OPEN-SANDBOX-API-KEY to noVNC HTTP or WebSocket requests. If the server "
+        "is multi-tenant, use a trusted authenticated reverse proxy that injects "
+        "the tenant key for both request types."
+    )
+
+
 def build_novnc_url(endpoint: str, protocol: str) -> str:
     """Build a noVNC page URL whose WebSocket targets the same endpoint."""
     scheme = protocol.lower()

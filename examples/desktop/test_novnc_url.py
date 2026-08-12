@@ -15,6 +15,7 @@
 import unittest
 
 from novnc_url import (
+    browser_proxy_auth_warning,
     build_novnc_url,
     normalize_domain,
     parse_bool,
@@ -101,6 +102,19 @@ class EnvironmentTest(unittest.TestCase):
 
     def test_http_management_api_accepts_direct_endpoints(self) -> None:
         validate_connection_mode("http", False)
+
+    def test_server_proxy_with_api_key_warns_about_browser_auth(self) -> None:
+        warning = browser_proxy_auth_warning(True, "secret")
+
+        self.assertIsNotNone(warning)
+        self.assertIn("OPEN-SANDBOX-API-KEY", warning)
+        self.assertIn("HTTP or WebSocket", warning)
+
+    def test_direct_endpoint_does_not_warn_about_proxy_auth(self) -> None:
+        self.assertIsNone(browser_proxy_auth_warning(False, "secret"))
+
+    def test_server_proxy_without_api_key_does_not_warn(self) -> None:
+        self.assertIsNone(browser_proxy_auth_warning(True, None))
 
 
 if __name__ == "__main__":

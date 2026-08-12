@@ -21,6 +21,7 @@ from opensandbox.config import ConnectionConfig
 from opensandbox.models.execd import RunCommandOpts
 
 from novnc_url import (
+    browser_proxy_auth_warning,
     build_novnc_url,
     normalize_domain,
     parse_bool,
@@ -119,6 +120,7 @@ async def main() -> None:
         # websockify endpoints do not terminate TLS.
         novnc_protocol = resolve_novnc_protocol(config.protocol, use_server_proxy)
         novnc_url = build_novnc_url(endpoint_novnc.endpoint, novnc_protocol)
+        auth_warning = browser_proxy_auth_warning(use_server_proxy, api_key)
 
         if not use_server_proxy:
             endpoint_vnc = await sandbox.get_endpoint(5900)
@@ -129,6 +131,8 @@ async def main() -> None:
         print("\nnoVNC (browser):")
         print(f"  {novnc_url}")
         print(f"Password: {vnc_password}")
+        if auth_warning:
+            print(f"Authentication note: {auth_warning}")
 
         print("\nKeeping sandbox alive for 5 minutes. Press Ctrl+C to exit sooner.")
         try:
