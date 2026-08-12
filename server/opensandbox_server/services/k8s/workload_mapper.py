@@ -98,6 +98,10 @@ def _build_sandbox_from_workload(workload: Any, workload_provider: Any) -> Sandb
 
 
 _POD_NAME_PATTERN = re.compile(r"^[a-z0-9](?:[-a-z0-9.]{0,251}[a-z0-9])?$")
+_ALLOCATION_RELEASE_ANNOTATION_KEYS = (
+    "sandbox.opensandbox.io/alloc-release",
+    "sandbox.opensandbox.io/alloc-released",
+)
 
 
 def _extract_confirmed_pool_allocation(
@@ -147,8 +151,47 @@ def _extract_confirmed_pool_allocation(
         or allocated != len(pods)
     ):
         return None
+    if _has_released_or_releasing_allocation_pods(annotations, pods):
+        return None
 
     return AllocationSummary(poolRef=pool_ref)
+
+
+def _has_released_or_releasing_allocation_pods(
+    annotations: dict[Any, Any],
+    allocation_pods: list[str],
+) -> bool:
+    """Return whether release state is malformed or includes allocated pods."""
+    allocation_pod_names = set(allocation_pods)
+    for key in _ALLOCATION_RELEASE_ANNOTATION_KEYS:
+        if key not in annotations:
+            continue
+
+        raw_release = annotations[key]
+        if not isinstance(raw_release, str):
+            return True
+        try:
+            release = json.loads(raw_release)
+        except (TypeError, ValueError):
+            return True
+        if not isinstance(release, dict):
+            return True
+
+        released_pods = release.get("pods")
+        if (
+            not isinstance(released_pods, list)
+            or any(
+                not isinstance(pod, str)
+                or not _POD_NAME_PATTERN.fullmatch(pod)
+                for pod in released_pods
+            )
+            or len(set(released_pods)) != len(released_pods)
+        ):
+            return True
+        if allocation_pod_names.intersection(released_pods):
+            return True
+
+    return False
 
 
 def _field(value: Any, *names: str) -> Any:

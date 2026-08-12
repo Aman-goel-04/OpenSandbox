@@ -128,6 +128,58 @@ class TestBuildSandboxFromWorkload:
         assert sandbox.allocation is not None
         assert sandbox.allocation.pool_ref == "pool-runc"
 
+    @pytest.mark.parametrize(
+        "annotation_key",
+        [
+            "sandbox.opensandbox.io/alloc-release",
+            "sandbox.opensandbox.io/alloc-released",
+        ],
+    )
+    def test_omits_allocation_when_release_state_intersects_allocation(
+        self, annotation_key
+    ):
+        workload = _allocated_workload()
+        workload["metadata"]["annotations"][annotation_key] = json.dumps(
+            {"pods": ["pod-1"]}
+        )
+
+        sandbox = _build_sandbox_from_workload(workload, _WorkloadProvider())
+
+        assert sandbox.allocation is None
+
+    @pytest.mark.parametrize(
+        "annotation_key",
+        [
+            "sandbox.opensandbox.io/alloc-release",
+            "sandbox.opensandbox.io/alloc-released",
+        ],
+    )
+    def test_omits_allocation_when_release_state_is_malformed(self, annotation_key):
+        workload = _allocated_workload()
+        workload["metadata"]["annotations"][annotation_key] = "{"
+
+        sandbox = _build_sandbox_from_workload(workload, _WorkloadProvider())
+
+        assert sandbox.allocation is None
+
+    @pytest.mark.parametrize(
+        "annotation_key",
+        [
+            "sandbox.opensandbox.io/alloc-release",
+            "sandbox.opensandbox.io/alloc-released",
+        ],
+    )
+    def test_returns_allocation_for_non_intersecting_release_state(self, annotation_key):
+        workload = _allocated_workload()
+        workload["metadata"]["annotations"][annotation_key] = json.dumps(
+            {"pods": ["pod-2"]}
+        )
+
+        sandbox = _build_sandbox_from_workload(workload, _WorkloadProvider())
+
+        assert sandbox.allocation is not None
+        assert sandbox.allocation.pool_ref == "pool-runc"
+
 
 def _allocated_workload(pool_ref="pool-runc"):
     return {
