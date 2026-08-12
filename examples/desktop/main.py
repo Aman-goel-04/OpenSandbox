@@ -20,7 +20,13 @@ from opensandbox import Sandbox
 from opensandbox.config import ConnectionConfig
 from opensandbox.models.execd import RunCommandOpts
 
-from novnc_url import build_novnc_url, resolve_protocol
+from novnc_url import (
+    build_novnc_url,
+    normalize_domain,
+    parse_bool,
+    resolve_novnc_protocol,
+    resolve_protocol,
+)
 
 
 def _required_env(name: str) -> str:
@@ -34,12 +40,7 @@ def _bool_env(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
         return default
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    raise RuntimeError(f"{name} must be true or false")
+    return parse_bool(value, name)
 
 
 async def _print_logs(label: str, execution) -> None:
@@ -52,7 +53,7 @@ async def _print_logs(label: str, execution) -> None:
 
 
 async def main() -> None:
-    domain = os.getenv("SANDBOX_DOMAIN", "localhost:8080")
+    domain = normalize_domain(os.getenv("SANDBOX_DOMAIN", "localhost:8080"))
     protocol = resolve_protocol(domain, os.getenv("SANDBOX_PROTOCOL"))
     use_server_proxy = _bool_env("SANDBOX_USE_SERVER_PROXY")
     api_key = os.getenv("SANDBOX_API_KEY")
@@ -111,9 +112,11 @@ async def main() -> None:
 
         endpoint_novnc = await sandbox.get_endpoint(6080)
 
-        # noVNC uses the page's scheme to select ws:// or wss://. In HTTPS
-        # deployments, server proxy mode keeps both requests on the TLS origin.
-        novnc_url = build_novnc_url(endpoint_novnc.endpoint, config.protocol)
+        # noVNC uses the page's scheme to select ws:// or wss://. Only server
+        # proxy endpoints inherit the management API's TLS origin; direct
+        # websockify endpoints do not terminate TLS.
+        novnc_protocol = resolve_novnc_protocol(config.protocol, use_server_proxy)
+        novnc_url = build_novnc_url(endpoint_novnc.endpoint, novnc_protocol)
 
         if not use_server_proxy:
             endpoint_vnc = await sandbox.get_endpoint(5900)

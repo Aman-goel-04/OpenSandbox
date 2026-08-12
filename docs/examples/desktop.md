@@ -107,7 +107,9 @@ iframe. That endpoint has no TLS termination and the browser will reject it as
 mixed content. Keep `SANDBOX_USE_SERVER_PROXY=true` unless the direct sandbox
 endpoint has its own trusted HTTPS gateway. Server proxy mode handles HTTP and
 WebSocket traffic, not the raw TCP protocol used by native VNC clients, so the
-example omits the native VNC endpoint in this mode.
+example omits the native VNC endpoint in this mode. When server proxy mode is
+disabled, the example always generates an `http://` noVNC URL for the direct
+websockify endpoint, even if the management API itself uses HTTPS.
 :::
 
 ![Desktop shell](../public/images/desktop-screenshot-shell.jpg)

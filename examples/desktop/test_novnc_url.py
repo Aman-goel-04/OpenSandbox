@@ -14,7 +14,13 @@
 
 import unittest
 
-from novnc_url import build_novnc_url, resolve_protocol
+from novnc_url import (
+    build_novnc_url,
+    normalize_domain,
+    parse_bool,
+    resolve_novnc_protocol,
+    resolve_protocol,
+)
 
 
 class BuildNoVNCURLTest(unittest.TestCase):
@@ -24,6 +30,18 @@ class BuildNoVNCURLTest(unittest.TestCase):
     def test_domain_url_scheme_overrides_explicit_protocol(self) -> None:
         self.assertEqual(
             resolve_protocol("https://sandbox.example.com", "HTTP"),
+            "https",
+        )
+
+    def test_normalizes_uppercase_domain_scheme_and_whitespace(self) -> None:
+        self.assertEqual(
+            normalize_domain("  HTTPS://sandbox.example.com  "),
+            "https://sandbox.example.com",
+        )
+
+    def test_resolves_uppercase_domain_scheme(self) -> None:
+        self.assertEqual(
+            resolve_protocol("HTTPS://sandbox.example.com", None),
             "https",
         )
 
@@ -54,6 +72,21 @@ class BuildNoVNCURLTest(unittest.TestCase):
     def test_rejects_unknown_protocol(self) -> None:
         with self.assertRaisesRegex(ValueError, "protocol"):
             build_novnc_url("sandbox.example.com/proxy/6080", "ftp")
+
+
+class EnvironmentTest(unittest.TestCase):
+    def test_bool_error_lists_accepted_values(self) -> None:
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "1, true, yes, on, 0, false, no, off",
+        ):
+            parse_bool("maybe", "SANDBOX_USE_SERVER_PROXY")
+
+    def test_direct_novnc_stays_http_with_https_management_api(self) -> None:
+        self.assertEqual(resolve_novnc_protocol("https", False), "http")
+
+    def test_server_proxy_novnc_inherits_management_protocol(self) -> None:
+        self.assertEqual(resolve_novnc_protocol("https", True), "https")
 
 
 if __name__ == "__main__":
