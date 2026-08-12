@@ -183,14 +183,18 @@ kubectl exec <pool-pod> -n <namespace> -- \
 # Check the executor health endpoint from a second terminal while this runs.
 kubectl port-forward pod/<pool-pod> -n <namespace> 5758:5758
 curl http://127.0.0.1:5758/health
+curl http://127.0.0.1:5758/getTasks
 
-# Check controller-reported task state and the latest task error.
-kubectl get batchsandbox <sandbox-name> -n <namespace> \
-  -o jsonpath='{.status.taskFailed}{"\t"}{.status.taskLastErrorMessage}{"\n"}'
+# The lifecycle server uses <sandbox-name>-0 as the task name. Check the task's
+# captured output (adjust the path if task-executor uses a custom data directory).
+kubectl exec <pool-pod> -n <namespace> -- \
+  sh -c 'tail -n 100 /var/lib/sandbox/tasks/<sandbox-name>-0/stdout.log; tail -n 100 /var/lib/sandbox/tasks/<sandbox-name>-0/stderr.log'
+
+# Check controller logs for delivery failures between the controller and port 5758.
 kubectl logs -n opensandbox-system -l control-plane=controller-manager --tail=100
 ```
 
-If `taskTemplate` exists but the health check cannot reach port `5758`, verify that task-executor is installed and remains running. If the task reaches `Failed`, use `taskLastErrorMessage` and the executor log to distinguish a missing `/opt/opensandbox/bootstrap.sh` from a failure inside the requested entrypoint.
+If `taskTemplate` exists but the health check cannot reach port `5758`, verify that task-executor is installed and remains running. The generated task intentionally starts `bootstrap.sh` in the background, so its wrapper can report success even when `bootstrap.sh` is missing or the requested entrypoint later fails. Do not rely on `taskFailed` or `taskLastErrorMessage` alone for these failures; inspect the task's captured `stderr.log` and `stdout.log`, then verify the execd or application process directly.
 
 Start the k8s OpenSandbox server:
 
