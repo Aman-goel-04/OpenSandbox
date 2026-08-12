@@ -137,6 +137,7 @@ spec:
       containers:
         - name: sandbox-container
           image: python:3.11
+          command: ["sleep", "3600"]
           volumeMounts:
             - name: shared-workspace
               mountPath: /workspace
