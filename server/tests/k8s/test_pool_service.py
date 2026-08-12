@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import pytest
+from copy import deepcopy
 from unittest.mock import MagicMock
 from kubernetes.client import ApiException
 
@@ -196,11 +197,14 @@ class TestCreatePool:
             template=template,
             capacitySpec=_capacity_spec(),
         )
+        expected_template = deepcopy(request.template)
 
         svc.create_pool(request)
 
         body = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]
-        assert body["spec"]["template"] == template
+        assert body["spec"]["template"] == expected_template
+        assert request.template == expected_template
+        assert template == expected_template
 
     def test_create_pool_returns_pool_response(self):
         svc, mock_api = _make_pool_service()

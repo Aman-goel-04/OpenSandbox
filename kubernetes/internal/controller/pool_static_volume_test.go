@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	sandboxv1alpha1 "github.com/alibaba/OpenSandbox/sandbox-k8s/apis/sandbox/v1alpha1"
+	controllerutils "github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils/controller"
 )
 
 func TestCreatePoolPodPreservesStaticPVC(t *testing.T) {
@@ -83,7 +84,7 @@ func TestCreatePoolPodPreservesStaticPVC(t *testing.T) {
 			},
 		},
 	}
-	defer PoolScaleExpectations.DeleteExpectations("opensandbox/shared-workspace-pool")
+	defer PoolScaleExpectations.DeleteExpectations(controllerutils.GetControllerKey(pool))
 
 	r := &PoolReconciler{
 		Client:   fakeClient,
