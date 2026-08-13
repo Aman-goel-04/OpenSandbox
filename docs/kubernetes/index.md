@@ -400,6 +400,12 @@ spec:
 Pool pods are created before allocation. The lifecycle API therefore rejects `networkPolicy` together with `extensions.poolRef`; it cannot inject an egress sidecar into an existing pool pod. Configure required network controls in the Pool pod template before pods are created, or use a non-pooled sandbox for per-request policies.
 :::
 
+::: tip Entrypoint and environment injection
+Pool pods are also created before a lifecycle request supplies its `entrypoint` or environment variables. The server does not rewrite the allocated Pod's `command`, `args`, or `env`; seeing the original Pool template in the Pod YAML is expected. Instead, it writes the request-specific process to `BatchSandbox.spec.taskTemplate`, and the controller sends that task to an in-pod task-executor on port `5758`.
+
+A Pool used through the lifecycle API with a custom entrypoint or environment must therefore run task-executor and provide an executable `/opt/opensandbox/bootstrap.sh`. See the [Code Interpreter Pool example](/examples/code-interpreter#how-pool-entrypoint-injection-works) for a complete template and troubleshooting commands.
+:::
+
 ::: tip Shared storage in Pool mode
 Static shared storage follows the same rule: pre-create a PVC (normally with a
 `ReadWriteMany`-capable storage class) and mount it in the Pool pod template as
