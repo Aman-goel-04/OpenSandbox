@@ -24,7 +24,9 @@ spec:
             - /bin/sh
             - -c
             - |
-              exec /opt/opensandbox/task-executor -listen-addr=0.0.0.0:5758 >/tmp/task-executor.log 2>&1
+              exec /opt/opensandbox/task-executor \
+                -listen-addr=0.0.0.0:5758 \
+                -log-dir=/tmp
           env:
             - name: SANDBOX_MAIN_CONTAINER
               value: main
