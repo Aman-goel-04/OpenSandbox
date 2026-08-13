@@ -139,7 +139,8 @@ clients, so the example omits the native VNC endpoint in this mode.
 | `SANDBOX_DOMAIN` | `localhost:8080` | Sandbox service address; may include an `http://` or `https://` scheme |
 | `SANDBOX_PROTOCOL` | Domain scheme, otherwise `http` | Protocol used when `SANDBOX_DOMAIN` has no scheme (`http` or `https`) |
 | `SANDBOX_USE_SERVER_PROXY` | `false` | Route sandbox service, noVNC HTTP, and WebSocket traffic through the OpenSandbox server; required with HTTPS |
-| `SANDBOX_API_KEY` | _(optional for local)_ | API key if your server requires authentication |
+| `SANDBOX_API_KEY` | _(optional for local)_ | Example-specific API key; takes precedence over `OPEN_SANDBOX_API_KEY` |
+| `OPEN_SANDBOX_API_KEY` | _(optional for local)_ | SDK-standard API key fallback when `SANDBOX_API_KEY` is unset |
 | `SANDBOX_IMAGE` | `opensandbox/desktop:latest` | Sandbox image to use |
 | `VNC_PASSWORD` | `opensandbox` | Password for VNC access |
 
