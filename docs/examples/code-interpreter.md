@@ -130,7 +130,9 @@ spec:
           - "/bin/sh"
           - "-c"
           - |
-            /opt/opensandbox/task-executor -listen-addr=0.0.0.0:5758 >/tmp/task-executor.log 2>&1
+            /opt/opensandbox/task-executor \
+              -listen-addr=0.0.0.0:5758 \
+              -log-dir=/tmp
           env:
           - name: SANDBOX_MAIN_CONTAINER
             value: main
@@ -158,7 +160,9 @@ The lifecycle API allocates an already-running Pod from the Pool, so it does not
 
 The Pool template must provide all parts of that execution path:
 
-- Install and run task-executor, listening on `0.0.0.0:5758`.
+- Install and run task-executor, listening on `0.0.0.0:5758`. Set its
+  `-log-dir` explicitly so the troubleshooting path is deterministic; the
+  example writes `/tmp/task-executor.log`.
 - Install execd and `bootstrap.sh` into the shared volume before the Pod starts.
 - Keep `bootstrap.sh` at `/opt/opensandbox/bootstrap.sh`. The server-generated task invokes that exact path. The execd binary can use another path only when the task-executor environment sets `EXECD` accordingly.
 - Start execd through `bootstrap.sh` after allocation so request-specific values such as `EXECD_ACCESS_TOKEN` are available. The example above leaves task-executor as the warm Pod's foreground process for this reason.
