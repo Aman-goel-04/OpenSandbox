@@ -52,6 +52,12 @@ HOP_BY_HOP_HEADERS = {
     "upgrade",
 }
 
+# Uvicorn adds this to client-facing responses. Forwarding the backend value as
+# well would produce a duplicate field on the wire.
+SERVER_GENERATED_RESPONSE_HEADERS = {
+    "server",
+}
+
 # Headers that shouldn't be forwarded to untrusted/internal backends
 SENSITIVE_HEADERS = {
     "authorization",
@@ -303,10 +309,11 @@ async def _proxy_http_request(
                 for header in connection_header.split(",")
                 if header.strip()
             )
+        response_header_exclusions = hop_by_hop | SERVER_GENERATED_RESPONSE_HEADERS
         response_headers = {
             key: value
             for key, value in resp.headers.items()
-            if key.lower() not in hop_by_hop
+            if key.lower() not in response_header_exclusions
         }
 
         return StreamingResponse(

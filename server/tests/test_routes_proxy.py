@@ -208,6 +208,44 @@ def test_proxy_forwards_filtered_headers_and_query(
     assert fake_client.response.aclose_called is True
 
 
+def test_proxy_preserves_origin_date_and_filters_server_header(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+) -> None:
+    class StubService:
+        @staticmethod
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+            assert sandbox_id == "sbx-123"
+            assert port == 44772
+            assert resolve_internal is True
+            return Endpoint(endpoint="backend.example:40109")
+
+    monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
+
+    fake_client = _FakeAsyncClient()
+    origin_date = "Wed, 21 Oct 2015 07:28:00 GMT"
+    fake_client.response = _FakeStreamingResponse(
+        headers={
+            "Date": origin_date,
+            "Server": "backend-server",
+            "X-Backend": "yes",
+        },
+        chunks=[b"proxy-ok"],
+    )
+    _set_http_client(client, fake_client)
+
+    response = client.get(
+        "/v1/sandboxes/sbx-123/proxy/44772",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    assert response.headers.get("x-backend") == "yes"
+    assert response.headers.get("date") == origin_date
+    assert "server" not in response.headers
+
+
 def test_proxy_root_path_forwards_endpoint_headers_and_query(
     client: TestClient,
     auth_headers: dict,
