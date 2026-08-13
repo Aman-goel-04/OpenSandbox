@@ -216,8 +216,11 @@ func (r *PoolReconciler) reconcilePool(ctx context.Context, pool *sandboxv1alpha
 		// was included in the alloc-status annotation. Do not let a patch failure
 		// interrupt scheduling, releasing, or scaling.
 		for _, sandbox := range batchSandboxes {
-			if err := r.backfillLegacyPoolAllocation(ctx, latestPool, sandbox, schedulePods); err != nil {
+			if err := r.backfillLegacyPoolAllocation(ctx, latestPool, sandbox, schedulePods, schedResult.LatestAllocation); err != nil {
 				logf.FromContext(ctx).Error(err, "Failed to backfill legacy pool allocation", "pool", latestPool.Name, "sandbox", sandbox.Name)
+				if result.RequeueAfter == 0 || result.RequeueAfter > defaultRetryTime {
+					result.RequeueAfter = defaultRetryTime
+				}
 			}
 		}
 
@@ -261,15 +264,15 @@ func (r *PoolReconciler) reconcilePool(ctx context.Context, pool *sandboxv1alpha
 // backfillLegacyPoolAllocation adds PoolRef and Generation to a verified legacy
 // allocation annotation. It intentionally leaves all newer or ambiguous records
 // untouched.
-func (r *PoolReconciler) backfillLegacyPoolAllocation(ctx context.Context, pool *sandboxv1alpha1.Pool, sandbox *sandboxv1alpha1.BatchSandbox, pods []*corev1.Pod) error {
+func (r *PoolReconciler) backfillLegacyPoolAllocation(ctx context.Context, pool *sandboxv1alpha1.Pool, sandbox *sandboxv1alpha1.BatchSandbox, pods []*corev1.Pod, latestAllocation map[string]string) error {
 	if sandbox.Spec.PoolRef == "" || sandbox.Spec.PoolRef != pool.Name ||
 		!sandbox.DeletionTimestamp.IsZero() ||
 		!controllerutil.ContainsFinalizer(sandbox, FinalizerPoolAllocation) {
 		return nil
 	}
 
-	allocation, err := parseSandboxAllocation(sandbox)
-	if err != nil || allocation.PoolRef != "" || !validLegacyAllocationPods(allocation.Pods) {
+	allocation, valid := parseLegacySandboxAllocation(sandbox)
+	if !valid {
 		return nil
 	}
 
@@ -295,6 +298,9 @@ func (r *PoolReconciler) backfillLegacyPoolAllocation(ctx context.Context, pool 
 		if _, ok := poolPods[podName]; !ok {
 			return nil
 		}
+		if latestAllocation[podName] != sandbox.Name {
+			return nil
+		}
 	}
 
 	allocation.PoolRef = pool.Name
@@ -315,6 +321,37 @@ func (r *PoolReconciler) backfillLegacyPoolAllocation(ctx context.Context, pool 
 	obj.Name = sandbox.Name
 	obj.Namespace = sandbox.Namespace
 	return r.Patch(ctx, obj, client.RawPatch(types.MergePatchType, patchData))
+}
+
+// parseLegacySandboxAllocation accepts only the historical pods-only JSON
+// shape. Explicit or partial newer evidence is never rewritten by migration.
+func parseLegacySandboxAllocation(sandbox *sandboxv1alpha1.BatchSandbox) (SandboxAllocation, bool) {
+	raw, ok := sandbox.GetAnnotations()[AnnoAllocStatusKey]
+	if !ok {
+		return SandboxAllocation{}, false
+	}
+	var payload map[string]stdjson.RawMessage
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil || payload == nil {
+		return SandboxAllocation{}, false
+	}
+	if _, exists := payload["poolRef"]; exists {
+		return SandboxAllocation{}, false
+	}
+	if _, exists := payload["generation"]; exists {
+		return SandboxAllocation{}, false
+	}
+	if len(payload) != 1 {
+		return SandboxAllocation{}, false
+	}
+	rawPods, ok := payload["pods"]
+	if !ok {
+		return SandboxAllocation{}, false
+	}
+	var pods []string
+	if err := json.Unmarshal(rawPods, &pods); err != nil || !validLegacyAllocationPods(pods) {
+		return SandboxAllocation{}, false
+	}
+	return SandboxAllocation{Pods: pods}, true
 }
 
 func validLegacyAllocationPods(pods []string) bool {

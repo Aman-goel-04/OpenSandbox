@@ -729,7 +729,32 @@ class SandboxInfo(
     val metadata: Map<String, String>? = null,
     val extensions: Map<String, String>? = null,
     val allocation: SandboxAllocation? = null,
-)
+) {
+    constructor(
+        id: String,
+        status: SandboxStatus,
+        entrypoint: List<String>,
+        expiresAt: OffsetDateTime?,
+        createdAt: OffsetDateTime,
+        image: SandboxImageSpec?,
+        snapshotId: String?,
+        platform: PlatformSpec?,
+        metadata: Map<String, String>?,
+        extensions: Map<String, String>?,
+    ) : this(
+        id = id,
+        status = status,
+        entrypoint = entrypoint,
+        expiresAt = expiresAt,
+        createdAt = createdAt,
+        image = image,
+        snapshotId = snapshotId,
+        platform = platform,
+        metadata = metadata,
+        extensions = extensions,
+        allocation = null,
+    )
+}
 
 /**
  * Current runtime-confirmed pool allocation for a sandbox.
