@@ -579,6 +579,10 @@ func (p *DefaultSandboxPool) ReleaseAllIdle(ctx context.Context) (int, error) {
 // ReleaseAllIdleParallel drains all idle sandboxes and kills them with bounded
 // concurrency. It blocks until every drained sandbox has received a best-effort
 // kill attempt. maxWorkers must be positive.
+//
+// ctx only bounds the drain phase. Once an ID has been drained, its kill attempt
+// uses an independent timeout and completes before this method returns, even if
+// ctx is cancelled.
 func (p *DefaultSandboxPool) ReleaseAllIdleParallel(ctx context.Context, maxWorkers int) (int, error) {
 	if maxWorkers <= 0 {
 		return 0, fmt.Errorf("opensandbox: pool release all idle parallel: maxWorkers must be positive, got %d", maxWorkers)

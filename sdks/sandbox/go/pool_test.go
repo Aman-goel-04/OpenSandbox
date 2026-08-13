@@ -478,12 +478,31 @@ type failAfterTakeStore struct {
 	err             error
 }
 
+type cancelAfterTakeStore struct {
+	*InMemoryPoolStateStore
+	successfulTakes int
+	takes           int
+	cancel          context.CancelFunc
+}
+
 func (s *failAfterTakeStore) TryTakeIdle(ctx context.Context, poolName string) (string, error) {
 	if s.takes >= s.successfulTakes {
 		return "", s.err
 	}
 	s.takes++
 	return s.InMemoryPoolStateStore.TryTakeIdle(ctx, poolName)
+}
+
+func (s *cancelAfterTakeStore) TryTakeIdle(ctx context.Context, poolName string) (string, error) {
+	sandboxID, err := s.InMemoryPoolStateStore.TryTakeIdle(ctx, poolName)
+	if err != nil || sandboxID == "" {
+		return sandboxID, err
+	}
+	s.takes++
+	if s.takes == s.successfulTakes {
+		s.cancel()
+	}
+	return sandboxID, nil
 }
 
 func (s *failingTakeStore) TryTakeIdle(_ context.Context, _ string) (string, error) {
@@ -917,6 +936,58 @@ func TestPool_ReleaseAllIdle_BoundsConcurrentKills(t *testing.T) {
 	}
 	if deleted.Load() != 55 {
 		t.Errorf("deleted = %d, want 55", deleted.Load())
+	}
+}
+
+func TestPool_ReleaseAllIdleParallel_CompletesDrainedKillsAfterContextCancellation(t *testing.T) {
+	const (
+		totalSandboxes      = 5
+		drainedBeforeCancel = 3
+	)
+	var deleted atomic.Int32
+	lifecycleSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		deleted.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(lifecycleSrv.Close)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := &cancelAfterTakeStore{
+		InMemoryPoolStateStore: NewInMemoryPoolStateStore(),
+		successfulTakes:        drainedBeforeCancel,
+		cancel:                 cancel,
+	}
+	pool := newTestPool(t, lifecycleSrv.URL, func(b *SandboxPoolBuilder) {
+		b.MaxIdle(0).StateStore(store)
+	})
+	for i := 0; i < totalSandboxes; i++ {
+		if err := store.PutIdle(ctx, "test-pool", fmt.Sprintf("idle-%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	released, err := pool.ReleaseAllIdleParallel(ctx, 2)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ReleaseAllIdleParallel() error = %v, want context.Canceled", err)
+	}
+	if released != drainedBeforeCancel {
+		t.Fatalf("released = %d, want %d", released, drainedBeforeCancel)
+	}
+	if got := deleted.Load(); got != drainedBeforeCancel {
+		t.Errorf("deleted = %d, want %d", got, drainedBeforeCancel)
+	}
+	counters, snapshotErr := store.SnapshotCounters(context.Background(), "test-pool")
+	if snapshotErr != nil {
+		t.Fatal(snapshotErr)
+	}
+	if want := totalSandboxes - drainedBeforeCancel; counters.IdleCount != want {
+		t.Errorf("remaining idle = %d, want %d", counters.IdleCount, want)
 	}
 }
 
