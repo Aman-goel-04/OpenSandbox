@@ -78,8 +78,6 @@ def main() -> None:
 
     connection_config = ConnectionConfig(**config_values) if config_values else None
     mcp = create_server(connection_config=connection_config)
-    connection_config = ConnectionConfig(**config_values) if config_values else None
-    mcp = create_server(connection_config=connection_config)
 
     if args.transport == "streamable-http":
         mcp.run(
