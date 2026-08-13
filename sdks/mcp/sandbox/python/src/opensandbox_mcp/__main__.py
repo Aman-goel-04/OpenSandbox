@@ -76,8 +76,8 @@ def main() -> None:
     if args.use_server_proxy:
         config_values["use_server_proxy"] = True
 
-     connection_config = ConnectionConfig(**config_values) if config_values else None
-     mcp = create_server(connection_config=connection_config)
+    connection_config = ConnectionConfig(**config_values) if config_values else None
+    mcp = create_server(connection_config=connection_config)
     connection_config = ConnectionConfig(**config_values) if config_values else None
     mcp = create_server(connection_config=connection_config)
 
