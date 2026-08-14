@@ -340,13 +340,23 @@ log.Printf("retired %s: drained=%d killed=%d",
 leave them nil for the defaults (30s and 7 days), or set an explicit zero to drain
 without a deadline and to write a tombstone that never expires.
 
-While a namespace is fenced, the state store refuses `PutIdle`, `SetMaxIdle`, and
-`SetIdleEntryTTL` with a `*PoolDestroyedError`, and no peer can take or renew the
-primary lock. That is what makes retirement safe without stopping every writer first:
-a surviving pool observes the fence on its next reconcile tick and stops warming up.
+The fence is what makes retirement safe without stopping every writer first, and it
+is enforced on two levels. The state store refuses `PutIdle`, `SetMaxIdle` and
+`SetIdleEntryTTL` with a `*PoolDestroyedError` and hands out no primary lock, which
+stops replenishment. The pool itself also checks the fence when it starts, on every
+acquire, again after a direct create, and on each reconcile tick: a surviving peer
+stops outright on its next tick, an in-flight acquire fails rather than minting a
+fresh sandbox into the retired namespace through the direct-create fallthrough, and a
+sandbox created just before the fence landed is killed instead of handed out.
 Starting a fresh pool against a tombstoned `PoolName` fails for the same reason, so
 rebinding the name requires either waiting out the tombstone TTL or rotating to a new
 `PoolName`.
+
+One deliberate exception: if the state store itself is unreachable, the destroy state
+is unknowable, so policies that already fall through to direct create on a store
+outage (`DIRECT_CREATE`, `RETRY_NEXT_IDLE_THEN_CREATE`) assume `ACTIVE` and proceed,
+matching the existing `try_take_idle` outage behavior in the OSEP-0005 error-code
+matrix. `FAIL_FAST` and `RETRY_NEXT_IDLE` surface the outage instead.
 
 ## Further reading
 

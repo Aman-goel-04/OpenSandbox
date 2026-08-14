@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -414,6 +415,22 @@ func TestSandboxPoolManager_Destroy_FenceStopsLivePool(t *testing.T) {
 		}
 	}
 
+	// The reconcile tick observes the fence and stops the pool outright.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		snapshot, err := pool.Snapshot(ctx)
+		if err != nil {
+			t.Fatalf("Snapshot failed: %v", err)
+		}
+		if snapshot.LifecycleState == PoolLifecycleStopped {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pool state = %s after destroy, want STOPPED", snapshot.LifecycleState)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
 	// A peer starting fresh against the tombstoned namespace must refuse to run.
 	peer := newTestPool(t, lifecycleSrv.URL, func(b *SandboxPoolBuilder) {
 		b.StateStore(store).MaxIdle(2)
@@ -422,6 +439,256 @@ func TestSandboxPoolManager_Destroy_FenceStopsLivePool(t *testing.T) {
 	var destroyed *PoolDestroyedError
 	if !errors.As(err, &destroyed) {
 		t.Fatalf("peer Start error = %v, want *PoolDestroyedError", err)
+	}
+}
+
+// countingLifecycleServer is a mock lifecycle API that records how many
+// sandboxes were created and killed.
+type countingLifecycleServer struct {
+	srv     *httptest.Server
+	created atomic.Int32
+	deleted atomic.Int32
+}
+
+func newCountingLifecycleServer(t *testing.T, execdURL string) *countingLifecycleServer {
+	t.Helper()
+	c := &countingLifecycleServer{}
+	c.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		switch {
+		case r.Method == http.MethodPost && path == "/v1/sandboxes":
+			c.created.Add(1)
+			jsonResponse(w, http.StatusCreated, SandboxInfo{
+				ID:         fmt.Sprintf("sbx-created-%d", c.created.Load()),
+				Status:     SandboxStatus{State: StateRunning},
+				Entrypoint: []string{"tail", "-f", "/dev/null"},
+				CreatedAt:  time.Now().UTC(),
+			})
+		case r.Method == http.MethodGet && strings.Contains(path, "/endpoints/"):
+			jsonResponse(w, http.StatusOK, Endpoint{
+				Endpoint: execdURL,
+				Headers:  map[string]string{"X-EXECD-ACCESS-TOKEN": "test-token"},
+			})
+		case r.Method == http.MethodGet && strings.HasPrefix(path, "/v1/sandboxes/"):
+			parts := strings.Split(path, "/")
+			jsonResponse(w, http.StatusOK, SandboxInfo{
+				ID:         parts[len(parts)-1],
+				Status:     SandboxStatus{State: StateRunning},
+				Entrypoint: []string{"tail", "-f", "/dev/null"},
+				CreatedAt:  time.Now().UTC(),
+			})
+		case r.Method == http.MethodDelete && strings.HasPrefix(path, "/v1/sandboxes/"):
+			c.deleted.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && strings.HasSuffix(path, "/renew-expiration"):
+			jsonResponse(w, http.StatusOK, RenewExpirationResponse{ExpiresAt: time.Now().Add(time.Hour).UTC()})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(c.srv.Close)
+	return c
+}
+
+// scriptedDestroyStateStore overrides GetDestroyState so a test can drive the
+// fence independently of the rest of the store.
+type scriptedDestroyStateStore struct {
+	*InMemoryPoolStateStore
+
+	// err, when set, is returned from every GetDestroyState call.
+	err error
+	// activeCalls is how many leading calls report ACTIVE before the namespace
+	// starts reporting DESTROYED. Ignored when err is set.
+	activeCalls int32
+
+	calls atomic.Int32
+}
+
+func (s *scriptedDestroyStateStore) GetDestroyState(_ context.Context, _ string) (PoolDestroyState, error) {
+	n := s.calls.Add(1)
+	if s.err != nil {
+		return PoolDestroyStateActive, s.err
+	}
+	if n <= s.activeCalls {
+		return PoolDestroyStateActive, nil
+	}
+	return PoolDestroyStateDestroyed, nil
+}
+
+// TestSandboxPoolManager_Destroy_BlocksDirectCreateOnLivePool covers the case a
+// store-level fence alone cannot: a peer that is still RUNNING when the fence
+// lands would otherwise find an empty idle buffer and mint a fresh sandbox into
+// the retired namespace via the direct-create fallthrough.
+func TestSandboxPoolManager_Destroy_BlocksDirectCreateOnLivePool(t *testing.T) {
+	ctx := context.Background()
+	execdSrv := newMockExecdServer(t)
+	lifecycle := newCountingLifecycleServer(t, execdSrv.URL)
+	store := NewInMemoryPoolStateStore()
+
+	// MaxIdle 0 and a long interval keep the pool RUNNING: no reconcile tick
+	// fires to observe the fence and stop it.
+	pool := newTestPool(t, lifecycle.srv.URL, func(b *SandboxPoolBuilder) {
+		b.StateStore(store).MaxIdle(0).ReconcileInterval(time.Hour).
+			EmptyBehavior(AcquirePolicyDirectCreate)
+	})
+	if err := pool.Start(ctx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	t.Cleanup(func() { _ = pool.Shutdown(context.Background(), false) })
+
+	// Sanity check: before the destroy, direct create is the expected behavior.
+	sb, err := pool.Acquire(ctx, AcquireOptions{})
+	if err != nil {
+		t.Fatalf("Acquire before destroy failed: %v", err)
+	}
+	_ = sb.Close()
+	if got := lifecycle.created.Load(); got != 1 {
+		t.Fatalf("created = %d before destroy, want 1", got)
+	}
+
+	manager := newTestPoolManager(t, store, lifecycle.srv.URL)
+	if _, err := manager.Destroy(ctx, "test-pool", PoolDestroyOptions{}); err != nil {
+		t.Fatalf("Destroy failed: %v", err)
+	}
+
+	snapshot, err := pool.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot failed: %v", err)
+	}
+	if snapshot.LifecycleState != PoolLifecycleRunning {
+		t.Fatalf("pool state = %s, want RUNNING (the test needs a live peer)", snapshot.LifecycleState)
+	}
+
+	_, err = pool.Acquire(ctx, AcquireOptions{})
+	var destroyed *PoolDestroyedError
+	if !errors.As(err, &destroyed) {
+		t.Fatalf("Acquire after destroy = %v, want *PoolDestroyedError", err)
+	}
+	if got := lifecycle.created.Load(); got != 1 {
+		t.Errorf("created = %d after destroy, want 1 (no sandbox may be minted into a retired namespace)", got)
+	}
+}
+
+// TestPool_Acquire_KillsSandboxFencedMidCreate covers a destroy that lands while
+// a direct create is already in flight.
+func TestPool_Acquire_KillsSandboxFencedMidCreate(t *testing.T) {
+	ctx := context.Background()
+	execdSrv := newMockExecdServer(t)
+	lifecycle := newCountingLifecycleServer(t, execdSrv.URL)
+
+	// The namespace is checked at Start and again before the acquire; both must
+	// see ACTIVE. The third check is the post-create one, and that is the one
+	// this test wants fenced.
+	store := &scriptedDestroyStateStore{
+		InMemoryPoolStateStore: NewInMemoryPoolStateStore(),
+		activeCalls:            2,
+	}
+
+	pool := newTestPool(t, lifecycle.srv.URL, func(b *SandboxPoolBuilder) {
+		b.StateStore(store).MaxIdle(0).ReconcileInterval(time.Hour)
+	})
+	if err := pool.Start(ctx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	t.Cleanup(func() { _ = pool.Shutdown(context.Background(), false) })
+
+	_, err := pool.Acquire(ctx, AcquireOptions{})
+	var destroyed *PoolDestroyedError
+	if !errors.As(err, &destroyed) {
+		t.Fatalf("Acquire = %v, want *PoolDestroyedError", err)
+	}
+	if got := lifecycle.created.Load(); got != 1 {
+		t.Fatalf("created = %d, want 1", got)
+	}
+
+	// The orphaned sandbox is killed asynchronously.
+	deadline := time.Now().Add(5 * time.Second)
+	for lifecycle.deleted.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("sandbox created before the fence was never killed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestPool_Acquire_NamespaceCheckDegradesOnStoreOutage keeps a store outage from
+// making direct-create policies less available than the OSEP-0005 matrix
+// documents, while fail-closed policies still surface it.
+func TestPool_Acquire_NamespaceCheckDegradesOnStoreOutage(t *testing.T) {
+	tests := []struct {
+		name        string
+		policy      AcquirePolicy
+		wantCreated int32
+		wantErr     bool
+	}{
+		{name: "direct create degrades", policy: AcquirePolicyDirectCreate, wantCreated: 1},
+		{name: "retry then create degrades", policy: AcquirePolicyRetryNextIdleThenCreate, wantCreated: 1},
+		{name: "fail fast surfaces the outage", policy: AcquirePolicyFailFast, wantErr: true},
+		{name: "retry next idle surfaces the outage", policy: AcquirePolicyRetryNextIdle, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			execdSrv := newMockExecdServer(t)
+			lifecycle := newCountingLifecycleServer(t, execdSrv.URL)
+			store := &scriptedDestroyStateStore{
+				InMemoryPoolStateStore: NewInMemoryPoolStateStore(),
+				err:                    errors.New("redis is down"),
+			}
+
+			pool := newTestPool(t, lifecycle.srv.URL, func(b *SandboxPoolBuilder) {
+				b.StateStore(store).MaxIdle(0).ReconcileInterval(time.Hour).
+					EmptyBehavior(tt.policy)
+			})
+			if err := pool.Start(ctx); err != nil {
+				t.Fatalf("Start failed: %v", err)
+			}
+			t.Cleanup(func() { _ = pool.Shutdown(context.Background(), false) })
+
+			sb, err := pool.Acquire(ctx, AcquireOptions{})
+			if tt.wantErr {
+				var unavailable *PoolStateStoreUnavailableError
+				if !errors.As(err, &unavailable) {
+					t.Fatalf("Acquire = %v, want *PoolStateStoreUnavailableError", err)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("Acquire failed: %v", err)
+				}
+				_ = sb.Close()
+			}
+			if got := lifecycle.created.Load(); got != tt.wantCreated {
+				t.Errorf("created = %d, want %d", got, tt.wantCreated)
+			}
+		})
+	}
+}
+
+func TestPool_Start_RefusesDestroyedNamespace(t *testing.T) {
+	ctx := context.Background()
+	execdSrv := newMockExecdServer(t)
+	lifecycleSrv := newMockLifecycleServer(t, execdSrv.URL)
+	store := &scriptedDestroyStateStore{
+		InMemoryPoolStateStore: NewInMemoryPoolStateStore(),
+	}
+
+	pool := newTestPool(t, lifecycleSrv.URL, func(b *SandboxPoolBuilder) {
+		b.StateStore(store).MaxIdle(0).ReconcileInterval(time.Hour)
+	})
+
+	err := pool.Start(ctx)
+	var destroyed *PoolDestroyedError
+	if !errors.As(err, &destroyed) {
+		t.Fatalf("Start = %v, want *PoolDestroyedError", err)
+	}
+
+	snapshot, err := pool.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot failed: %v", err)
+	}
+	if snapshot.LifecycleState != PoolLifecycleNotStarted {
+		t.Errorf("state after refused Start = %s, want NOT_STARTED", snapshot.LifecycleState)
 	}
 }
 
