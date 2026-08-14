@@ -1018,6 +1018,61 @@ class SandboxPoolTest {
     }
 
     @Test
+    fun `stale acquire cleanup triggers replenish before periodic reconcile`() {
+        val store = CountingPoolStateStore()
+        val manager = mockk<SandboxManager>(relaxed = true)
+        val created = AtomicInteger(0)
+        val killed = CountDownLatch(1)
+        every { manager.killSandbox("warmup-1") } answers { killed.countDown() }
+
+        val config =
+            PoolConfig.builder()
+                .poolName("cleanup-reconcile-pool")
+                .ownerId("cleanup-reconcile-owner")
+                .maxIdle(1)
+                .warmupConcurrency(1)
+                .stateStore(store)
+                .connectionConfig(ConnectionConfig.builder().build())
+                .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
+                .sandboxCreator(
+                    PooledSandboxCreator {
+                        val index = created.incrementAndGet()
+                        mockk<Sandbox>(relaxed = true).also { sandbox ->
+                            every { sandbox.id } returns "warmup-$index"
+                        }
+                    },
+                ).warmupSkipHealthCheck()
+                .reconcileInterval(Duration.ofSeconds(30))
+                .drainTimeout(Duration.ofSeconds(2))
+                .build()
+        val pool =
+            SandboxPool(
+                config = config,
+                sandboxManagerFactory = { manager },
+                idleSandboxConnector = { throw RuntimeException("stale sandbox") },
+            )
+
+        pool.start()
+        try {
+            awaitCondition {
+                store.snapshotCounters("cleanup-reconcile-pool").idleCount == 1 &&
+                    store.reconcileTicks.get() >= 2
+            }
+
+            assertThrows(PoolAcquireFailedException::class.java) {
+                pool.acquire(policy = AcquirePolicy.FAIL_FAST)
+            }
+
+            assertTrue(killed.await(5, TimeUnit.SECONDS))
+            awaitCondition {
+                created.get() == 2 && store.snapshotCounters("cleanup-reconcile-pool").idleCount == 1
+            }
+        } finally {
+            pool.shutdown(graceful = false)
+        }
+    }
+
+    @Test
     fun `acquire with RETRY_NEXT_IDLE and empty idle throws PoolEmptyException`() {
         val pool = buildPool()
         pool.start()
