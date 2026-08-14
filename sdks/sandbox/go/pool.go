@@ -329,6 +329,12 @@ func (p *DefaultSandboxPool) Acquire(ctx context.Context, opts AcquireOptions) (
 				go p.killDiscardedAliveSandboxes(pendingKill)
 				return nil, &PoolNotRunningError{PoolName: p.config.PoolName, State: currentState}
 			}
+			// A destroy may have landed since the preflight check. Stop retrying rather
+			// than pop further idle IDs out from under the drain.
+			if err := p.ensureNamespaceActiveForAcquire(ctx, policy); err != nil {
+				go p.killDiscardedAliveSandboxes(pendingKill)
+				return nil, err
+			}
 			continue
 		}
 		// Connect + readiness succeeded. From here on the sandbox is a healthy, borrowable idle:
@@ -351,6 +357,15 @@ func (p *DefaultSandboxPool) Acquire(ctx context.Context, opts AcquireOptions) (
 				go p.killDiscardedAliveSandboxes(pendingKill)
 				return nil, fmt.Errorf("opensandbox: pool acquire: renew after connect failed: %w", renewErr)
 			}
+		}
+		// TryTakeIdle is unfenced so the destroy manager can drain, so this ID is
+		// already out of the store and a destroy can no longer reach it. Re-check
+		// before handing it over, fail-closed: if the store cannot confirm the
+		// namespace is ACTIVE, kill the sandbox rather than leak it into a
+		// namespace that may be retired.
+		if err := p.ensureNamespaceActiveAfterCreate(ctx, sb, nil); err != nil {
+			go p.killDiscardedAliveSandboxes(pendingKill)
+			return nil, err
 		}
 		go p.killDiscardedAliveSandboxes(pendingKill)
 		p.config.Logger.Debug("acquire: from idle",
@@ -465,7 +480,7 @@ func (p *DefaultSandboxPool) directCreate(ctx context.Context, opts AcquireOptio
 		return nil, err
 	}
 	// Re-check: a destroy may have landed while this sandbox was being created.
-	if err := p.ensureNamespaceActiveAfterCreate(ctx, sb, policy); err != nil {
+	if err := p.ensureNamespaceActiveAfterCreate(ctx, sb, &policy); err != nil {
 		return nil, err
 	}
 	return sb, nil
@@ -890,21 +905,26 @@ func (p *DefaultSandboxPool) ensureNamespaceActiveForAcquire(ctx context.Context
 	return err
 }
 
-// ensureNamespaceActiveAfterCreate re-checks the fence once a direct create has
-// produced a sandbox, so a destroy that landed mid-create does not leak a live
-// sandbox into a retired namespace. On a fence the sandbox is killed and closed.
-func (p *DefaultSandboxPool) ensureNamespaceActiveAfterCreate(ctx context.Context, sb *Sandbox, policy AcquirePolicy) error {
+// ensureNamespaceActiveAfterCreate re-checks the fence once the acquire path holds
+// a live sandbox, so a destroy that landed mid-acquire does not leak one into a
+// retired namespace. On a fence the sandbox is killed and closed.
+//
+// policy is non-nil only for the direct-create path, where a store outage degrades
+// the same way the rest of that path does. The idle path passes nil and stays
+// fail-closed: that sandbox is already out of the store, so an unconfirmed
+// namespace has to be treated as retired.
+func (p *DefaultSandboxPool) ensureNamespaceActiveAfterCreate(ctx context.Context, sb *Sandbox, policy *AcquirePolicy) error {
 	err := p.ensureNamespaceActive(ctx)
 	if err == nil {
 		return nil
 	}
 	var unavailable *PoolStateStoreUnavailableError
-	if errors.As(err, &unavailable) && policyFallsThroughToDirectCreate(policy) {
+	if errors.As(err, &unavailable) && policy != nil && policyFallsThroughToDirectCreate(*policy) {
 		p.config.Logger.Warn("acquire: state store unavailable during post-create namespace check, "+
 			"keeping sandbox and degrading per policy",
 			"pool_name", p.config.PoolName,
 			"sandbox_id", sb.ID(),
-			"policy", policy,
+			"policy", *policy,
 			"error", err)
 		return nil
 	}

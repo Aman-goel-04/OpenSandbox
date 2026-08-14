@@ -611,6 +611,124 @@ func TestPool_Acquire_KillsSandboxFencedMidCreate(t *testing.T) {
 	}
 }
 
+// TestPool_Acquire_KillsIdleSandboxFencedMidAcquire covers the fence landing
+// between the preflight check and the idle take. TryTakeIdle is unfenced so the
+// destroy manager can drain, which means the ID is already out of the store by
+// then and a concurrent Destroy can no longer reach it: the acquire has to kill
+// it rather than hand back a sandbox from a retired namespace.
+func TestPool_Acquire_KillsIdleSandboxFencedMidAcquire(t *testing.T) {
+	ctx := context.Background()
+	execdSrv := newMockExecdServer(t)
+	lifecycle := newCountingLifecycleServer(t, execdSrv.URL)
+
+	// Start and the acquire preflight both see ACTIVE; the post-connect check
+	// is the third call and sees the fence.
+	store := &scriptedDestroyStateStore{
+		InMemoryPoolStateStore: NewInMemoryPoolStateStore(),
+		activeCalls:            2,
+	}
+
+	pool := newTestPool(t, lifecycle.srv.URL, func(b *SandboxPoolBuilder) {
+		b.StateStore(store).MaxIdle(0).ReconcileInterval(time.Hour)
+	})
+	if err := pool.Start(ctx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	t.Cleanup(func() { _ = pool.Shutdown(context.Background(), false) })
+
+	if err := store.PutIdle(ctx, "test-pool", "sbx-idle-fenced"); err != nil {
+		t.Fatalf("PutIdle failed: %v", err)
+	}
+
+	sb, err := pool.Acquire(ctx, AcquireOptions{})
+	var destroyed *PoolDestroyedError
+	if !errors.As(err, &destroyed) {
+		if sb != nil {
+			_ = sb.Close()
+		}
+		t.Fatalf("Acquire = %v, want *PoolDestroyedError", err)
+	}
+	if got := lifecycle.created.Load(); got != 0 {
+		t.Errorf("created = %d, want 0 (the idle candidate must not be replaced)", got)
+	}
+
+	// The idle sandbox is no longer tracked anywhere, so the acquire must kill it.
+	deadline := time.Now().Add(5 * time.Second)
+	for lifecycle.deleted.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("idle sandbox taken before the fence was never killed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestPool_Acquire_IdlePathFenceCheckIsFailClosed pins the deliberate asymmetry
+// with the direct-create path: an idle sandbox is already out of the store, so an
+// unreachable store cannot be assumed ACTIVE the way direct create may.
+func TestPool_Acquire_IdlePathFenceCheckIsFailClosed(t *testing.T) {
+	ctx := context.Background()
+	execdSrv := newMockExecdServer(t)
+	lifecycle := newCountingLifecycleServer(t, execdSrv.URL)
+
+	inner := NewInMemoryPoolStateStore()
+	if err := inner.PutIdle(ctx, "test-pool", "sbx-idle-outage"); err != nil {
+		t.Fatalf("PutIdle failed: %v", err)
+	}
+
+	// Report ACTIVE for Start and the preflight, then fail. DIRECT_CREATE would
+	// degrade and keep going; the idle path must not.
+	store := &outageAfterNCallsStore{
+		InMemoryPoolStateStore: inner,
+		okCalls:                2,
+	}
+
+	pool := newTestPool(t, lifecycle.srv.URL, func(b *SandboxPoolBuilder) {
+		b.StateStore(store).MaxIdle(0).ReconcileInterval(time.Hour).
+			EmptyBehavior(AcquirePolicyDirectCreate)
+	})
+	if err := pool.Start(ctx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	t.Cleanup(func() { _ = pool.Shutdown(context.Background(), false) })
+
+	sb, err := pool.Acquire(ctx, AcquireOptions{})
+	if err == nil {
+		_ = sb.Close()
+		t.Fatal("Acquire succeeded with an unconfirmable namespace, want an error")
+	}
+	var unavailable *PoolStateStoreUnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("Acquire = %v, want *PoolStateStoreUnavailableError", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for lifecycle.deleted.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("idle sandbox was never killed after the fail-closed check")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// outageAfterNCallsStore answers GetDestroyState normally for the first okCalls
+// calls and then reports the store as unreachable.
+type outageAfterNCallsStore struct {
+	*InMemoryPoolStateStore
+
+	okCalls int32
+	calls   atomic.Int32
+}
+
+func (s *outageAfterNCallsStore) GetDestroyState(ctx context.Context, poolName string) (PoolDestroyState, error) {
+	if s.calls.Add(1) <= s.okCalls {
+		return s.InMemoryPoolStateStore.GetDestroyState(ctx, poolName)
+	}
+	return PoolDestroyStateActive, &PoolStateStoreUnavailableError{
+		Operation: "GetDestroyState",
+		Cause:     errors.New("redis is down"),
+	}
+}
+
 // TestPool_Acquire_NamespaceCheckDegradesOnStoreOutage keeps a store outage from
 // making direct-create policies less available than the OSEP-0005 matrix
 // documents, while fail-closed policies still surface it.
