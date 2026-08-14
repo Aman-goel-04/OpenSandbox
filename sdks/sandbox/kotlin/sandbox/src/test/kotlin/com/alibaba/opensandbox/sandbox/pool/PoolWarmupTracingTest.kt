@@ -150,6 +150,17 @@ class PoolWarmupTracingTest {
             // Root span is backdated to submission, so the trace covers the
             // queue wait before the create phase.
             assertTrue(root.startEpochNanos <= create.startEpochNanos)
+            // Root start must be epoch wall-clock (not monotonic nanoTime):
+            // within a minute of test start, and not some arbitrary boot-relative value.
+            val testStartEpochNanos = System.currentTimeMillis() * 1_000_000L
+            assertTrue(
+                root.startEpochNanos <= testStartEpochNanos,
+                "root start must be in the past relative to test start",
+            )
+            assertTrue(
+                root.startEpochNanos >= testStartEpochNanos - Duration.ofMinutes(1).toNanos(),
+                "root start must be epoch wall-clock near test start",
+            )
         } finally {
             pool.shutdown(graceful = false)
         }
@@ -189,6 +200,54 @@ class PoolWarmupTracingTest {
                 "failure must be recorded on the root span",
             )
             assertTrue(spans.none { it.name == PoolTracer.WARMUP_COMMIT_SPAN })
+        } finally {
+            pool.shutdown(graceful = false)
+        }
+    }
+
+    @Test
+    fun `dropped warmup commit is traced as a failure`() {
+        val spanExporter = installSdkTracerProvider()
+        val store = LockLossOnCommitPoolStateStore()
+        val pool =
+            SandboxPool.builder()
+                .poolName("trace-drop-pool")
+                .ownerId("trace-drop-owner")
+                .maxIdle(1)
+                .warmupConcurrency(1)
+                .stateStore(store)
+                .connectionConfig(ConnectionConfig.builder().enableTracing().build())
+                .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
+                .sandboxCreator(
+                    PooledSandboxCreator {
+                        mockk<Sandbox>(relaxed = true).also { sandbox ->
+                            every { sandbox.id } returns "warmup-dropped-1"
+                        }
+                    },
+                ).warmupSkipHealthCheck()
+                .warmupSandboxPreparer(
+                    SandboxPreparer {
+                        store.failRenewPrimaryLock = true
+                    },
+                ).reconcileInterval(Duration.ofSeconds(30))
+                .drainTimeout(Duration.ofSeconds(2))
+                .build()
+
+        pool.start()
+        try {
+            awaitCondition { spanExporter.finishedSpanItems.any { it.name == PoolTracer.WARMUP_ROOT_SPAN } }
+            val spans = spanExporter.finishedSpanItems
+            val root = spans.single { it.name == PoolTracer.WARMUP_ROOT_SPAN }
+            assertEquals("failure", root.attributes[AttributeKey.stringKey(PoolTracer.ATTR_RESULT)])
+            assertEquals(
+                "warmup-lock-lost",
+                root.attributes[AttributeKey.stringKey(PoolTracer.ATTR_DROP_REASON)],
+            )
+            assertNull(root.attributes[AttributeKey.stringKey(PoolTracer.ATTR_SANDBOX_ID)])
+            assertTrue(
+                spans.any { it.name == PoolTracer.WARMUP_COMMIT_SPAN },
+                "commit phase must still be traced",
+            )
         } finally {
             pool.shutdown(graceful = false)
         }
@@ -301,5 +360,26 @@ class PoolWarmupTracingTest {
             Thread.sleep(20)
         }
         throw AssertionError("condition not met within $timeout")
+    }
+
+    /**
+     * In-memory store whose primary-lock renewal starts failing once a warmup
+     * preparer sets [failRenewPrimaryLock], so the commit path drops the
+     * warmed sandbox with `warmup-lock-lost`.
+     */
+    private class LockLossOnCommitPoolStateStore(
+        private val delegate: InMemoryPoolStateStore = InMemoryPoolStateStore(),
+    ) : com.alibaba.opensandbox.sandbox.domain.pool.PoolStateStore by delegate {
+        @Volatile
+        var failRenewPrimaryLock: Boolean = false
+
+        override fun renewPrimaryLock(
+            poolName: String,
+            ownerId: String,
+            ttl: Duration,
+        ): Boolean {
+            if (failRenewPrimaryLock) return false
+            return delegate.renewPrimaryLock(poolName, ownerId, ttl)
+        }
     }
 }

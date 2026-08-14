@@ -49,15 +49,17 @@ internal class PoolTracer private constructor(
         get() = tracer != null
 
     /**
-     * Starts the root span of one warmup trace, backdated to [submittedNanos]
-     * so the queue-wait time is part of the trace. Returns null when tracing
-     * is disabled; the caller then runs without spans.
+     * Starts the root span of one warmup trace, backdated to
+     * [submittedEpochNanos] (epoch wall-clock, see
+     * [WarmupTrace.endSuccess]) so the queue-wait time is part of the trace.
+     * Returns null when tracing is disabled; the caller then runs without
+     * spans.
      */
     fun startWarmupRoot(
         poolName: String,
         ownerId: String,
         runGeneration: Long,
-        submittedNanos: Long,
+        submittedEpochNanos: Long,
     ): WarmupTrace? {
         val t = tracer ?: return null
         val root =
@@ -65,7 +67,7 @@ internal class PoolTracer private constructor(
                 .setAttribute(ATTR_POOL_NAME, poolName)
                 .setAttribute(ATTR_POOL_OWNER, ownerId)
                 .setAttribute(ATTR_POOL_RUN_GENERATION, runGeneration)
-                .setStartTimestamp(submittedNanos, TimeUnit.NANOSECONDS)
+                .setStartTimestamp(submittedEpochNanos, TimeUnit.NANOSECONDS)
                 .startSpan()
         return WarmupTrace(root)
     }
@@ -105,6 +107,7 @@ internal class PoolTracer private constructor(
         const val ATTR_SANDBOX_ID = "sandbox.id"
         const val ATTR_SANDBOX_IMAGE = "sandbox.image"
         const val ATTR_RESULT = "result"
+        const val ATTR_DROP_REASON = "drop.reason"
 
         private const val INSTRUMENTATION_NAME = "com.alibaba.opensandbox.sandbox"
 
@@ -169,6 +172,19 @@ internal class WarmupTrace internal constructor(
     fun endFailure(error: Throwable) {
         root.recordException(error)
         root.setAttribute(PoolTracer.ATTR_RESULT, RESULT_FAILURE)
+        root.end()
+    }
+
+    /**
+     * Ends the trace as failed because the warmup outcome could not be
+     * committed (stale run, primary lock lost, or putIdle failure) — the
+     * sandbox never entered the idle pool and is scheduled for cleanup.
+     * [source] matches the pool's cleanup-source values, e.g.
+     * `warmup-lock-lost`.
+     */
+    fun endDropped(source: String) {
+        root.setAttribute(PoolTracer.ATTR_RESULT, RESULT_FAILURE)
+        root.setAttribute(PoolTracer.ATTR_DROP_REASON, source)
         root.end()
     }
 

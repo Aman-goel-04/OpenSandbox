@@ -1009,7 +1009,7 @@ class SandboxPool internal constructor(
             ) {
                 return
             }
-            val task = TrackedWarmupTask(run, System.nanoTime())
+            val task = TrackedWarmupTask(run, submittedEpochNanos())
             try {
                 run.warmupExecutor.execute(task)
             } catch (e: Exception) {
@@ -1024,9 +1024,16 @@ class SandboxPool internal constructor(
         }
     }
 
+    /**
+     * Epoch-based submission timestamp (OpenTelemetry start timestamps are
+     * wall-clock, not monotonic). Used to backdate the warmup root span so the
+     * queue-wait window is part of the trace.
+     */
+    private fun submittedEpochNanos(): Long = System.currentTimeMillis() * 1_000_000L
+
     private inner class TrackedWarmupTask(
         private val run: RunContext,
-        private val submittedNanos: Long,
+        private val submittedEpochNanos: Long,
     ) : Runnable {
         private val completed = AtomicBoolean(false)
 
@@ -1043,7 +1050,7 @@ class SandboxPool internal constructor(
                     poolName = config.poolName,
                     ownerId = config.ownerId,
                     runGeneration = run.generation,
-                    submittedNanos = submittedNanos,
+                    submittedEpochNanos = submittedEpochNanos,
                 )
             val outcome: WarmupOutcome
             if (trace == null) {
@@ -1236,7 +1243,13 @@ class SandboxPool internal constructor(
             trace.withCurrent {
                 poolTracer.withPhaseSpan(PoolTracer.WARMUP_COMMIT_SPAN) { commit() }
             }
-            trace.endSuccess(sandboxId, creationSpec.imageSpec.image)
+            if (cleanupSource != null) {
+                // The sandbox never entered the idle pool (stale run, lock
+                // lost, or commit failure); do not report a success.
+                trace.endDropped(cleanupSource)
+            } else {
+                trace.endSuccess(sandboxId, creationSpec.imageSpec.image)
+            }
         }
         cleanupSource?.let { source ->
             scheduleKillDiscardedAlive(
