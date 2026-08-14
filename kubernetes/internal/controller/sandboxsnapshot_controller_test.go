@@ -512,6 +512,7 @@ func TestBuildCommitJob_ExecutesImageCommitterDirectlyWithIsolatedArgs(t *testin
 			ServiceAccountName: "snapshot-committer",
 			NodeName:           "must-be-overridden",
 			RestartPolicy:      corev1.RestartPolicyAlways,
+			SecurityContext:    &corev1.PodSecurityContext{RunAsNonRoot: ptrToBool(true)},
 			Tolerations:        []corev1.Toleration{{Key: "snapshot", Operator: corev1.TolerationOpExists}},
 			Containers: []corev1.Container{
 				{
@@ -566,7 +567,14 @@ func TestBuildCommitJob_ExecutesImageCommitterDirectlyWithIsolatedArgs(t *testin
 	require.NotNil(t, fifoVolume.HostPath.Type)
 	assert.Equal(t, corev1.HostPathDirectoryOrCreate, *fifoVolume.HostPath.Type)
 
+	require.NotNil(t, job.Spec.Template.Spec.SecurityContext)
+	require.NotNil(t, job.Spec.Template.Spec.SecurityContext.RunAsNonRoot)
+	assert.True(t, *job.Spec.Template.Spec.SecurityContext.RunAsNonRoot)
 	require.NotNil(t, container.SecurityContext)
+	require.NotNil(t, container.SecurityContext.RunAsUser)
+	assert.Zero(t, *container.SecurityContext.RunAsUser)
+	require.NotNil(t, container.SecurityContext.RunAsNonRoot)
+	assert.False(t, *container.SecurityContext.RunAsNonRoot)
 	require.NotNil(t, container.SecurityContext.AllowPrivilegeEscalation)
 	assert.False(t, *container.SecurityContext.AllowPrivilegeEscalation)
 	require.NotNil(t, container.SecurityContext.Capabilities)

@@ -322,6 +322,7 @@ func (r *SandboxSnapshotReconciler) imageCommitterPullSecrets() []corev1.LocalOb
 func commitJobSecurityContext() *corev1.SecurityContext {
 	return &corev1.SecurityContext{
 		RunAsUser:                ptrToInt64(0),
+		RunAsNonRoot:             ptrToBool(false),
 		AllowPrivilegeEscalation: ptrToBool(false),
 		Capabilities: &corev1.Capabilities{
 			Drop: []corev1.Capability{"ALL"},
