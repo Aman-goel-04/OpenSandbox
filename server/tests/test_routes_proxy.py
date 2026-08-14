@@ -14,6 +14,7 @@
 
 import asyncio
 import gzip
+from types import SimpleNamespace
 from typing import Any, cast
 
 import httpx
@@ -326,6 +327,48 @@ def test_proxy_rewrites_only_root_relative_redirects(
 
     assert response.status_code == 302
     assert response.headers["location"] == expected_location
+
+
+def test_proxy_rewrites_root_relative_redirect_with_server_eip_path(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+) -> None:
+    class StubService:
+        @staticmethod
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+            assert sandbox_id == "sbx-123"
+            assert port == 44772
+            assert resolve_internal is True
+            return Endpoint(endpoint="backend.example:40109")
+
+    monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
+    monkeypatch.setattr(
+        lifecycle,
+        "get_config",
+        lambda: SimpleNamespace(
+            server=SimpleNamespace(eip="sandbox.example.com/opensandbox/")
+        ),
+    )
+
+    fake_client = _FakeAsyncClient()
+    fake_client.response = _FakeStreamingResponse(
+        status_code=302,
+        headers={"Location": "/login?next=%2F"},
+    )
+    _set_http_client(client, fake_client)
+
+    response = client.get(
+        "/v1/sandboxes/sbx-123/proxy/44772/",
+        headers=auth_headers,
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 302
+    assert (
+        response.headers["location"]
+        == "/opensandbox/sandboxes/sbx-123/proxy/44772/login?next=%2F"
+    )
 
 
 def test_proxy_root_path_forwards_endpoint_headers_and_query(

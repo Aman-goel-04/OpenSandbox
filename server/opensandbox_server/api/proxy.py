@@ -20,6 +20,7 @@ import hmac
 import logging
 from collections.abc import AsyncIterator, Mapping
 from typing import Optional
+from urllib.parse import urlsplit
 
 import anyio
 import httpx
@@ -181,6 +182,12 @@ def _rewrite_proxy_location(
         return location
 
     proxy_suffix = f"/sandboxes/{sandbox_id}/proxy/{port}"
+    eip = (lifecycle.get_config().server.eip or "").strip().rstrip("/")
+    if eip:
+        external_url = eip if "://" in eip else f"//{eip}"
+        external_prefix = urlsplit(external_url).path.rstrip("/")
+        return f"{external_prefix}{proxy_suffix}{location}"
+
     proxy_start = request.url.path.find(proxy_suffix)
     if proxy_start < 0:
         return location
