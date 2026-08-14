@@ -1090,11 +1090,12 @@ class SandboxPoolTest {
     @Test
     fun `acquire with RETRY_NEXT_IDLE and all stale idle drains up to maxAcquireRetries and throws`() {
         val store = InMemoryPoolStateStore()
+        val connectAttempts = AtomicInteger(0)
         // maxIdle=0 keeps the reconcile loop from creating fresh sandboxes against the (missing)
         // server; we drive idle membership manually via putIdle so the test only exercises the
         // acquire retry loop.
-        val pool =
-            SandboxPool.builder()
+        val config =
+            PoolConfig.builder()
                 .poolName("test-pool")
                 .ownerId("test-owner")
                 .maxIdle(0)
@@ -1105,7 +1106,21 @@ class SandboxPoolTest {
                 .reconcileInterval(Duration.ofSeconds(30))
                 .maxAcquireRetries(3)
                 .build()
-        // 5 stale IDs in idle; retry policy should try 3, leave 2 behind.
+        val pool =
+            SandboxPool(
+                config = config,
+                sandboxManagerFactory = { cfg ->
+                    SandboxManager.builder().connectionConfig(cfg).build()
+                },
+                idleSandboxConnector = { sandboxId ->
+                    connectAttempts.incrementAndGet()
+                    throw RuntimeException("stale sandbox $sandboxId")
+                },
+            )
+        // 5 stale IDs in idle; retry policy should try exactly 3. The leftover two are excess
+        // under maxIdle=0 and the completion-driven reconcile may remove them before the
+        // assertion, so the retry budget is verified via connector attempts instead of the
+        // residual idle count.
         repeat(5) { store.putIdle("test-pool", "stale-id-$it") }
 
         pool.start()
@@ -1113,7 +1128,7 @@ class SandboxPoolTest {
             assertThrows(PoolAcquireFailedException::class.java) {
                 pool.acquire(policy = AcquirePolicy.RETRY_NEXT_IDLE)
             }
-            assertEquals(2, store.snapshotCounters("test-pool").idleCount)
+            assertEquals(3, connectAttempts.get())
         } finally {
             pool.shutdown(graceful = false)
         }
