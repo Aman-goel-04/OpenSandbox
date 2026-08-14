@@ -54,6 +54,12 @@ Health is tracked separately as `HEALTHY | DEGRADED | DRAINING | STOPPED`; after
 exponential backoff before retrying warmup. Callers do not need to observe these states
 directly — `snapshot()` exposes them for diagnostics.
 
+The Kotlin pool treats HTTP 429 warmup responses as server back-pressure rather than
+ordinary create failures. New warmups pause for the server's `Retry-After` duration (capped
+at 60 seconds), or 10 seconds when the header is unavailable, while idle maintenance remains
+active. This local throttle does not increment the degraded failure count and resets when the
+pool instance is restarted.
+
 ![Client pool lifecycle state machine](/images/client-pool-lifecycle.svg)
 
 ### There is no `release()`
