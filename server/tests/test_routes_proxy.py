@@ -17,6 +17,7 @@ import gzip
 from typing import Any, cast
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 from starlette.requests import ClientDisconnect
 from starlette.types import Message
@@ -258,6 +259,73 @@ def test_proxy_preserves_origin_date_and_filters_server_header(
     assert response.headers.get("x-backend") == "yes"
     assert response.headers.get("date") == origin_date
     assert "server" not in response.headers
+
+
+@pytest.mark.parametrize(
+    ("request_path", "location", "expected_location"),
+    [
+        (
+            "/v1/sandboxes/sbx-123/proxy/44772/",
+            "/login?next=%2F",
+            "/v1/sandboxes/sbx-123/proxy/44772/login?next=%2F",
+        ),
+        (
+            "/sandboxes/sbx-123/proxy/44772/",
+            "/login?next=%2F",
+            "/sandboxes/sbx-123/proxy/44772/login?next=%2F",
+        ),
+        (
+            "/v1/sandboxes/sbx-123/proxy/44772/nested/page",
+            "/login?next=%2F",
+            "/v1/sandboxes/sbx-123/proxy/44772/login?next=%2F",
+        ),
+        ("/v1/sandboxes/sbx-123/proxy/44772/", "login?next=%2F", "login?next=%2F"),
+        (
+            "/v1/sandboxes/sbx-123/proxy/44772/",
+            "https://example.com/login",
+            "https://example.com/login",
+        ),
+        (
+            "/v1/sandboxes/sbx-123/proxy/44772/",
+            "//example.com/login",
+            "//example.com/login",
+        ),
+        ("/v1/sandboxes/sbx-123/proxy/44772/", "?next=%2F", "?next=%2F"),
+    ],
+)
+def test_proxy_rewrites_only_root_relative_redirects(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+    request_path: str,
+    location: str,
+    expected_location: str,
+) -> None:
+    class StubService:
+        @staticmethod
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+            assert sandbox_id == "sbx-123"
+            assert port == 44772
+            assert resolve_internal is True
+            return Endpoint(endpoint="backend.example:40109")
+
+    monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
+
+    fake_client = _FakeAsyncClient()
+    fake_client.response = _FakeStreamingResponse(
+        status_code=302,
+        headers={"Location": location},
+    )
+    _set_http_client(client, fake_client)
+
+    response = client.get(
+        request_path,
+        headers=auth_headers,
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 302
+    assert response.headers["location"] == expected_location
 
 
 def test_proxy_root_path_forwards_endpoint_headers_and_query(

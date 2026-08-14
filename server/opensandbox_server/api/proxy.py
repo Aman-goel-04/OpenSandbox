@@ -170,6 +170,24 @@ def _set_forwarded_headers(
         headers["X-Forwarded-For"] = request.client.host
 
 
+def _rewrite_proxy_location(
+    location: str,
+    request: Request,
+    sandbox_id: str,
+    port: int,
+) -> str:
+    """Keep root-relative redirects inside the current sandbox proxy route."""
+    if not location.startswith("/") or location.startswith("//"):
+        return location
+
+    proxy_suffix = f"/sandboxes/{sandbox_id}/proxy/{port}"
+    proxy_start = request.url.path.find(proxy_suffix)
+    if proxy_start < 0:
+        return location
+    proxy_path = request.url.path[: proxy_start + len(proxy_suffix)]
+    return f"{proxy_path}{location}"
+
+
 def _schedule_proxy_renew(request: Request | WebSocket, sandbox_id: str) -> None:
     proxy_renew = getattr(request.app.state, "proxy_renew_coordinator", None)
     if proxy_renew is not None:
@@ -337,7 +355,11 @@ async def _proxy_http_request(
                 )
             response_header_exclusions = hop_by_hop | SERVER_GENERATED_RESPONSE_HEADERS
             response_headers = {
-                key: value
+                key: (
+                    _rewrite_proxy_location(value, request, sandbox_id, port)
+                    if key.lower() == "location"
+                    else value
+                )
                 for key, value in resp.headers.items()
                 if key.lower() not in response_header_exclusions
             }
