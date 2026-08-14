@@ -1,0 +1,635 @@
+// Copyright 2026 Alibaba Group Holding Ltd.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package opensandbox
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+// killRecorder is a mock lifecycle server that records DELETE calls and can be
+// told to fail them or to stall before answering.
+type killRecorder struct {
+	srv     *httptest.Server
+	deleted atomic.Int32
+	fail    atomic.Bool
+	delay   atomic.Int64 // nanoseconds
+}
+
+func newKillRecorder(t *testing.T) *killRecorder {
+	t.Helper()
+	rec := &killRecorder{}
+	rec.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if d := time.Duration(rec.delay.Load()); d > 0 {
+			time.Sleep(d)
+		}
+		rec.deleted.Add(1)
+		if rec.fail.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(rec.srv.Close)
+	return rec
+}
+
+func newTestPoolManager(t *testing.T, store PoolStateStore, serverURL string) *SandboxPoolManager {
+	t.Helper()
+	manager, err := NewSandboxPoolManagerBuilder().
+		StateStore(store).
+		ConnectionConfig(ConnectionConfig{Domain: serverURL, Protocol: "http"}).
+		OwnerID("test-pool-manager").
+		Build()
+	if err != nil {
+		t.Fatalf("newTestPoolManager: Build failed: %v", err)
+	}
+	return manager
+}
+
+func seedIdle(t *testing.T, store PoolStateStore, poolName string, n int) {
+	t.Helper()
+	ctx := context.Background()
+	for i := 0; i < n; i++ {
+		if err := store.PutIdle(ctx, poolName, fmt.Sprintf("sbx-idle-%d", i)); err != nil {
+			t.Fatalf("seedIdle: PutIdle failed: %v", err)
+		}
+	}
+}
+
+func durationPtr(d time.Duration) *time.Duration { return &d }
+
+// ---------- Destroy Protocol Tests ----------
+
+func TestSandboxPoolManager_Destroy(t *testing.T) {
+	tests := []struct {
+		name          string
+		idleCount     int
+		killsFail     bool
+		options       PoolDestroyOptions
+		wantDrained   int
+		wantKilled    int
+		wantDeletions int32
+	}{
+		{
+			name:    "empty pool",
+			options: PoolDestroyOptions{},
+		},
+		{
+			name:          "drains and kills every idle sandbox",
+			idleCount:     3,
+			wantDrained:   3,
+			wantKilled:    3,
+			wantDeletions: 3,
+		},
+		{
+			name:          "kill failures are best-effort",
+			idleCount:     2,
+			killsFail:     true,
+			wantDrained:   2,
+			wantKilled:    0,
+			wantDeletions: 2,
+		},
+		{
+			name:          "zero drain timeout disables the deadline",
+			idleCount:     2,
+			options:       PoolDestroyOptions{DrainTimeout: durationPtr(0)},
+			wantDrained:   2,
+			wantKilled:    2,
+			wantDeletions: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := NewInMemoryPoolStateStore()
+			rec := newKillRecorder(t)
+			rec.fail.Store(tt.killsFail)
+			seedIdle(t, store, "test-pool", tt.idleCount)
+
+			manager := newTestPoolManager(t, store, rec.srv.URL)
+			result, err := manager.Destroy(ctx, "test-pool", tt.options)
+			if err != nil {
+				t.Fatalf("Destroy failed: %v", err)
+			}
+
+			if result.State != PoolDestroyStateDestroyed {
+				t.Errorf("state = %s, want DESTROYED", result.State)
+			}
+			if result.PoolName != "test-pool" {
+				t.Errorf("poolName = %q, want %q", result.PoolName, "test-pool")
+			}
+			if !result.PersistentStateCleared {
+				t.Error("PersistentStateCleared = false, want true")
+			}
+			if result.DrainedIdleCount != tt.wantDrained {
+				t.Errorf("DrainedIdleCount = %d, want %d", result.DrainedIdleCount, tt.wantDrained)
+			}
+			if result.KilledIdleCount != tt.wantKilled {
+				t.Errorf("KilledIdleCount = %d, want %d", result.KilledIdleCount, tt.wantKilled)
+			}
+			if got := rec.deleted.Load(); got != tt.wantDeletions {
+				t.Errorf("DELETE requests = %d, want %d", got, tt.wantDeletions)
+			}
+
+			state, err := store.GetDestroyState(ctx, "test-pool")
+			if err != nil {
+				t.Fatalf("GetDestroyState failed: %v", err)
+			}
+			if state != PoolDestroyStateDestroyed {
+				t.Errorf("store destroy state = %s, want DESTROYED", state)
+			}
+			counters, err := store.SnapshotCounters(ctx, "test-pool")
+			if err != nil {
+				t.Fatalf("SnapshotCounters failed: %v", err)
+			}
+			if counters.IdleCount != 0 {
+				t.Errorf("idle count after destroy = %d, want 0", counters.IdleCount)
+			}
+		})
+	}
+}
+
+// recordingPoolLogger captures warnings so tests can assert on best-effort paths.
+type recordingPoolLogger struct {
+	mu    sync.Mutex
+	warns []string
+}
+
+func (l *recordingPoolLogger) Info(_ string, _ ...interface{})  {}
+func (l *recordingPoolLogger) Debug(_ string, _ ...interface{}) {}
+
+func (l *recordingPoolLogger) Warn(msg string, _ ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.warns = append(l.warns, msg)
+}
+
+func (l *recordingPoolLogger) warnCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.warns)
+}
+
+func TestSandboxPoolManager_Destroy_LogsBestEffortKillFailures(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemoryPoolStateStore()
+	rec := newKillRecorder(t)
+	rec.fail.Store(true)
+	seedIdle(t, store, "test-pool", 2)
+
+	logger := &recordingPoolLogger{}
+	manager, err := NewSandboxPoolManagerBuilder().
+		StateStore(store).
+		ConnectionConfig(ConnectionConfig{Domain: rec.srv.URL, Protocol: "http"}).
+		PoolLogger(logger).
+		Build()
+	if err != nil {
+		t.Fatalf("Build failed: %v", err)
+	}
+
+	result, err := manager.Destroy(ctx, "test-pool", PoolDestroyOptions{})
+	if err != nil {
+		t.Fatalf("Destroy failed: %v", err)
+	}
+	if result.State != PoolDestroyStateDestroyed {
+		t.Errorf("state = %s, want DESTROYED (kill failures must not abort the destroy)", result.State)
+	}
+	if got := logger.warnCount(); got != 2 {
+		t.Errorf("warn count = %d, want 2 (one per failed kill)", got)
+	}
+}
+
+func TestSandboxPoolManager_Destroy_IsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemoryPoolStateStore()
+	rec := newKillRecorder(t)
+	seedIdle(t, store, "test-pool", 2)
+
+	manager := newTestPoolManager(t, store, rec.srv.URL)
+	if _, err := manager.Destroy(ctx, "test-pool", PoolDestroyOptions{}); err != nil {
+		t.Fatalf("first Destroy failed: %v", err)
+	}
+
+	result, err := manager.Destroy(ctx, "test-pool", PoolDestroyOptions{})
+	if err != nil {
+		t.Fatalf("second Destroy failed: %v", err)
+	}
+	if result.State != PoolDestroyStateDestroyed {
+		t.Errorf("state = %s, want DESTROYED", result.State)
+	}
+	if result.PersistentStateCleared {
+		t.Error("PersistentStateCleared = true on a repeat destroy, want false")
+	}
+	if result.DrainedIdleCount != 0 || result.KilledIdleCount != 0 {
+		t.Errorf("repeat destroy drained/killed = %d/%d, want 0/0", result.DrainedIdleCount, result.KilledIdleCount)
+	}
+	if got := rec.deleted.Load(); got != 2 {
+		t.Errorf("DELETE requests = %d, want 2 (the repeat destroy must not kill again)", got)
+	}
+}
+
+func TestSandboxPoolManager_Destroy_DrainTimeoutLeavesFence(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemoryPoolStateStore()
+	rec := newKillRecorder(t)
+	rec.delay.Store(int64(30 * time.Millisecond))
+	seedIdle(t, store, "test-pool", 5)
+
+	manager := newTestPoolManager(t, store, rec.srv.URL)
+	_, err := manager.Destroy(ctx, "test-pool", PoolDestroyOptions{
+		DrainTimeout: durationPtr(10 * time.Millisecond),
+	})
+
+	var incomplete *PoolDestroyIncompleteError
+	if !errors.As(err, &incomplete) {
+		t.Fatalf("Destroy error = %v, want *PoolDestroyIncompleteError", err)
+	}
+	if incomplete.PoolName != "test-pool" {
+		t.Errorf("PoolName = %q, want %q", incomplete.PoolName, "test-pool")
+	}
+
+	// The namespace stays fenced so a retry can finish the job.
+	state, err := store.GetDestroyState(ctx, "test-pool")
+	if err != nil {
+		t.Fatalf("GetDestroyState failed: %v", err)
+	}
+	if state != PoolDestroyStateDestroying {
+		t.Errorf("state after timeout = %s, want DESTROYING", state)
+	}
+
+	rec.delay.Store(0)
+	result, err := manager.Destroy(ctx, "test-pool", PoolDestroyOptions{})
+	if err != nil {
+		t.Fatalf("retry Destroy failed: %v", err)
+	}
+	if result.State != PoolDestroyStateDestroyed {
+		t.Errorf("state after retry = %s, want DESTROYED", result.State)
+	}
+}
+
+func TestSandboxPoolManager_Destroy_TombstoneTTLExpires(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemoryPoolStateStore()
+	rec := newKillRecorder(t)
+
+	manager := newTestPoolManager(t, store, rec.srv.URL)
+	if _, err := manager.Destroy(ctx, "test-pool", PoolDestroyOptions{
+		TombstoneTTL: durationPtr(20 * time.Millisecond),
+	}); err != nil {
+		t.Fatalf("Destroy failed: %v", err)
+	}
+
+	if err := store.PutIdle(ctx, "test-pool", "sbx-blocked"); err == nil {
+		t.Fatal("PutIdle succeeded while the tombstone was live, want *PoolDestroyedError")
+	}
+
+	time.Sleep(40 * time.Millisecond)
+
+	state, err := store.GetDestroyState(ctx, "test-pool")
+	if err != nil {
+		t.Fatalf("GetDestroyState failed: %v", err)
+	}
+	if state != PoolDestroyStateActive {
+		t.Errorf("state after tombstone TTL = %s, want ACTIVE", state)
+	}
+	if err := store.PutIdle(ctx, "test-pool", "sbx-rebound"); err != nil {
+		t.Errorf("PutIdle after tombstone expiry failed: %v", err)
+	}
+}
+
+func TestSandboxPoolManager_Destroy_ZeroTombstoneTTLNeverExpires(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemoryPoolStateStore()
+	rec := newKillRecorder(t)
+
+	manager := newTestPoolManager(t, store, rec.srv.URL)
+	if _, err := manager.Destroy(ctx, "test-pool", PoolDestroyOptions{
+		TombstoneTTL: durationPtr(0),
+	}); err != nil {
+		t.Fatalf("Destroy failed: %v", err)
+	}
+
+	time.Sleep(20 * time.Millisecond)
+
+	state, err := store.GetDestroyState(ctx, "test-pool")
+	if err != nil {
+		t.Fatalf("GetDestroyState failed: %v", err)
+	}
+	if state != PoolDestroyStateDestroyed {
+		t.Errorf("state = %s, want DESTROYED (a zero TTL must never expire)", state)
+	}
+}
+
+func TestSandboxPoolManager_Destroy_InvalidOptions(t *testing.T) {
+	tests := []struct {
+		name     string
+		poolName string
+		options  PoolDestroyOptions
+	}{
+		{name: "blank pool name", poolName: "   ", options: PoolDestroyOptions{}},
+		{name: "unsupported strategy", poolName: "test-pool", options: PoolDestroyOptions{Strategy: PoolDestroyStrategy(99)}},
+		{name: "negative drain timeout", poolName: "test-pool", options: PoolDestroyOptions{DrainTimeout: durationPtr(-time.Second)}},
+		{name: "negative tombstone TTL", poolName: "test-pool", options: PoolDestroyOptions{TombstoneTTL: durationPtr(-time.Second)}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewInMemoryPoolStateStore()
+			rec := newKillRecorder(t)
+			manager := newTestPoolManager(t, store, rec.srv.URL)
+
+			if _, err := manager.Destroy(context.Background(), tt.poolName, tt.options); err == nil {
+				t.Fatal("Destroy succeeded, want validation error")
+			}
+
+			// A rejected destroy must not have fenced anything.
+			state, err := store.GetDestroyState(context.Background(), "test-pool")
+			if err != nil {
+				t.Fatalf("GetDestroyState failed: %v", err)
+			}
+			if state != PoolDestroyStateActive {
+				t.Errorf("state = %s, want ACTIVE", state)
+			}
+		})
+	}
+}
+
+// ---------- Fence Observation Tests ----------
+
+func TestSandboxPoolManager_Destroy_FenceStopsLivePool(t *testing.T) {
+	ctx := context.Background()
+	execdSrv := newMockExecdServer(t)
+	lifecycleSrv := newMockLifecycleServer(t, execdSrv.URL)
+	store := NewInMemoryPoolStateStore()
+
+	pool := newTestPool(t, lifecycleSrv.URL, func(b *SandboxPoolBuilder) {
+		b.StateStore(store).MaxIdle(2).ReconcileInterval(10 * time.Millisecond)
+	})
+	if err := pool.Start(ctx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	t.Cleanup(func() { _ = pool.Shutdown(context.Background(), false) })
+
+	waitForIdleCount(t, store, "test-pool", 2)
+
+	manager := newTestPoolManager(t, store, lifecycleSrv.URL)
+	if _, err := manager.Destroy(ctx, "test-pool", PoolDestroyOptions{}); err != nil {
+		t.Fatalf("Destroy failed: %v", err)
+	}
+
+	// The still-running pool must not replenish the destroyed namespace.
+	for i := 0; i < 5; i++ {
+		time.Sleep(20 * time.Millisecond)
+		counters, err := store.SnapshotCounters(ctx, "test-pool")
+		if err != nil {
+			t.Fatalf("SnapshotCounters failed: %v", err)
+		}
+		if counters.IdleCount != 0 {
+			t.Fatalf("idle count = %d after destroy, want 0 (fenced pool must not warm up)", counters.IdleCount)
+		}
+	}
+
+	// A peer starting fresh against the tombstoned namespace must refuse to run.
+	peer := newTestPool(t, lifecycleSrv.URL, func(b *SandboxPoolBuilder) {
+		b.StateStore(store).MaxIdle(2)
+	})
+	err := peer.Start(ctx)
+	var destroyed *PoolDestroyedError
+	if !errors.As(err, &destroyed) {
+		t.Fatalf("peer Start error = %v, want *PoolDestroyedError", err)
+	}
+}
+
+func TestInMemoryPoolStateStore_FenceRejectsWrites(t *testing.T) {
+	ctx := context.Background()
+
+	for _, state := range []PoolDestroyState{PoolDestroyStateDestroying, PoolDestroyStateDestroyed} {
+		t.Run(state.String(), func(t *testing.T) {
+			store := NewInMemoryPoolStateStore()
+			if err := store.BeginDestroy(ctx, "test-pool", "owner-1"); err != nil {
+				t.Fatalf("BeginDestroy failed: %v", err)
+			}
+			if state == PoolDestroyStateDestroyed {
+				if err := store.MarkDestroyed(ctx, "test-pool", "owner-1", time.Hour); err != nil {
+					t.Fatalf("MarkDestroyed failed: %v", err)
+				}
+			}
+
+			writes := map[string]func() error{
+				"PutIdle":         func() error { return store.PutIdle(ctx, "test-pool", "sbx-1") },
+				"SetMaxIdle":      func() error { return store.SetMaxIdle(ctx, "test-pool", 5) },
+				"SetIdleEntryTTL": func() error { return store.SetIdleEntryTTL(ctx, "test-pool", time.Minute) },
+			}
+			for name, write := range writes {
+				var destroyed *PoolDestroyedError
+				if err := write(); !errors.As(err, &destroyed) {
+					t.Errorf("%s error = %v, want *PoolDestroyedError", name, err)
+				} else if destroyed.State != state {
+					t.Errorf("%s error state = %s, want %s", name, destroyed.State, state)
+				}
+			}
+
+			acquired, err := store.TryAcquirePrimaryLock(ctx, "test-pool", "owner-2", time.Minute)
+			if err != nil {
+				t.Fatalf("TryAcquirePrimaryLock failed: %v", err)
+			}
+			if acquired {
+				t.Error("TryAcquirePrimaryLock succeeded on a fenced namespace, want false")
+			}
+
+			renewed, err := store.RenewPrimaryLock(ctx, "test-pool", "owner-2", time.Minute)
+			if err != nil {
+				t.Fatalf("RenewPrimaryLock failed: %v", err)
+			}
+			if renewed {
+				t.Error("RenewPrimaryLock succeeded on a fenced namespace, want false")
+			}
+		})
+	}
+}
+
+func TestInMemoryPoolStateStore_BeginDestroyRejectsTombstoned(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemoryPoolStateStore()
+
+	if err := store.BeginDestroy(ctx, "test-pool", "owner-1"); err != nil {
+		t.Fatalf("BeginDestroy failed: %v", err)
+	}
+	// Re-entrant while DESTROYING, so a retrying owner can make progress.
+	if err := store.BeginDestroy(ctx, "test-pool", "owner-1"); err != nil {
+		t.Fatalf("second BeginDestroy on a DESTROYING namespace failed: %v", err)
+	}
+
+	if err := store.MarkDestroyed(ctx, "test-pool", "owner-1", time.Hour); err != nil {
+		t.Fatalf("MarkDestroyed failed: %v", err)
+	}
+
+	var destroyed *PoolDestroyedError
+	if err := store.BeginDestroy(ctx, "test-pool", "owner-2"); !errors.As(err, &destroyed) {
+		t.Fatalf("BeginDestroy on a tombstoned namespace = %v, want *PoolDestroyedError", err)
+	}
+}
+
+func TestInMemoryPoolStateStore_ClearPoolStateKeepsFence(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemoryPoolStateStore()
+
+	if err := store.SetMaxIdle(ctx, "test-pool", 7); err != nil {
+		t.Fatalf("SetMaxIdle failed: %v", err)
+	}
+	if err := store.PutIdle(ctx, "test-pool", "sbx-1"); err != nil {
+		t.Fatalf("PutIdle failed: %v", err)
+	}
+	if err := store.BeginDestroy(ctx, "test-pool", "owner-1"); err != nil {
+		t.Fatalf("BeginDestroy failed: %v", err)
+	}
+	if err := store.ClearPoolState(ctx, "test-pool"); err != nil {
+		t.Fatalf("ClearPoolState failed: %v", err)
+	}
+
+	counters, err := store.SnapshotCounters(ctx, "test-pool")
+	if err != nil {
+		t.Fatalf("SnapshotCounters failed: %v", err)
+	}
+	if counters.IdleCount != 0 {
+		t.Errorf("idle count = %d, want 0", counters.IdleCount)
+	}
+	maxIdle, err := store.GetMaxIdle(ctx, "test-pool")
+	if err != nil {
+		t.Fatalf("GetMaxIdle failed: %v", err)
+	}
+	if maxIdle != 0 {
+		t.Errorf("maxIdle = %d, want 0", maxIdle)
+	}
+	state, err := store.GetDestroyState(ctx, "test-pool")
+	if err != nil {
+		t.Fatalf("GetDestroyState failed: %v", err)
+	}
+	if state != PoolDestroyStateDestroying {
+		t.Errorf("state = %s, want DESTROYING (ClearPoolState must not lift the fence)", state)
+	}
+}
+
+func TestInMemoryPoolStateStore_MarkDestroyedRejectsBlankOwnerAndNegativeTTL(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemoryPoolStateStore()
+
+	if err := store.MarkDestroyed(ctx, "test-pool", "", time.Hour); err == nil {
+		t.Error("MarkDestroyed with a blank owner succeeded, want error")
+	}
+	if err := store.MarkDestroyed(ctx, "test-pool", "owner-1", -time.Second); err == nil {
+		t.Error("MarkDestroyed with a negative TTL succeeded, want error")
+	}
+	if err := store.BeginDestroy(ctx, "test-pool", ""); err == nil {
+		t.Error("BeginDestroy with a blank owner succeeded, want error")
+	}
+}
+
+// ---------- Builder Tests ----------
+
+func TestSandboxPoolManagerBuilder_Validation(t *testing.T) {
+	tests := []struct {
+		name    string
+		build   func() (*SandboxPoolManager, error)
+		wantErr bool
+	}{
+		{
+			name: "missing state store",
+			build: func() (*SandboxPoolManager, error) {
+				return NewSandboxPoolManagerBuilder().
+					ConnectionConfig(ConnectionConfig{Domain: "localhost:8080"}).
+					Build()
+			},
+			wantErr: true,
+		},
+		{
+			name: "missing connection config",
+			build: func() (*SandboxPoolManager, error) {
+				return NewSandboxPoolManagerBuilder().
+					StateStore(NewInMemoryPoolStateStore()).
+					Build()
+			},
+			wantErr: true,
+		},
+		{
+			name: "blank owner ID",
+			build: func() (*SandboxPoolManager, error) {
+				return NewSandboxPoolManagerBuilder().
+					StateStore(NewInMemoryPoolStateStore()).
+					ConnectionConfig(ConnectionConfig{Domain: "localhost:8080"}).
+					OwnerID("   ").
+					Build()
+			},
+			wantErr: true,
+		},
+		{
+			name: "defaults the owner ID",
+			build: func() (*SandboxPoolManager, error) {
+				return NewSandboxPoolManagerBuilder().
+					StateStore(NewInMemoryPoolStateStore()).
+					ConnectionConfig(ConnectionConfig{Domain: "localhost:8080"}).
+					Build()
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			manager, err := tt.build()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("Build succeeded, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Build failed: %v", err)
+			}
+			if manager.ownerID == "" {
+				t.Error("ownerID is empty, want a generated value")
+			}
+		})
+	}
+}
+
+// waitForIdleCount blocks until the store reports want idle entries.
+func waitForIdleCount(t *testing.T, store PoolStateStore, poolName string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		counters, err := store.SnapshotCounters(context.Background(), poolName)
+		if err != nil {
+			t.Fatalf("SnapshotCounters failed: %v", err)
+		}
+		if counters.IdleCount >= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d idle entries in pool %q", want, poolName)
+}
