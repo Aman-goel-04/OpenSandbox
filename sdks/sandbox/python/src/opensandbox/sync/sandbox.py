@@ -31,6 +31,7 @@ from opensandbox.exceptions import (
     SandboxInternalException,
     SandboxReadyTimeoutException,
 )
+from opensandbox.internal.lifecycle_metrics import report_sandbox_create_metric
 from opensandbox.models.diagnostics import DiagnosticContent
 from opensandbox.models.sandboxes import (
     CreateSnapshotRequest,
@@ -468,21 +469,9 @@ class SandboxSync:
             f"ConnectionConfig(domain={self.connection_config.get_domain()}, "
             f"use_server_proxy={self.connection_config.use_server_proxy})"
         )
-        if self.connection_config.use_server_proxy:
-            hint = (
-                "Hint: server proxy mode is enabled. Check server-to-sandbox connectivity "
-                "and server API key/auth configuration."
-            )
-        else:
-            hint = (
-                "Hint: direct sandbox endpoint access is enabled. If the SDK cannot directly "
-                "reach sandbox network/ports, set ConnectionConfigSync(use_server_proxy=True). "
-                "For Docker bridge deployments where server runs in a container, also configure "
-                "server [docker].host_ip to a host-reachable address."
-            )
         final_message = (
             f"Sandbox health check timed out after {timeout.total_seconds()}s "
-            f"({attempt} attempts). {error_detail}. {connection_detail}. {hint}"
+            f"({attempt} attempts). {error_detail}. {connection_detail}."
         )
         logger.error(final_message)
         raise SandboxReadyTimeoutException(final_message)
@@ -566,6 +555,7 @@ class SandboxSync:
         factory = AdapterFactorySync(config)
         sandbox_id: str | None = None
         sandbox_service: SandboxesSync | None = None
+        create_started = time.monotonic()
 
         try:
             sandbox_service = factory.create_sandbox_service()
@@ -617,8 +607,23 @@ class SandboxSync:
                     f"Sandbox {sandbox.id} created (skip_health_check=true, sandbox may not be ready yet)"
                 )
 
+            report_sandbox_create_metric(
+                config,
+                sandbox_id=sandbox.id,
+                image=startup_source,
+                create_duration_ms=int((time.monotonic() - create_started) * 1000),
+                success=True,
+            )
+
             return sandbox
         except Exception as e:
+            report_sandbox_create_metric(
+                config,
+                sandbox_id=sandbox_id,
+                image=startup_source,
+                create_duration_ms=int((time.monotonic() - create_started) * 1000),
+                success=False,
+            )
             if sandbox_id and sandbox_service:
                 try:
                     logger.warning(

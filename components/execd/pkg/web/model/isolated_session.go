@@ -121,6 +121,7 @@ type IsolatedRunRequest struct {
 	Code           string            `json:"code" validate:"required"`
 	Envs           map[string]string `json:"envs,omitempty"`
 	TimeoutSeconds int               `json:"timeout_seconds,omitempty" validate:"omitempty,gte=0"`
+	Background     bool              `json:"background,omitempty"`
 }
 
 // Validate checks IsolatedRunRequest fields.
@@ -129,14 +130,51 @@ func (r *IsolatedRunRequest) Validate() error {
 	return v.Struct(r)
 }
 
+// IsolatedBackgroundRunResponse is the handle returned for background: true runs.
+type IsolatedBackgroundRunResponse struct {
+	SessionID string    `json:"session_id"`
+	RunID     string    `json:"run_id"`
+	StartedAt time.Time `json:"started_at"`
+}
+
+// IsolatedRunStatus describes the lifecycle state of an isolated background run.
+type IsolatedRunStatus struct {
+	SessionID  string     `json:"session_id"`
+	RunID      string     `json:"run_id"`
+	Running    bool       `json:"running"`
+	ExitCode   *int       `json:"exit_code,omitempty"`
+	Error      string     `json:"error,omitempty"`
+	StartedAt  time.Time  `json:"started_at"`
+	FinishedAt *time.Time `json:"finished_at,omitempty"`
+}
+
 // Session State
 
 // SessionState is returned by GET /v1/isolated/session/<id>.
+//
+// Runtime fields (Status/CreatedAt/LastRunAt/IdleRemainingSeconds) are always
+// populated. The remaining fields echo the parameters used to create the
+// session and let a stateless client rebuild a session handle from just a
+// session ID (e.g. after a client restart). Older execd builds may omit
+// these fields; clients must tolerate them being absent.
 type SessionState struct {
-	Status               string    `json:"status"` // "active" | "destroyed"
+	Status               string    `json:"status"` // "active" | "dead" | "destroyed"
 	CreatedAt            time.Time `json:"created_at"`
 	LastRunAt            time.Time `json:"last_run_at"`
 	IdleRemainingSeconds *int      `json:"idle_remaining_seconds,omitempty"`
+
+	// Creation-parameter echoes. All optional; a session_id-only client
+	// must tolerate any of these being absent.
+	Profile            string              `json:"profile,omitempty"`
+	Workspace          *WorkspaceSpec      `json:"workspace,omitempty"`
+	ExtraWritable      []string            `json:"extra_writable,omitempty"`
+	Binds              []BindMount         `json:"binds,omitempty"`
+	ShareNet           *bool               `json:"share_net,omitempty"`
+	EnvPassthrough     *EnvPassthroughSpec `json:"env_passthrough,omitempty"`
+	Uid                *uint32             `json:"uid,omitempty"`
+	Gid                *uint32             `json:"gid,omitempty"`
+	UidMode            string              `json:"uid_mode,omitempty"`
+	IdleTimeoutSeconds *int                `json:"idle_timeout_seconds,omitempty"`
 }
 
 // IsolatedSessionSummary describes a single session in a list response.
@@ -157,10 +195,12 @@ type ListIsolatedSessionsResponse struct {
 
 // CapabilitiesResponse is returned by GET /v1/isolated/capabilities.
 type CapabilitiesResponse struct {
-	Available       bool   `json:"available"`
-	Isolator        string `json:"isolator,omitempty"`
-	Version         string `json:"version,omitempty"`
-	Message         string `json:"message,omitempty"`
-	CommitSupported bool   `json:"commit_supported"`
-	DiffSupported   bool   `json:"diff_supported"`
+	Available        bool   `json:"available"`
+	Isolator         string `json:"isolator,omitempty"`
+	Version          string `json:"version,omitempty"`
+	Message          string `json:"message,omitempty"`
+	SetprivAvailable bool   `json:"setpriv_available"`
+	UsernsAvailable  bool   `json:"userns_available"`
+	CommitSupported  bool   `json:"commit_supported"`
+	DiffSupported    bool   `json:"diff_supported"`
 }

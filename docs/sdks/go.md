@@ -231,6 +231,19 @@ func main() {
 }
 ```
 
+::: tip AcquirePolicy
+`AcquirePolicy` controls what happens when the idle buffer is empty **or** the first idle candidate fails its readiness check:
+
+| Policy | Retry across idles | Fallback on exhaustion |
+|---|---|---|
+| `AcquirePolicyFailFast` | no | return `*PoolEmptyError` / `*PoolAcquireFailedError` |
+| `AcquirePolicyDirectCreate` (default) | no | create a new sandbox via lifecycle API |
+| `AcquirePolicyRetryNextIdle` | up to `MaxAcquireRetries` idles | return error |
+| `AcquirePolicyRetryNextIdleThenCreate` | up to `MaxAcquireRetries` idles | create a new sandbox |
+
+Use the `RetryNextIdle*` variants when the pool may contain a mix of healthy and stale idle sandboxes (custom templates with long cold-start; network flap left a few unreachable idles). Each failed candidate still pays up to `AcquireReadyTimeout`, so bound the retry with `MaxAcquireRetries` (default `3`) via `builder.MaxAcquireRetries(n)` or `PoolConfig.MaxAcquireRetries`.
+:::
+
 For distributed deployment with multiple processes or pods, use `RedisPoolStateStore`.
 The store accepts a caller-managed `redis.Client` and does not create or close Redis
 connections.
@@ -283,6 +296,10 @@ pool, err := opensandbox.NewSandboxPoolBuilder().
 - All nodes sharing one pool must use the same creation and warmup definition. If that definition changes, use a new `PoolName` or key prefix and drain the old pool.
 - `Resize(ctx, maxIdle)` can be called from any node. The call returns after the target is stored in the shared state store; the current primary applies replenish or shrink work during periodic reconcile.
 - Use `Resize(ctx, 0)` and wait for `Snapshot().IdleCount == 0` to drain a distributed idle buffer. `ReleaseAllIdle()` is only a best-effort cleanup pass in distributed mode.
+- `ReleaseAllIdle(ctx)` preserves fire-and-forget kill scheduling. Call
+  `ReleaseAllIdleParallel(ctx, maxWorkers)` on `*DefaultSandboxPool` for bounded
+  parallel cleanup that waits for every drained ID to receive a kill attempt.
+  `maxWorkers` must be positive; the method is not part of the `SandboxPool` interface.
 - Configure `PrimaryLockTTL` greater than `WarmupReadyTimeout` plus expected warmup preparer time.
 :::
 
@@ -416,6 +433,10 @@ client := opensandbox.NewExecdClient(url, token,
 
 ::: info TLS Certificate Strength
 SDK-created HTTP clients enforce NIST 2030 minimum TLS certificate strength by default (RSA >= 2048, EC >= 224, DSA P >= 2048/Q >= 224, hash >= 224). If you must interoperate with legacy endpoints, set `AllowWeakServerCertKeyLengths: true` in `TransportConfig`.
+:::
+
+::: tip SDK Telemetry
+`CreateSandbox` reports create latency to `POST /v1/metrics/events` by default. Set `ConnectionConfig.DisableMetrics` or `OPENSANDBOX_DISABLE_METRICS=1` to opt out. See [SDK Telemetry](/guides/sdk-telemetry).
 :::
 
 ## Error Handling

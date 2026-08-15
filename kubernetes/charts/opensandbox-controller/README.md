@@ -73,13 +73,18 @@ kubectl delete crd sandboxsnapshots.sandbox.opensandbox.io
 | `controller.resources.requests.cpu` | CPU resource requests | `10m` |
 | `controller.resources.requests.memory` | Memory resource requests | `64Mi` |
 | `controller.logLevel` | Can be one of 'debug', 'info', 'error' | `info` |
+| `controller.metrics.enabled` | Expose the controller-runtime `/metrics` endpoint (sets `--metrics-bind-address`) | `false` |
+| `controller.metrics.port` | Port for the metrics endpoint | `8080` |
+| `controller.metrics.secure` | Serve metrics over HTTPS with authn/authz (`--metrics-secure`); set `false` for plain HTTP scraping | `false` |
 | `controller.kubeClient.qps` | QPS for Kubernetes client rate limiter | `100` |
 | `controller.kubeClient.burst` | Burst for Kubernetes client rate limiter | `200` |
 | `controller.snapshot.imageCommitterImage` | Image used by snapshot commit Jobs | `image-committer:dev` |
+| `controller.snapshot.imageCommitterPodTemplate` | PodTemplateSpec overlay for snapshot commit Job Pods | `{}` |
 | `controller.snapshot.commitJobTimeout` | Timeout duration for snapshot commit Jobs | `10m` |
 | `controller.snapshot.registry` | OCI registry prefix used for snapshot images | `""` |
 | `controller.snapshot.registryInsecure` | Use insecure registry mode for snapshot pushes | `false` |
 | `controller.snapshot.snapshotPushSecret` | Secret name used by commit Jobs to push snapshots | `""` |
+| `controller.snapshot.imageCommitterPullSecret` | Secret name for pulling the image-committer image in commit Jobs (needed when it's in a private registry) | `""` |
 | `controller.snapshot.resumePullSecret` | Secret name injected into resumed sandboxes for image pulls | `""` |
 | `controller.leaderElection.enabled` | Enable leader election | `true` |
 | `controller.nodeSelector` | Node labels for pod assignment | `{}` |
@@ -165,20 +170,35 @@ The chart exposes the snapshot-related settings below:
 controller:
   snapshot:
     imageCommitterImage: my-registry/image-committer:v0.1.1
+    imageCommitterPodTemplate:
+      metadata:
+        labels:
+          identity.example/use: "true"
+      spec:
+        serviceAccountName: snapshot-committer
+        containers:
+          - name: commit
+            resources:
+              requests:
+                cpu: 100m
+                memory: 128Mi
     commitJobTimeout: 15m
     registry: my-registry/snapshots
     registryInsecure: false
     snapshotPushSecret: registry-snapshot-push-secret
+    imageCommitterPullSecret: registry-image-committer-pull-secret
     resumePullSecret: registry-pull-secret
 ```
 
 These values render directly to the controller flags:
 
 - `--image-committer-image`
+- `--image-committer-pod-template-file`
 - `--commit-job-timeout`
 - `--snapshot-registry`
 - `--snapshot-registry-insecure`
 - `--snapshot-push-secret`
+- `--image-committer-pull-secret`
 - `--resume-pull-secret`
 
 ### Node Affinity

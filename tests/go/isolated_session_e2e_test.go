@@ -77,6 +77,61 @@ func TestIsolationSessionLifecycle(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// TestIsolationAttachRoundtrip covers the stateless-recovery flow: a
+// client that only kept the sessionId calls IsolationAttach and then
+// exercises run/get/delete through the newly-built handle. Also verifies
+// that the creation-parameter echoes are populated after attach.
+func TestIsolationAttachRoundtrip(t *testing.T) {
+	ctx, sb := createIsolatedTestSandbox(t)
+
+	created, err := sb.IsolationCreate(ctx, opensandbox.CreateIsolatedSessionRequest{
+		Workspace: opensandbox.IsolatedWorkspaceSpec{Path: "/tmp", Mode: "rw"},
+	})
+	require.NoError(t, err)
+	sessionID := created.SessionID()
+
+	// Write some state through the original handle so we can prove the
+	// attached handle really targets the same bwrap session.
+	_, err = created.Run(ctx, opensandbox.IsolatedRunRequest{
+		Code: "echo attached-state > /tmp/attach-marker.txt",
+	}, nil)
+	require.NoError(t, err)
+
+	// Simulate a stateless client that only kept the sessionID.
+	attached, err := sb.IsolationAttach(ctx, sessionID)
+	require.NoError(t, err)
+	assert.Equal(t, sessionID, attached.SessionID())
+
+	// Creation-parameter echoes should be populated by GET.
+	info := attached.Info()
+	require.NotNil(t, info)
+	require.NotNil(t, info.Workspace)
+	assert.Equal(t, "/tmp", info.Workspace.Path)
+	assert.Equal(t, "rw", info.Workspace.Mode)
+
+	// Handle works end-to-end via sessionID alone.
+	state, err := attached.Get(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, "active", state.Status)
+
+	exec, err := attached.Run(ctx, opensandbox.IsolatedRunRequest{
+		Code: "cat /tmp/attach-marker.txt",
+	}, nil)
+	require.NoError(t, err)
+	assert.Contains(t, exec.Text(), "attached-state")
+
+	require.NoError(t, attached.Delete(ctx))
+}
+
+// TestIsolationAttachNotFound verifies attach with an unknown sessionID
+// surfaces the same error shape used by IsolatedGet on 404.
+func TestIsolationAttachNotFound(t *testing.T) {
+	ctx, sb := createIsolatedTestSandbox(t)
+
+	_, err := sb.IsolationAttach(ctx, "00000000-0000-0000-0000-000000000000")
+	require.Error(t, err)
+}
+
 func TestIsolationListSessions(t *testing.T) {
 	ctx, sb := createIsolatedTestSandbox(t)
 
@@ -1173,4 +1228,115 @@ func TestIsolationWithSessionE2E(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Contains(t, output, "with-session-val")
+}
+
+// ---------------------------------------------------------------------------
+// Background run tests
+// ---------------------------------------------------------------------------
+
+// waitForBackgroundRun polls a background run's status until it is no longer
+// running or the timeout elapses.
+func waitForBackgroundRun(t *testing.T, ctx context.Context, session *opensandbox.IsolationSession, runID string) *opensandbox.IsolatedRunStatus {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		status, err := session.GetRunStatus(ctx, runID)
+		require.NoError(t, err)
+		if !status.Running {
+			return status
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("background run %s did not finish within 30s", runID)
+	return nil
+}
+
+func createIsolationSessionForTest(t *testing.T, ctx context.Context, sb *opensandbox.Sandbox) *opensandbox.IsolationSession {
+	t.Helper()
+	session, err := sb.IsolationCreate(ctx, opensandbox.CreateIsolatedSessionRequest{
+		Workspace: opensandbox.IsolatedWorkspaceSpec{Path: "/tmp", Mode: "rw"},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { session.Delete(ctx) })
+	return session
+}
+
+// TestIsolationBackgroundRunCompletes covers the full background lifecycle:
+// start a detached echo run, poll status until it finishes with exit code 0,
+// read the logs from the start, and verify an incremental read from the
+// returned cursor returns the remainder.
+func TestIsolationBackgroundRunCompletes(t *testing.T) {
+	ctx, sb := createIsolatedTestSandbox(t)
+	session := createIsolationSessionForTest(t, ctx, sb)
+
+	run, err := session.RunBackground(ctx, "echo hello-background")
+	require.NoError(t, err)
+	assert.NotEmpty(t, run.RunID)
+	assert.Equal(t, session.SessionID(), run.SessionID)
+	assert.False(t, run.StartedAt.IsZero(), "started_at should be populated")
+
+	status := waitForBackgroundRun(t, ctx, session, run.RunID)
+	assert.False(t, status.Running)
+	assert.NotNil(t, status.ExitCode)
+	assert.Equal(t, 0, *status.ExitCode)
+	assert.NotNil(t, status.FinishedAt)
+
+	logs, nextCursor, err := session.GetRunLogs(ctx, run.RunID, 0)
+	require.NoError(t, err)
+	assert.Contains(t, logs, "hello-background")
+	assert.Greater(t, nextCursor, int64(0))
+
+	// Incremental read from the returned cursor returns the remainder.
+	tail, tailCursor, err := session.GetRunLogs(ctx, run.RunID, nextCursor)
+	require.NoError(t, err)
+	assert.Equal(t, "", tail)
+	assert.Equal(t, nextCursor, tailCursor)
+}
+
+// TestIsolationBackgroundRunExitCode verifies exit code propagation for a
+// failing background run.
+func TestIsolationBackgroundRunExitCode(t *testing.T) {
+	ctx, sb := createIsolatedTestSandbox(t)
+	session := createIsolationSessionForTest(t, ctx, sb)
+
+	run, err := session.RunBackground(ctx, "exit 7")
+	require.NoError(t, err)
+
+	status := waitForBackgroundRun(t, ctx, session, run.RunID)
+	assert.False(t, status.Running)
+	assert.NotNil(t, status.ExitCode)
+	assert.Equal(t, 7, *status.ExitCode)
+	assert.Equal(t, "", status.Error)
+}
+
+// TestIsolationBackgroundRunDoesNotPolluteForeground verifies that background
+// output is captured to the run log and does not leak into a following
+// foreground run's output.
+func TestIsolationBackgroundRunDoesNotPolluteForeground(t *testing.T) {
+	ctx, sb := createIsolatedTestSandbox(t)
+	session := createIsolationSessionForTest(t, ctx, sb)
+
+	run, err := session.RunBackground(ctx, "echo bg-output-line")
+	require.NoError(t, err)
+	waitForBackgroundRun(t, ctx, session, run.RunID)
+
+	exec, err := session.Run(ctx, opensandbox.IsolatedRunRequest{Code: "echo fg-output-line"}, nil)
+	require.NoError(t, err)
+	assert.Contains(t, exec.Text(), "fg-output-line")
+	assert.NotContains(t, exec.Text(), "bg-output-line")
+
+	// The background output must live in the run log instead.
+	logs, _, err := session.GetRunLogs(ctx, run.RunID, 0)
+	require.NoError(t, err)
+	assert.Contains(t, logs, "bg-output-line")
+}
+
+// TestIsolationBackgroundRunStatusNotFound verifies that an unknown run ID
+// surfaces an error from the status endpoint.
+func TestIsolationBackgroundRunStatusNotFound(t *testing.T) {
+	ctx, sb := createIsolatedTestSandbox(t)
+	session := createIsolationSessionForTest(t, ctx, sb)
+
+	_, err := session.GetRunStatus(ctx, "no-such-run")
+	require.Error(t, err)
 }

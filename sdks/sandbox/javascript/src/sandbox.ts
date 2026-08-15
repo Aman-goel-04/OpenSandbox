@@ -22,6 +22,7 @@ import {
   DEFAULT_TIMEOUT_SECONDS,
 } from "./core/constants.js";
 import { ConnectionConfig, type ConnectionConfigOptions } from "./config/connection.js";
+import { reportSandboxCreateMetric } from "./internal/lifecycleMetrics.js";
 import type { SandboxFiles } from "./services/filesystem.js";
 import type { CredentialVault, Egress } from "./services/egress.js";
 import { createDefaultAdapterFactory } from "./factory/defaultAdapterFactory.js";
@@ -55,8 +56,17 @@ const unavailableIsolation: IsolationService = {
   create(): Promise<IsolationSession> {
     throw new Error("Isolation is not available: the adapter factory did not provide an IsolationService");
   },
+  attach(): Promise<IsolationSession> {
+    throw new Error("Isolation is not available: the adapter factory did not provide an IsolationService");
+  },
   capabilities(): Promise<IsolatedCapabilities> {
-    return Promise.resolve({ available: false, commit_supported: false, diff_supported: false });
+    return Promise.resolve({
+      available: false,
+      setpriv_available: false,
+      userns_available: false,
+      commit_supported: false,
+      diff_supported: false,
+    });
   },
   list(): Promise<IsolatedSessionSummary[]> {
     throw new Error("Isolation is not available: the adapter factory did not provide an IsolationService");
@@ -409,6 +419,11 @@ export class Sandbox {
     }
 
     let sandboxId: SandboxId | undefined;
+    const startupSource =
+      typeof opts.image === "string"
+        ? opts.image
+        : opts.image?.uri ?? opts.snapshotId;
+    const createStarted = Date.now();
     try {
       const created = await sandboxes.createSandbox(req);
       sandboxId = created.id as SandboxId;
@@ -467,8 +482,21 @@ export class Sandbox {
         });
       }
 
+      reportSandboxCreateMetric(connectionConfig, {
+        sandboxId,
+        image: startupSource,
+        createDurationMs: Date.now() - createStarted,
+        success: true,
+      });
+
       return sbx;
     } catch (err) {
+      reportSandboxCreateMetric(connectionConfig, {
+        sandboxId,
+        image: startupSource,
+        createDurationMs: Date.now() - createStarted,
+        success: false,
+      });
       if (sandboxId) {
         try {
           await sandboxes.deleteSandbox(sandboxId);
@@ -710,12 +738,7 @@ export class Sandbox {
 
     const buildTimeoutMessage = () => {
       const context = `domain=${this.connectionConfig.domain}, useServerProxy=${this.connectionConfig.useServerProxy}`;
-      let suggestion =
-        "If this sandbox runs in Docker bridge or remote-network mode, consider enabling useServerProxy=true.";
-      if (!this.connectionConfig.useServerProxy) {
-        suggestion += " You can also configure server-side [docker].host_ip for direct endpoint access.";
-      }
-      return `Sandbox health check timed out after ${opts.readyTimeoutSeconds}s (${attempt} attempts). ${errorDetail} Connection context: ${context}. ${suggestion}`;
+      return `Sandbox health check timed out after ${opts.readyTimeoutSeconds}s (${attempt} attempts). ${errorDetail} Connection context: ${context}.`;
     };
 
     // Wait until execd becomes reachable and passes health check.

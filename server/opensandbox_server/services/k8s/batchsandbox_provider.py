@@ -141,6 +141,16 @@ class BatchSandboxProvider(WorkloadProvider):
                     "Pool mode does not support volumes. "
                     "Remove 'volumes' from request or use template mode."
                 )
+            if network_policy is not None:
+                raise ValueError(
+                    "Pool mode does not support networkPolicy. "
+                    "Remove 'networkPolicy' from request or use template mode."
+                )
+            if credential_proxy_enabled:
+                raise ValueError(
+                    "Pool mode does not support credentialProxy.enabled. "
+                    "Disable credential proxy or use template mode."
+                )
             return self._create_workload_from_pool(
                 batchsandbox_name=sandbox_id,
                 namespace=namespace,
@@ -240,6 +250,7 @@ class BatchSandboxProvider(WorkloadProvider):
             egress_mode=egress_mode,
             credential_proxy_enabled=credential_proxy_enabled,
             extra_env=egress_env,
+            sandbox_id=sandbox_id,
         )
 
         if volumes:
@@ -831,12 +842,18 @@ class BatchSandboxProvider(WorkloadProvider):
             "last_transition_at": creation_timestamp,
         }
     
+    def get_internal_endpoint(
+        self, workload: Dict[str, Any], port: int, sandbox_id: str
+    ) -> Optional[Endpoint]:
+        """Resolve the internal endpoint from the BatchSandbox annotation."""
+        pod_ip = self._parse_pod_ip(workload)
+        if not pod_ip:
+            return None
+        return Endpoint(endpoint=f"{pod_ip}:{port}")
+
     def get_endpoint_info(self, workload: Dict[str, Any], port: int, sandbox_id: str) -> Optional[Endpoint]:
         """Resolve endpoint using gateway ingress or parsed pod IP."""
         if self.ingress_config and self.ingress_config.mode == INGRESS_MODE_GATEWAY:
             return format_ingress_endpoint(self.ingress_config, sandbox_id, port)
 
-        pod_ip = self._parse_pod_ip(workload)
-        if not pod_ip:
-            return None
-        return Endpoint(endpoint=f"{pod_ip}:{port}")
+        return self.get_internal_endpoint(workload, port, sandbox_id)

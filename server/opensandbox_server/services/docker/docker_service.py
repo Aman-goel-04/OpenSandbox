@@ -34,7 +34,7 @@ from threading import Lock, Thread, Timer
 from typing import Any, Dict, Optional
 
 import docker
-from docker.errors import DockerException
+from docker.errors import DockerException, NotFound as DockerNotFound
 from fastapi import HTTPException, status
 
 from opensandbox_server.extensions import (
@@ -152,6 +152,7 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         self._execd_archive_cache: Dict[str, bytes] = {}
         self._bootstrap_script_cache: Dict[str, bytes] = {}
         self._bwrap_archive_cache: Dict[str, bytes] = {}
+        self._session_gate_archive_cache: Dict[str, bytes] = {}
         self._windows_profile_cache: Dict[str, bytes] = {}
         self._daemon_platform: Optional[PlatformSpec] = None
         self._metadata_store = DockerMetadataStore()
@@ -244,9 +245,31 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         """Helper to fetch the Docker container associated with a sandbox ID."""
         label_selector = f"{SANDBOX_ID_LABEL}={sandbox_id}"
         try:
+            try:
+                container = self.docker_client.containers.get(f"sandbox-{sandbox_id}")
+            except DockerNotFound:
+                container = None
+
+            if container is not None:
+                labels = container.attrs.get("Config", {}).get("Labels") or {}
+                if labels.get(SANDBOX_ID_LABEL) == sandbox_id:
+                    return container
+
+            # Preserve lookup for managed containers with a nonstandard name.
             containers = self.docker_client.containers.list(
                 all=True, filters={"label": label_selector}
             )
+        except DockerNotFound as exc:
+            # Container disappeared between list-summary and inspect; treat as
+            # not found rather than surfacing a 500. See list_sandboxes for
+            # the full-table variant of this fix.
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "code": SandboxErrorCodes.SANDBOX_NOT_FOUND,
+                    "message": f"Sandbox {sandbox_id} not found.",
+                },
+            ) from exc
         except DockerException as exc:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -928,13 +951,21 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         )
 
     def list_sandboxes(self, request: ListSandboxesRequest) -> ListSandboxesResponse:
-        """
-        List sandboxes with optional filtering and pagination.
+        """List sandboxes with optional filtering and pagination.
+
+        Discovers container IDs via ``docker_client.api.containers`` and then
+        inspects each one via ``containers.get(id)``. This gives an explicit
+        per-container failure boundary: if a container is removed between the
+        list summary and its inspect, that entry is skipped instead of
+        failing the whole listing with 500. The high-level
+        ``docker_client.containers.list(filters=...)`` inlines the same
+        second-stage inspect but does not expose that boundary.
         """
         try:
-            containers = self.docker_client.containers.list(
+            summaries = self.docker_client.api.containers(
                 all=True,
                 filters={"label": [SANDBOX_ID_LABEL]},
+                trunc=False,
             )
         except DockerException as exc:
             raise HTTPException(
@@ -946,14 +977,27 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
             ) from exc
 
         sandboxes_by_id: dict[str, Sandbox] = {}
-        container_ids: set[str] = set()
-        for container in containers:
-            labels = container.attrs.get("Config", {}).get("Labels") or {}
-            sandbox_id = labels.get(SANDBOX_ID_LABEL)
-            if not sandbox_id:
+        for summary in summaries:
+            container_id = summary.get("Id")
+            summary_labels = summary.get("Labels") or {}
+            sandbox_id = summary_labels.get(SANDBOX_ID_LABEL)
+            if not container_id or not sandbox_id:
                 continue
+            try:
+                container = self.docker_client.containers.get(container_id)
+            except DockerNotFound:
+                # Removed between list and inspect; skip so concurrent
+                # deletions do not fail the whole listing.
+                continue
+            except DockerException as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail={
+                        "code": SandboxErrorCodes.CONTAINER_QUERY_FAILED,
+                        "message": f"Failed to query sandbox containers: {str(exc)}",
+                    },
+                ) from exc
             sandbox_obj = self._container_to_sandbox(container, sandbox_id)
-            container_ids.add(sandbox_id)
             if matches_filter(sandbox_obj, request.filter):
                 sandboxes_by_id[sandbox_id] = sandbox_obj
 

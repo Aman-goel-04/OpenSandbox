@@ -17,6 +17,7 @@
 E2E tests for isolated session (OSEP-0013 bwrap namespace isolation).
 """
 
+import asyncio
 import logging
 import time
 
@@ -36,6 +37,7 @@ from opensandbox.models.isolated import (
     BindMount,
     CreateIsolatedSessionRequest,
     IsolatedRunOpts,
+    IsolatedRunStatus,
     IsolatedWorkspaceSpec,
 )
 
@@ -210,6 +212,54 @@ class TestIsolatedSessionE2E:
             fake_session = await self._create_session()
             await fake_session.delete()
             await fake_session.delete()  # second delete should fail
+
+    # ── Attach (stateless recovery) ───────────────────────────────────
+
+    async def test_attach_roundtrip(self):
+        """Stateless-recovery flow: create → drop handle → attach by
+        sessionId only → run/get/delete all work through the new handle.
+        """
+        created = await self._create_session(mode="rw")
+        session_id = created.session_id
+        try:
+            # Prove the original handle can write state we want to
+            # observe after we re-attach.
+            await created.run("echo attached-state > /tmp/attach-marker.txt")
+
+            # Simulate a stateless client that only kept the sessionId.
+            attached = await self.sandbox.isolation.attach(session_id)
+            assert attached.session_id == session_id
+            # Creation-param echo fields should now be populated.
+            assert attached.info.workspace is not None
+            assert attached.info.workspace.path == "/tmp"
+            assert attached.info.workspace.mode == "rw"
+
+            # Handle must work end-to-end via sessionId alone.
+            state = await attached.get()
+            assert state.status == "active"
+
+            result = await attached.run("cat /tmp/attach-marker.txt")
+            assert "attached-state" in result.text
+
+            await attached.delete()
+        except Exception:
+            # If attach failed before delete, clean up via the original handle.
+            # Best-effort: swallow cleanup errors so the original exception
+            # surfaces, but log them for debuggability.
+            try:
+                await created.delete()
+            except Exception as cleanup_exc:
+                logger.warning(
+                    "attach roundtrip cleanup: failed to delete session %s: %s",
+                    session_id, cleanup_exc,
+                )
+            raise
+
+    async def test_attach_nonexistent_session_raises(self):
+        with pytest.raises(SandboxApiException):
+            await self.sandbox.isolation.attach(
+                "00000000-0000-0000-0000-000000000000",
+            )
 
     # ── RW mode: run-based file tests ─────────────────────────────────
 
@@ -716,3 +766,93 @@ class TestIsolatedSessionE2E:
         finally:
             await session.delete()
             await self.sandbox.commands.run(f"rm -rf {src_dir}")
+
+    # ── Background run tests ─────────────────────────────────────────
+
+    async def _wait_for_background_run(
+        self, session, run_id: str, timeout: float = 30.0
+    ) -> IsolatedRunStatus:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            status = await session.run_status(run_id)
+            if not status.running:
+                return status
+            await asyncio.sleep(0.2)
+        raise AssertionError(f"background run {run_id} did not finish within {timeout}s")
+
+    async def test_background_run_completes(self):
+        session = await self._create_session()
+        try:
+            run = await session.run_background("echo hello-background")
+            assert run.run_id
+            assert run.session_id == session.session_id
+
+            status = await self._wait_for_background_run(session, run.run_id)
+            assert status.running is False
+            assert status.exit_code == 0
+            assert status.finished_at is not None
+
+            logs = await session.run_logs(run.run_id)
+            assert "hello-background" in logs.text
+            assert logs.cursor > 0
+
+            # Incremental read from the returned cursor returns the remainder.
+            tail = await session.run_logs(run.run_id, cursor=logs.cursor)
+            assert tail.text == ""
+        finally:
+            await session.delete()
+
+    async def test_background_run_exit_code(self):
+        session = await self._create_session()
+        try:
+            run = await session.run_background("exit 7")
+            status = await self._wait_for_background_run(session, run.run_id)
+            assert status.exit_code == 7
+            assert status.error is None
+        finally:
+            await session.delete()
+
+    async def test_background_run_envs(self):
+        session = await self._create_session()
+        try:
+            run = await session.run_background(
+                "echo $BG_E2E_VAR",
+                opts=IsolatedRunOpts(envs={"BG_E2E_VAR": "background-env"}),
+            )
+            await self._wait_for_background_run(session, run.run_id)
+            logs = await session.run_logs(run.run_id)
+            assert "background-env" in logs.text
+        finally:
+            await session.delete()
+
+    async def test_background_run_does_not_pollute_foreground(self):
+        session = await self._create_session()
+        try:
+            run = await session.run_background("echo bg-output-line")
+            await self._wait_for_background_run(session, run.run_id)
+
+            result = await session.run("echo fg-output-line")
+            assert "fg-output-line" in result.text
+            assert "bg-output-line" not in result.text
+        finally:
+            await session.delete()
+
+    async def test_background_run_long_running_completes(self):
+        session = await self._create_session()
+        try:
+            run = await session.run_background("sleep 2 && echo woke-up")
+            status = await self._wait_for_background_run(session, run.run_id, timeout=30)
+            assert status.exit_code == 0
+            logs = await session.run_logs(run.run_id)
+            assert "woke-up" in logs.text
+        finally:
+            await session.delete()
+
+    async def test_background_run_status_not_found(self):
+        session = await self._create_session()
+        try:
+            with pytest.raises(SandboxApiException) as exc_info:
+                await session.run_status("no-such-run")
+            assert exc_info.value.status_code == 404
+        finally:
+            await session.delete()

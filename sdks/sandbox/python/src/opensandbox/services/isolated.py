@@ -30,8 +30,11 @@ from opensandbox.models.execd import Execution, ExecutionHandlers
 from opensandbox.models.isolated import (
     BindMount,
     CreateIsolatedSessionRequest,
+    IsolatedBackgroundRun,
     IsolatedCapabilities,
+    IsolatedRunLogs,
     IsolatedRunOpts,
+    IsolatedRunStatus,
     IsolatedSessionInfo,
     IsolatedSessionState,
     IsolatedSessionSummary,
@@ -62,6 +65,34 @@ class IsolationSession(Protocol):
         handlers: ExecutionHandlers | None = None,
     ) -> Execution: ...
 
+    async def run_background(
+        self,
+        code: str,
+        *,
+        opts: IsolatedRunOpts | None = None,
+    ) -> IsolatedBackgroundRun:
+        """Start *code* detached inside the session and return a run handle.
+
+        The run's combined output and exit code are captured by execd; poll
+        them with :meth:`run_status` and :meth:`run_logs`. The run is not
+        time-limited and idle GC is suspended while it is active.
+        """
+        ...
+
+    async def run_status(self, run_id: str) -> IsolatedRunStatus:
+        """Return the lifecycle state of a background run."""
+        ...
+
+    async def run_logs(self, run_id: str, cursor: int = 0) -> IsolatedRunLogs:
+        """Return the background run's log from *cursor* plus the next cursor.
+
+        Each call returns at most 16 MiB; pass the returned ``cursor`` to
+        fetch the remainder. Per-run log retention is capped at 16 MiB
+        (output beyond it is discarded when the run finishes), so drain
+        incrementally while the run is active if more than one page is needed.
+        """
+        ...
+
     async def get(self) -> IsolatedSessionState: ...
 
     async def delete(self) -> None: ...
@@ -73,6 +104,24 @@ class IsolationService(Protocol):
     async def create(
         self, request: CreateIsolatedSessionRequest
     ) -> IsolationSession: ...
+
+    async def attach(self, session_id: str) -> IsolationSession:
+        """Rebuild a session handle from an existing ``session_id``.
+
+        Fetches the current session state from execd and returns the same
+        handle type as :meth:`create`. Useful for stateless callers (e.g.
+        serverless workers restarted mid-flight) that only have a session ID.
+
+        When the execd side echoes the creation-parameter fields (``profile``,
+        ``workspace``, ``binds`` etc.), they populate ``handle.info``. Older
+        execd builds omit these fields; ``handle.info`` then only carries the
+        session ID (creation-parameter fields are ``None``) but ``run``/``get``/
+        ``delete``/``files`` still work because they only need the session ID.
+
+        Raises the SDK's standard not-found error when the session does not
+        exist on execd.
+        """
+        ...
 
     async def capabilities(self) -> IsolatedCapabilities: ...
 

@@ -29,8 +29,11 @@ from opensandbox.models.execd_sync import ExecutionHandlersSync
 from opensandbox.models.isolated import (
     BindMount,
     CreateIsolatedSessionRequest,
+    IsolatedBackgroundRun,
     IsolatedCapabilities,
+    IsolatedRunLogs,
     IsolatedRunOpts,
+    IsolatedRunStatus,
     IsolatedSessionInfo,
     IsolatedSessionState,
     IsolatedSessionSummary,
@@ -60,6 +63,33 @@ class IsolationSessionSync(Protocol):
         handlers: ExecutionHandlersSync | None = None,
     ) -> Execution: ...
 
+    def run_background(
+        self,
+        code: str,
+        *,
+        opts: IsolatedRunOpts | None = None,
+    ) -> IsolatedBackgroundRun:
+        """Start *code* detached inside the session and return a run handle.
+
+        Poll the run with :meth:`run_status` and :meth:`run_logs`. The run is
+        not time-limited and idle GC is suspended while it is active.
+        """
+        ...
+
+    def run_status(self, run_id: str) -> IsolatedRunStatus:
+        """Return the lifecycle state of a background run."""
+        ...
+
+    def run_logs(self, run_id: str, cursor: int = 0) -> IsolatedRunLogs:
+        """Return the background run's log from *cursor* plus the next cursor.
+
+        Each call returns at most 16 MiB; pass the returned ``cursor`` to
+        fetch the remainder. Per-run log retention is capped at 16 MiB
+        (output beyond it is discarded when the run finishes), so drain
+        incrementally while the run is active if more than one page is needed.
+        """
+        ...
+
     def get(self) -> IsolatedSessionState: ...
 
     def delete(self) -> None: ...
@@ -71,6 +101,16 @@ class IsolationServiceSync(Protocol):
     def create(
         self, request: CreateIsolatedSessionRequest
     ) -> IsolationSessionSync: ...
+
+    def attach(self, session_id: str) -> IsolationSessionSync:
+        """Rebuild a session handle from an existing ``session_id``.
+
+        Synchronous counterpart of the async ``attach``. See the async
+        :class:`opensandbox.services.isolated.IsolationService.attach` for the
+        full contract (creation-parameter echo, older-execd tolerance,
+        not-found propagation).
+        """
+        ...
 
     def capabilities(self) -> IsolatedCapabilities: ...
 

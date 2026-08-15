@@ -20,7 +20,6 @@ using Kubernetes resources for sandbox lifecycle management.
 """
 
 import asyncio
-import json
 import logging
 import time
 from datetime import datetime, timezone
@@ -60,7 +59,6 @@ from opensandbox_server.services.k8s.error_helpers import _build_k8s_api_error, 
 from opensandbox_server.services.k8s.k8s_diagnostics import K8sDiagnosticsMixin
 from opensandbox_server.services.k8s.endpoint_resolver import _attach_egress_auth_headers, _attach_secure_access_headers
 from opensandbox_server.services.k8s.list_helpers import _build_list_sandboxes_response
-from opensandbox_server.services.k8s.volume_helper import ensure_shared_pvc_read_only_policy
 from opensandbox_server.services.k8s.status_helpers import (
     _is_unschedulable_status,
     _normalize_create_status,
@@ -336,6 +334,39 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
             request.credential_proxy, request.network_policy, self.app_config.egress
         )
         ensure_egress_runtime_compatible(request.network_policy, self.app_config.secure_runtime)
+
+    def _ensure_pool_mode_compatible(
+        self,
+        request: CreateSandboxRequest,
+        has_pool_ref: bool,
+    ) -> None:
+        """Reject request fields that pooled pods cannot honor."""
+        if not has_pool_ref:
+            return
+        if request.network_policy is not None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": SandboxErrorCodes.INVALID_PARAMETER,
+                    "message": (
+                        "networkPolicy cannot be used together with extensions.poolRef "
+                        "because pooled pods are pre-created. Remove 'networkPolicy' "
+                        "from the request or use template mode."
+                    ),
+                },
+            )
+        if request.credential_proxy and request.credential_proxy.enabled:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": SandboxErrorCodes.INVALID_PARAMETER,
+                    "message": (
+                        "credentialProxy.enabled cannot be used together with "
+                        "extensions.poolRef because pooled pods are pre-created. "
+                        "Disable credential proxy or use template mode."
+                    ),
+                },
+            )
 
     def _ensure_image_auth_support(self, request: CreateSandboxRequest) -> None:
         """
@@ -732,6 +763,7 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         """
         pool_ref = (request.extensions or {}).get("poolRef", "").strip()
         has_pool_ref = bool(pool_ref)
+        self._ensure_pool_mode_compatible(request, has_pool_ref)
 
         if not has_pool_ref:
             request = resolve_sandbox_image_from_request(request)
@@ -803,11 +835,6 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
 
             if has_pool_ref and pool_ref != POOL_AUTO_ASSIGN_REF:
                 await asyncio.to_thread(self._ensure_pool_ref_exists, pool_ref)
-
-            # Kubernetes applies PVC readOnly at the source volume level, so
-            # shared PVC mounts must agree before any auto-provisioning side effect.
-            if request.volumes:
-                ensure_shared_pvc_read_only_policy(request.volumes)
 
             # Auto-create PVCs that don't exist yet
             if request.volumes:
@@ -1395,7 +1422,8 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         Args:
             sandbox_id: Unique sandbox identifier
             port: Port number
-            resolve_internal: Ignored for Kubernetes (always returns Pod IP)
+            resolve_internal: If True, bypass ingress and return the provider's
+                internal workload endpoint for use by the server-side proxy.
             expires: Unix epoch seconds for a signed route token.
                 Requires ingress gateway mode with secure_access keys configured.
 
@@ -1445,19 +1473,9 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
             if expires is not None:
                 endpoint = self._build_signed_endpoint(sandbox_id, port, expires)
             elif resolve_internal:
-                annotations = workload.get("metadata", {}).get("annotations", {})
-                raw_endpoints = annotations.get("sandbox.opensandbox.io/endpoints")
-                pod_ip = None
-                if raw_endpoints:
-                    try:
-                        endpoints = json.loads(raw_endpoints)
-                        if isinstance(endpoints, list) and endpoints:
-                            first_endpoint = endpoints[0]
-                            if isinstance(first_endpoint, str) and first_endpoint:
-                                pod_ip = first_endpoint
-                    except (TypeError, ValueError, json.JSONDecodeError):
-                        pod_ip = None
-                endpoint = Endpoint(endpoint=f"{pod_ip}:{port}") if pod_ip else None
+                endpoint = self.workload_provider.get_internal_endpoint(
+                    workload, port, sandbox_id
+                )
             else:
                 endpoint = self.workload_provider.get_endpoint_info(workload, port, sandbox_id)
 

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 import {DEFAULT_USER_AGENT} from "../core/constants.js";
+import {ensureClientIpReady, withClientIp} from "./clientIp.js";
 
 export type ConnectionProtocol = "http" | "https";
 
@@ -62,6 +63,11 @@ export interface ConnectionConfigOptions {
    * Disable endpoint caching entirely.
    */
   endpointCacheDisabled?: boolean;
+  /**
+   * Disable SDK telemetry (sandbox.create latency reports).
+   * Also honored via `OPENSANDBOX_DISABLE_METRICS=1`.
+   */
+  disableMetrics?: boolean;
 }
 
 function isNodeRuntime(): boolean {
@@ -230,16 +236,33 @@ function createTimedFetch(opts: {
         init.signal.addEventListener("abort", onAbort, { once: true } as any);
     }
 
+    // Best-effort: attach the SDK host's own IP so the server can see the
+    // client's self-reported address. Applied per request (never overriding a
+    // caller-supplied value or dropping existing headers) and skipped silently
+    // when the IP is unavailable. Await the one-time detection so even the very
+    // first request carries the header (bounded by the probe timeout).
+    await ensureClientIpReady();
+    const withIp = withClientIp(input, init);
+    const reqInput = withIp.input;
     const mergedInit: RequestInit = {
-      ...init,
+      ...(withIp.init ?? {}),
       signal: ac.signal,
     };
 
     if (debug) {
-      const mergedHeaders = {
-        ...defaultHeaders,
-        ...((init?.headers ?? {}) as any),
-      };
+      // Log the headers actually being sent: prefer the merged headers produced
+      // by withClientIp (which include the client-IP header), falling back to
+      // the request input's headers when it is a Request object.
+      const outgoing = new Headers(
+        withIp.init?.headers ??
+          (typeof Request !== "undefined" && reqInput instanceof Request
+            ? reqInput.headers
+            : undefined)
+      );
+      const mergedHeaders: Record<string, string> = { ...defaultHeaders };
+      outgoing.forEach((value, key) => {
+        mergedHeaders[key] = value;
+      });
       // eslint-disable-next-line no-console
       console.log(
         `[opensandbox:${label}] ->`,
@@ -250,7 +273,7 @@ function createTimedFetch(opts: {
     }
 
     try {
-      const res = await baseFetch(input, mergedInit);
+      const res = await baseFetch(reqInput, mergedInit);
       if (debug) {
         // eslint-disable-next-line no-console
         console.log(`[opensandbox:${label}] <-`, method, url, res.status);
@@ -281,6 +304,7 @@ export class ConnectionConfig {
   readonly endpointCacheTtlMs: number;
   readonly endpointCacheSize: number;
   readonly endpointCacheDisabled: boolean;
+  readonly disableMetrics: boolean;
   private _closeTransport: () => Promise<void>;
   private _closePromise: Promise<void> | null = null;
   private _transportInitialized = false;
@@ -291,6 +315,7 @@ export class ConnectionConfig {
    * Environment variables (optional):
    * - `OPEN_SANDBOX_DOMAIN` (default: `localhost:8080`)
    * - `OPEN_SANDBOX_API_KEY`
+   * - `OPENSANDBOX_DISABLE_METRICS=1` to opt out of create-latency telemetry
    */
   constructor(opts: ConnectionConfigOptions = {}) {
     const envDomain = readEnv("OPEN_SANDBOX_DOMAIN");
@@ -312,6 +337,7 @@ export class ConnectionConfig {
     this.endpointCacheTtlMs = opts.endpointCacheTtlMs ?? 600_000;
     this.endpointCacheSize = opts.endpointCacheSize ?? 1024;
     this.endpointCacheDisabled = !!opts.endpointCacheDisabled;
+    this.disableMetrics = !!opts.disableMetrics;
 
     const headers: Record<string, string> = { ...(opts.headers ?? {}) };
     // Attach API key via header unless the user already provided one.
@@ -399,6 +425,7 @@ export class ConnectionConfig {
       endpointCacheTtlMs: this.endpointCacheTtlMs,
       endpointCacheSize: this.endpointCacheSize,
       endpointCacheDisabled: this.endpointCacheDisabled,
+      disableMetrics: this.disableMetrics,
     });
     clone.initializeTransport();
     return clone;

@@ -34,6 +34,7 @@ from .file_info import FileInfo
 from .file_info_type import FileInfoType
 from .file_metadata import FileMetadata
 from .get_files_info_response_200 import GetFilesInfoResponse200
+from .isolated_background_run_response import IsolatedBackgroundRunResponse
 from .isolated_chmod_files_body import IsolatedChmodFilesBody
 from .isolated_create_session_response import IsolatedCreateSessionResponse
 from .isolated_get_files_info_response_200 import IsolatedGetFilesInfoResponse200
@@ -42,6 +43,7 @@ from .isolated_replace_content_body import IsolatedReplaceContentBody
 from .isolated_replace_content_response_200 import IsolatedReplaceContentResponse200
 from .isolated_run_request import IsolatedRunRequest
 from .isolated_run_request_envs import IsolatedRunRequestEnvs
+from .isolated_run_status import IsolatedRunStatus
 from .isolated_session_summary import IsolatedSessionSummary
 from .isolated_session_summary_status import IsolatedSessionSummaryStatus
 from .isolated_upload_file_body import IsolatedUploadFileBody
@@ -65,7 +67,9 @@ from .server_stream_event_error import ServerStreamEventError
 from .server_stream_event_results import ServerStreamEventResults
 from .server_stream_event_type import ServerStreamEventType
 from .session_state import SessionState
+from .session_state_profile import SessionStateProfile
 from .session_state_status import SessionStateStatus
+from .session_state_uid_mode import SessionStateUidMode
 from .upload_file_body import UploadFileBody
 
 __all__ = (
@@ -87,6 +91,7 @@ __all__ = (
     "FileInfoType",
     "FileMetadata",
     "GetFilesInfoResponse200",
+    "IsolatedBackgroundRunResponse",
     "IsolatedChmodFilesBody",
     "IsolatedCreateSessionResponse",
     "IsolatedGetFilesInfoResponse200",
@@ -95,6 +100,7 @@ __all__ = (
     "IsolatedReplaceContentResponse200",
     "IsolatedRunRequest",
     "IsolatedRunRequestEnvs",
+    "IsolatedRunStatus",
     "IsolatedSessionSummary",
     "IsolatedSessionSummaryStatus",
     "IsolatedUploadFileBody",
@@ -118,6 +124,8 @@ __all__ = (
     "ServerStreamEventResults",
     "ServerStreamEventType",
     "SessionState",
+    "SessionStateProfile",
     "SessionStateStatus",
+    "SessionStateUidMode",
     "UploadFileBody",
 )

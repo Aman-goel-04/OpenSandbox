@@ -43,6 +43,12 @@ DEFAULT_CONFIG_PATH = Path.home() / ".sandbox.toml"
 
 API_KEY_ENV_VAR = "OPENSANDBOX_SERVER_API_KEY"
 
+# OSEP-0011 secure-access keys may be injected via environment instead of the
+# [ingress.secure_access] TOML block, so key material can come from a Secret
+# rather than a plaintext config file.
+SECURE_ACCESS_KEYS_ENV_VAR = "OPENSANDBOX_SECURE_ACCESS_KEYS"
+SECURE_ACCESS_ACTIVE_KEY_ENV_VAR = "OPENSANDBOX_SECURE_ACCESS_ACTIVE_KEY"
+
 _HOSTNAME_RE = re.compile(r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?:\.(?!-)[A-Za-z0-9-]{1,63})*$")
 _WILDCARD_DOMAIN_RE = re.compile(r"^\*\.(?!-)[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63})+$")
 _IPV4_WITH_PORT_RE = re.compile(r"^(?P<ip>(?:\d{1,3}\.){3}\d{1,3})(?::(?P<port>\d{1,5}))?$")
@@ -104,31 +110,31 @@ def _is_wildcard_domain(host: str) -> bool:
 
 
 class RenewIntentRedisConfig(BaseModel):
-    """🧪 [EXPERIMENTAL] Redis list consumer for renew-intent queue (ingress gateway path)."""
+    """Redis list consumer for renew-intent queue (ingress gateway path)."""
 
     enabled: bool = Field(
         default=False,
         description=(
-            "🧪 [EXPERIMENTAL] When true, server workers consume renew intents from Redis "
+            "When true, server workers consume renew intents from Redis "
             "(ingress gateway path)."
         ),
     )
     dsn: Optional[str] = Field(
         default=None,
         description=(
-            '🧪 [EXPERIMENTAL] Redis DSN (e.g. "redis://127.0.0.1:6379/0"). '
+            'Redis DSN (e.g. "redis://127.0.0.1:6379/0"). '
             "Required when redis.enabled is true."
         ),
     )
     queue_key: str = Field(
         default="opensandbox:renew:intent",
         min_length=1,
-        description="🧪 [EXPERIMENTAL] Redis List key for LPUSH/BRPOP renew-intent JSON payloads.",
+        description="Redis List key for LPUSH/BRPOP renew-intent JSON payloads.",
     )
     consumer_concurrency: int = Field(
         default=8,
         ge=1,
-        description="🧪 [EXPERIMENTAL] Number of concurrent BRPOP worker tasks.",
+        description="Number of concurrent BRPOP worker tasks.",
     )
 
     @model_validator(mode="after")
@@ -140,13 +146,40 @@ class RenewIntentRedisConfig(BaseModel):
         return self
 
 
-class RenewIntentConfig(BaseModel):
-    """🧪 [EXPERIMENTAL] Renew sandbox expiration when access is observed (proxy and/or Redis queue)."""
+class OtelConfig(BaseModel):
+    """Optional OpenTelemetry export for ingested SDK metrics."""
 
     enabled: bool = Field(
         default=False,
         description=(
-            "🧪 [EXPERIMENTAL] Master switch for auto-renew on reverse-proxy access and/or Redis "
+            "Enable OTLP metrics export. When false, SDK events are accepted but recorded as noop."
+        ),
+    )
+    endpoint: Optional[str] = Field(
+        default=None,
+        description=(
+            "OTLP HTTP metrics endpoint. When omitted, OpenTelemetry uses "
+            "OTEL_EXPORTER_OTLP_ENDPOINT / OTEL_EXPORTER_OTLP_METRICS_ENDPOINT."
+        ),
+    )
+    service_name: str = Field(
+        default="opensandbox-server",
+        description="service.name resource attribute for exported metrics.",
+    )
+    export_interval_millis: int = Field(
+        default=60000,
+        ge=1000,
+        description="Periodic export interval in milliseconds.",
+    )
+
+
+class RenewIntentConfig(BaseModel):
+    """Renew sandbox expiration when access is observed (proxy and/or Redis queue)."""
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Master switch for auto-renew on reverse-proxy access and/or Redis "
             "ingress intents. When false, renew-intent logic is off."
         ),
     )
@@ -154,14 +187,14 @@ class RenewIntentConfig(BaseModel):
         default=60,
         ge=1,
         description=(
-            "🧪 [EXPERIMENTAL] Minimum seconds between successful renewals for the same sandbox "
+            "Minimum seconds between successful renewals for the same sandbox "
             "(cooldown)."
         ),
     )
     redis: RenewIntentRedisConfig = Field(
         default_factory=RenewIntentRedisConfig,
         description=(
-            "🧪 [EXPERIMENTAL] Redis queue consumer for ingress gateway renew-intent mode. "
+            "Redis queue consumer for ingress gateway renew-intent mode. "
             "In TOML, set keys under the same [renew_intent] table as redis.enabled, "
             "redis.dsn, redis.queue_key, redis.consumer_concurrency (dotted keys)."
         ),
@@ -324,7 +357,9 @@ class IngressConfig(BaseModel):
             "OSEP-0011 secure access signing configuration. "
             "When set, the server can issue signed route tokens and static "
             "SecureAccessTokens for sandbox endpoints. "
-            "Requires ingress.mode = 'gateway'."
+            "Requires ingress.mode = 'gateway'. "
+            "May also be injected via the OPENSANDBOX_SECURE_ACCESS_KEYS and "
+            "OPENSANDBOX_SECURE_ACCESS_ACTIVE_KEY environment variables."
         ),
     )
 
@@ -963,6 +998,10 @@ class AppConfig(BaseModel):
         default_factory=RenewIntentConfig,
         description="Auto-renew sandbox expiration when reverse-proxy access is observed.",
     )
+    otel: OtelConfig = Field(
+        default_factory=OtelConfig,
+        description="OpenTelemetry export for SDK metrics ingestion (Phase 1: create latency).",
+    )
     runtime: RuntimeConfig = Field(..., description="Sandbox runtime configuration.")
     kubernetes: Optional[KubernetesRuntimeConfig] = None
     agent_sandbox: Optional["AgentSandboxRuntimeConfig"] = None
@@ -1039,6 +1078,44 @@ def _apply_env_overrides(config: AppConfig) -> None:
     """Apply environment variable overrides to parsed configuration."""
     if API_KEY_ENV_VAR in os.environ:
         config.server.api_key = os.environ[API_KEY_ENV_VAR]
+    _apply_secure_access_env_overrides(config)
+
+
+def _apply_secure_access_env_overrides(config: AppConfig) -> None:
+    """Build ingress.secure_access from OPENSANDBOX_SECURE_ACCESS_* env vars.
+
+    OPENSANDBOX_SECURE_ACCESS_KEYS is a comma-separated key ring in
+    "key_id=base64" form; OPENSANDBOX_SECURE_ACCESS_ACTIVE_KEY names the
+    signing key. Both must be set together, and env wins over any
+    [ingress.secure_access] block from the config file.
+    """
+    keys_env = os.environ.get(SECURE_ACCESS_KEYS_ENV_VAR)
+    active_key_env = os.environ.get(SECURE_ACCESS_ACTIVE_KEY_ENV_VAR)
+    if keys_env is None and active_key_env is None:
+        return
+    if not keys_env or not active_key_env:
+        raise ValueError(
+            f"{SECURE_ACCESS_KEYS_ENV_VAR} and {SECURE_ACCESS_ACTIVE_KEY_ENV_VAR} "
+            "must be set together."
+        )
+    if config.ingress is None or config.ingress.mode != INGRESS_MODE_GATEWAY:
+        raise ValueError(
+            f"{SECURE_ACCESS_KEYS_ENV_VAR} requires ingress.mode = "
+            f"'{INGRESS_MODE_GATEWAY}' in the config file."
+        )
+    keys: list[SecureAccessKey] = []
+    for pair in keys_env.split(","):
+        key_id, sep, b64 = pair.partition("=")
+        if not sep or not key_id:
+            raise ValueError(
+                f"{SECURE_ACCESS_KEYS_ENV_VAR} entries must be in "
+                f"key_id=base64 form, got {pair!r}"
+            )
+        keys.append(SecureAccessKey(key_id=key_id, key=b64))
+    config.ingress.secure_access = SecureAccessConfig(
+        active_key=active_key_env,
+        keys=keys,
+    )
 
 
 def load_config(path: str | Path | None = None) -> AppConfig:
