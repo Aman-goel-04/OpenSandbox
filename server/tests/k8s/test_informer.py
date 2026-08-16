@@ -239,6 +239,12 @@ class TestWorkloadInformerStaleness:
         informer._last_contact_at -= informer._staleness_limit_seconds - 1
         assert informer.has_synced is True
 
+    def test_has_synced_false_after_stop(self):
+        """A stopped informer will never refresh again, however recent its last contact."""
+        informer = self._synced_informer()
+        informer.stop()
+        assert informer.has_synced is False
+
     def test_completed_watch_stream_refreshes_contact(self):
         """An idle watch that closes cleanly still proves the API server is reachable."""
         informer = self._synced_informer()

@@ -75,6 +75,9 @@ class WorkloadInformer:
         reader parked forever — so a "listed once" latch would keep readers on a
         frozen cache.  Going stale makes them fall back to a live request.
         """
+        if self._stop_event.is_set():
+            # Stopped: nothing will refresh the cache again, however recent it is.
+            return False
         with self._lock:
             if not self._has_synced or self._last_contact_at is None:
                 return False
