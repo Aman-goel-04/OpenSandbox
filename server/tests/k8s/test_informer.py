@@ -213,6 +213,85 @@ class TestWorkloadInformerHandleEvent:
         assert informer._resource_version == "200"
 
 
+class TestWorkloadInformerStaleness:
+    """has_synced reflects whether the cache is still being maintained."""
+
+    def _synced_informer(self) -> WorkloadInformer:
+        informer = _make_informer(
+            list_fn=MagicMock(return_value=_list_response("x")),
+            resync_period_seconds=300,
+            watch_timeout_seconds=60,
+        )
+        informer._full_resync()
+        return informer
+
+    def test_has_synced_false_once_contact_goes_stale(self):
+        """A watch that stalls without raising must not leave readers on a frozen cache."""
+        informer = self._synced_informer()
+        assert informer.has_synced is True
+
+        informer._last_contact_at -= informer._staleness_limit_seconds + 1
+        assert informer.has_synced is False
+
+    def test_has_synced_true_within_staleness_limit(self):
+        """Recent contact keeps the cache usable."""
+        informer = self._synced_informer()
+        informer._last_contact_at -= informer._staleness_limit_seconds - 1
+        assert informer.has_synced is True
+
+    def test_completed_watch_stream_refreshes_contact(self):
+        """An idle watch that closes cleanly still proves the API server is reachable."""
+        informer = self._synced_informer()
+        informer._last_contact_at -= informer._staleness_limit_seconds + 1
+
+        fake_watch = MagicMock()
+        fake_watch.stream.return_value = iter(())
+        with patch(
+            "opensandbox_server.services.k8s.informer.watch.Watch",
+            return_value=fake_watch,
+        ):
+            informer._run_watch_loop(60)
+
+        assert informer.has_synced is True
+
+
+class TestWorkloadInformerWatchResilience:
+    """The watch stream cannot silently park or resume from a dead cursor."""
+
+    def test_watch_stream_sets_client_side_request_timeout(self):
+        """A client read timeout is passed, above the server-side watch timeout."""
+        informer = _make_informer()
+        fake_watch = MagicMock()
+        fake_watch.stream.return_value = iter(())
+
+        with patch(
+            "opensandbox_server.services.k8s.informer.watch.Watch",
+            return_value=fake_watch,
+        ):
+            informer._run_watch_loop(60)
+
+        kwargs = fake_watch.stream.call_args.kwargs
+        connect_timeout, read_timeout = kwargs["_request_timeout"]
+        assert connect_timeout > 0
+        assert read_timeout > kwargs["timeout_seconds"]
+
+    def test_error_event_forces_a_fresh_list(self):
+        """A 410 Gone Status carries no name, so it must clear the cursor explicitly."""
+        informer = _make_informer()
+        informer._resource_version = "12345"
+        informer._has_synced = True
+
+        informer._handle_event(
+            {
+                "type": "ERROR",
+                "object": {"kind": "Status", "code": 410, "message": "too old resource version"},
+            }
+        )
+
+        assert informer._resource_version is None
+        assert informer._has_synced is False
+
+
 class TestWorkloadInformerStartStop:
     """start/stop thread lifecycle."""
 
