@@ -74,6 +74,62 @@ test("CommandsAdapter.run keeps exitCode null when error value is empty", async 
   assert.equal(execution.exitCode, null);
 });
 
+function createEarlyCloseStream() {
+  // Delivers the two SSE chunks one read() at a time, then errors on the
+  // next pull — simulating a peer that closes the connection right after
+  // execution_complete, before the chunked terminator arrives (#1528).
+  const encoder = new TextEncoder();
+  const chunks = [
+    'data: {"type":"init","text":"cmd-bg","timestamp":1}\n\n',
+    'data: {"type":"execution_complete","timestamp":2,"execution_time":3}\n\n',
+  ].map((chunk) => encoder.encode(chunk));
+  let index = 0;
+  return new ReadableStream({
+    pull(controller) {
+      if (index < chunks.length) {
+        controller.enqueue(chunks[index]);
+        index += 1;
+        return;
+      }
+      controller.error(new Error("peer closed connection early"));
+    },
+  });
+}
+
+test("CommandsAdapter.run breaks on execution_complete for background commands", async () => {
+  const fetchImpl = async () =>
+    new Response(createEarlyCloseStream(), {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+
+  const adapter = new CommandsAdapter(
+    {},
+    { baseUrl: "http://127.0.0.1:8080", fetch: fetchImpl },
+  );
+
+  const execution = await adapter.run("sleep 1", { background: true });
+
+  assert.equal(execution.id, "cmd-bg");
+  assert.equal(execution.complete?.executionTimeMs, 3);
+  assert.equal(execution.exitCode, undefined);
+});
+
+test("CommandsAdapter.run still surfaces stream errors for foreground commands", async () => {
+  const fetchImpl = async () =>
+    new Response(createEarlyCloseStream(), {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+
+  const adapter = new CommandsAdapter(
+    {},
+    { baseUrl: "http://127.0.0.1:8080", fetch: fetchImpl },
+  );
+
+  await assert.rejects(() => adapter.run("sleep 1"));
+});
+
 test("CommandsAdapter.runInSession sends command and timeout fields", async () => {
   let requestBody;
   const fetchImpl = async (url, init) => {
