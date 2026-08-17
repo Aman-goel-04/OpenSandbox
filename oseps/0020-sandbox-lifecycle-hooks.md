@@ -279,19 +279,20 @@ Design notes:
   descriptors; container-local timezone). The ticker starts from the injected
   `OPEN_SANDBOX_LIFECYCLE` env at boot; `POST /v1/lifecycle/periodic` replaces
   the schedule live.
-- **Config is persisted inside the sandbox, never memory-only.** execd writes
-  the effective lifecycle config (the runtime-updated `periodic` schedule; the
-  same file may later carry other in-sandbox hook state) to a file on the
-  sandbox **container rootfs**: `/var/execd/lifecycle.json`, with an atomic
-  write (temp file + rename). `/var/execd` is deliberately **not** any mounted
-  volume — it is not the K8s `opensandbox-bin` emptyDir (`/opt/opensandbox`,
-  wiped on pod recreation) nor the isolation volume
-  (`/var/lib/execd/isolation`), so the file lives in the writable layer that is
-  committed into the K8s rootfs snapshot on pause and restored on resume.
-  `bootstrap.sh` creates the directory (and execd may fall back gracefully if
-  it cannot) so non-root sandbox images can write it. On startup execd loads
-  **persisted file first, injected env as fallback**, so a runtime-PATCHed
-  schedule survives:
+- **Config is persisted inside the sandbox, never memory-only, and never as a
+  monolithic daemon-state blob.** execd follows one-concern-one-file
+  persistence under `/var/execd/`: the lifecycle config is a dedicated
+  **config file** (`/var/execd/lifecycle.json`) holding only the hook
+  definitions (desired state — small, low-frequency writes). It is written
+  atomically (temp file + rename) and carries a `version` field for future
+  migration. `/var/execd` is deliberately **not** any mounted volume — it is
+  not the K8s `opensandbox-bin` emptyDir (`/opt/opensandbox`, wiped on pod
+  recreation) nor the isolation volume (`/var/lib/execd/isolation`), so the
+  file lives in the writable layer that is committed into the K8s rootfs
+  snapshot on pause and restored on resume. `bootstrap.sh` creates the
+  directory (and execd may fall back gracefully if it cannot) so non-root
+  sandbox images can write it. On startup execd loads **persisted file first,
+  injected env as fallback**, so a runtime-PATCHed schedule survives:
   - **execd restarts** — the updated schedule is reloaded from the file.
   - **Docker pause/resume** — the container rootfs persists, config intact.
   - **K8s pause/resume** — the pod is recreated from the rootfs snapshot,
@@ -300,6 +301,22 @@ Design notes:
   The server-side label/annotation remains the source of truth for
   re-provisioning; the in-sandbox file is the runtime authority that keeps
   execd self-sufficient across restarts and resume.
+
+  **General execd persistence principles (apply to any future daemon state):**
+  - **Config vs. runtime state are separated.** Config (desired state, e.g.
+    lifecycle hooks) is persisted; runtime state that is rebuildable (hook run
+    results, `lastRunAt`/`consecutiveFailures` counters, session records)
+    stays in memory and may be reset on restart — `GET /v1/lifecycle/status`
+    reflects the current execd process only.
+  - **One concern = one file or directory.** Variable-cardinality data uses
+    one file per entity (`/var/execd/sessions/<id>.json`), never a JSON array
+    that is rewritten on every change; events use append-only JSONL with
+    rotation (reusing the `lumberjack` setup from `internal/supervisor`), not
+    a JSON file that is rewritten per append.
+  - **Load is best-effort and fail-open.** A missing, malformed, or
+    unsupported-version config file is logged and falls back to the injected
+    env (or defaults); it never blocks execd startup or the sandbox boot,
+    matching OSEP-0018's fail-open stance.
 - Concurrency: one in-flight run per `name`; a tick that finds its previous run
   still active is skipped (no queueing). Docker pause freezes execd, so the
   ticker naturally suspends; K8s resume recreates the pod and the ticker
