@@ -282,13 +282,20 @@ Design notes:
 - **Config is persisted inside the sandbox, never memory-only.** execd writes
   the effective lifecycle config (the runtime-updated `periodic` schedule; the
   same file may later carry other in-sandbox hook state) to a file on the
-  sandbox filesystem, e.g. `/opt/opensandbox/lifecycle.json`, with an atomic
-  write (temp file + rename). On startup execd loads **persisted file first,
-  injected env as fallback**, so a runtime-PATCHed schedule survives:
+  sandbox **container rootfs**: `/var/execd/lifecycle.json`, with an atomic
+  write (temp file + rename). `/var/execd` is deliberately **not** any mounted
+  volume — it is not the K8s `opensandbox-bin` emptyDir (`/opt/opensandbox`,
+  wiped on pod recreation) nor the isolation volume
+  (`/var/lib/execd/isolation`), so the file lives in the writable layer that is
+  committed into the K8s rootfs snapshot on pause and restored on resume.
+  `bootstrap.sh` creates the directory (and execd may fall back gracefully if
+  it cannot) so non-root sandbox images can write it. On startup execd loads
+  **persisted file first, injected env as fallback**, so a runtime-PATCHed
+  schedule survives:
   - **execd restarts** — the updated schedule is reloaded from the file.
-  - **Docker pause/resume** — the filesystem persists, config intact.
-  - **K8s pause/resume** — the pod is recreated from the rootfs snapshot, which
-    contains the config file, so PATCHed schedules survive resume; the
+  - **Docker pause/resume** — the container rootfs persists, config intact.
+  - **K8s pause/resume** — the pod is recreated from the rootfs snapshot,
+    which contains the config file, so PATCHed schedules survive resume; the
     creation-time env only serves as the boot default on first provision.
   The server-side label/annotation remains the source of truth for
   re-provisioning; the in-sandbox file is the runtime authority that keeps
