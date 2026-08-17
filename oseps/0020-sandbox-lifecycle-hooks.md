@@ -238,7 +238,7 @@ hook config survives server restarts by riding the existing per-provider state:
 |---|---|---|
 | Docker | container label `sandbox.opensandbox.io/lifecycle` (JSON) | matches the existing label-based config pattern (`opensandbox.io/embedding-proxy-port`); re-read by `_restore_existing_sandboxes` |
 | K8s | BatchSandbox annotation `sandbox.opensandbox.io/lifecycle` (JSON) | annotations are schemaless — no CRD change; the operator controller ignores the key entirely (server-only contract) |
-| Both | in-sandbox env `OPEN_SANDBOX_LIFECYCLE` (JSON) at create | consumed by `bootstrap.sh` (`preStart`) and execd (periodic ticker startup); contains only `preStart` + `periodic` (the in-sandbox halves) |
+| Both | in-sandbox env `OPEN_SANDBOX_LIFECYCLE` (TOML content) at create | **transport only**: `bootstrap.sh` materializes it to `/var/execd/lifecycle.toml` on first provision (if absent); execd reads only the file. Contains only `preStart` + `periodic` (the in-sandbox halves) |
 
 The K8s annotation is added to the annotation contract list in
 `kubernetes/AGENTS.md` when implemented; readers/writers must be updated
@@ -282,17 +282,39 @@ Design notes:
 - **Config is persisted inside the sandbox, never memory-only, and never as a
   monolithic daemon-state blob.** execd follows one-concern-one-file
   persistence under `/var/execd/`: the lifecycle config is a dedicated
-  **config file** (`/var/execd/lifecycle.json`) holding only the hook
-  definitions (desired state — small, low-frequency writes). It is written
-  atomically (temp file + rename) and carries a `version` field for future
-  migration. `/var/execd` is deliberately **not** any mounted volume — it is
+  **TOML config file** (`/var/execd/lifecycle.toml`) holding only the hook
+  definitions (desired state — small, low-frequency writes). TOML matches
+  execd's existing config convention (`--isolation-config` /
+  `EXECD_ISOLATION_CONFIG`, `configs/isolation.example.toml`), but is a
+  **separate per-sandbox file**: the isolation TOML is a static
+  operator/image-level policy and is not runtime-PATCHable, while this file is
+  per-sandbox and updated by PATCH. It is written atomically (temp file +
+  rename) and carries a `version` key for future migration:
+
+  ```toml
+  # /var/execd/lifecycle.toml
+  version = 1
+
+  [preStart]
+  command = ["/opt/hooks/pre-start.sh"]
+  timeout_seconds = 60
+
+  [[periodic]]
+  name = "checkpoint"
+  schedule = "*/5 * * * *"
+  command = ["/opt/hooks/checkpoint.sh"]
+  timeout_seconds = 60
+  ```
+
+  `/var/execd` is deliberately **not** any mounted volume — it is
   not the K8s `opensandbox-bin` emptyDir (`/opt/opensandbox`, wiped on pod
   recreation) nor the isolation volume (`/var/lib/execd/isolation`), so the
   file lives in the writable layer that is committed into the K8s rootfs
   snapshot on pause and restored on resume. `bootstrap.sh` creates the
   directory (and execd may fall back gracefully if it cannot) so non-root
   sandbox images can write it. On startup execd loads **persisted file first,
-  injected env as fallback**, so a runtime-PATCHed schedule survives:
+  injected env as fallback** — `bootstrap.sh` writes the file only when it is
+  absent (first provision), so a runtime-PATCHed schedule survives:
   - **execd restarts** — the updated schedule is reloaded from the file.
   - **Docker pause/resume** — the container rootfs persists, config intact.
   - **K8s pause/resume** — the pod is recreated from the rootfs snapshot,
@@ -303,6 +325,9 @@ Design notes:
   execd self-sufficient across restarts and resume.
 
   **General execd persistence principles (apply to any future daemon state):**
+  - **Config files are TOML.** execd's existing config surface is TOML
+    (`--isolation-config`); new config files follow the same format and
+    parsing conventions, never JSON.
   - **Config vs. runtime state are separated.** Config (desired state, e.g.
     lifecycle hooks) is persisted; runtime state that is rebuildable (hook run
     results, `lastRunAt`/`consecutiveFailures` counters, session records)
@@ -329,13 +354,16 @@ env-preparation script) and the separate `opensandbox-supervisor` binary has
 worker-level `--pre-start`/`--post-exit` hooks with timeouts. This OSEP adds a
 structured `preStart` to the contract:
 
-- At create, the server serializes `lifecycle.preStart` (plus `periodic`) into
-  `OPEN_SANDBOX_LIFECYCLE` env on the container/pod.
-- `bootstrap.sh` parses `OPEN_SANDBOX_LIFECYCLE.preStart` and, if present, runs
-  it as a child process (exec semantics — not sourced; sourced env preparation
-  stays with `EXECD_BOOTSTRAP_PRE_SCRIPT`) with a `timeout`-bounded wait, before
-  starting execd and the entrypoint. Non-zero exit or timeout aborts the boot
-  (the container start fails, matching `preStart` Abort semantics).
+- At create, the server serializes `lifecycle.preStart` (plus `periodic`) as
+  TOML into the `OPEN_SANDBOX_LIFECYCLE` env on the container/pod; `bootstrap.sh`
+  materializes it to `/var/execd/lifecycle.toml` when the file does not exist
+  yet (first provision), so execd and the boot path read the file only.
+- `bootstrap.sh` parses `/var/execd/lifecycle.toml` `[preStart]` and, if
+  present, runs it as a child process (exec semantics — not sourced; sourced
+  env preparation stays with `EXECD_BOOTSTRAP_PRE_SCRIPT`) with a
+  `timeout`-bounded wait, before starting execd and the entrypoint. Non-zero
+  exit or timeout aborts the boot (the container start fails, matching
+  `preStart` Abort semantics).
 - When OSEP-0018 (execd as sandbox init) lands, execution moves into execd's
   launch path before the entrypoint is spawned; the contract is unchanged.
 
@@ -399,8 +427,9 @@ in `reason`/`message` (and 409 on aborted transitions).
   injection.
 - execd periodic: cron scheduling (descriptor + 5-field), in-flight skip
   (slow hook), hot schedule replacement, consecutive-failure recording.
-- execd lifecycle config file: atomic write (temp + rename), startup load order
-  (persisted file wins over injected env), malformed-file fallback.
+- execd lifecycle config file: TOML parse (valid/invalid/unsupported
+  `version`), atomic write (temp + rename), startup load order (persisted file
+  wins over injected env), malformed-file fail-open fallback.
 - Failure-policy resolution: Abort/Continue per event and per default.
 
 **Integration**
