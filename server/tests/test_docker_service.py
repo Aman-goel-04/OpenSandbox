@@ -809,7 +809,7 @@ async def test_egress_sidecar_injection_and_capabilities(mock_docker):
 
     cfg = _app_config()
     cfg.docker.network_mode = "bridge"
-    cfg.egress = EgressConfig(image="egress:latest", timeout_seconds=75.5)
+    cfg.egress = EgressConfig(image="egress:latest", readiness_timeout_seconds=75.5)
     service = DockerSandboxService(config=cfg)
 
     req = CreateSandboxRequest(

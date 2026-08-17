@@ -511,7 +511,7 @@ class DockerNetworkingMixin:
                     sandbox_id,
                     egress_api_host_port,
                     egress_token,
-                    timeout_seconds=self.app_config.egress.timeout_seconds,
+                    timeout_seconds=self.app_config.egress.readiness_timeout_seconds,
                 )
             return sidecar_container
         except Exception as exc:

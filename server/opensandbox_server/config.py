@@ -751,7 +751,7 @@ class EgressConfig(BaseModel):
             "(e.g. IPv4-only CNI or experimenting with IPv6 egress despite gaps)."
         ),
     )
-    timeout_seconds: float = Field(
+    readiness_timeout_seconds: float = Field(
         default=30.0,
         gt=0,
         description=(
