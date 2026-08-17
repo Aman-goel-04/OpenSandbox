@@ -35,8 +35,8 @@ uv run python examples/deep-agents/main.py
 ```
 
 The agent writes a Python script into the sandbox, runs it, and reports the output — all file
-and shell operations happen inside the sandbox rather than on the host. The sandbox is killed
-on exit.
+and shell operations happen inside the sandbox rather than on the host. The sandbox is destroyed
+on exit (terminated and local resources closed).
 
 ## Environment Variables
 
