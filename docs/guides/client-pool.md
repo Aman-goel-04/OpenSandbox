@@ -306,6 +306,15 @@ validate a positive concurrency value and wait for every drained ID to receive a
 best-effort kill attempt. The Go method is intentionally outside the
 `SandboxPool` interface to preserve compatibility with third-party implementors.
 
+### Tracing warmups (Kotlin)
+
+The Kotlin SDK can emit an OpenTelemetry trace per warmup task (`pool.warmup`
+root span plus `create` / `prepare` / `renew` / `commit` phases) when
+`ConnectionConfig.enableTracing(true)` is set and an OpenTelemetry SDK +
+exporter is on the classpath. `trace_id` / `span_id` are published to the
+SLF4J MDC, so search your logs for a `sandbox_id` to find the warmup trace and
+drill into phase durations. See [SDK Tracing (Pool Warmup)](/guides/sdk-tracing).
+
 ### Retiring an old pool namespace
 
 The retirement procedure differs across SDKs because Go does not currently ship a
