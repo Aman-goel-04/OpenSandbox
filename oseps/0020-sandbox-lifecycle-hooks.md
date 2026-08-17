@@ -96,17 +96,20 @@ guarantee a hook runs. This drives the declarative-first design.
 | R1 | Hooks are declared in `CreateSandboxRequest.lifecycle`; all hooks optional | Must |
 | R2 | `prePause`, `postResume`, `preTerminate`, `periodic` are updatable at runtime via `PATCH /sandboxes/{sandboxId}/lifecycle`; `preStart` is rejected by PATCH | Must |
 | R3 | `preStart` executes before the sandbox entrypoint starts, in-sandbox, without any server round trip | Must |
-| R4 | Transition hooks run through the orchestrated channel: server → execd `/v1/lifecycle/run` | Must |
-| R5 | Each hook has `timeoutSeconds` (default 60) and `failurePolicy` (`Abort` default for `prePause`/`postResume`, `Continue` default for `preTerminate`) | Must |
+| R4 | `prePause` and `postResume` run through the orchestrated channel: server → execd `/v1/lifecycle/run`; `preTerminate` runs **in-sandbox via SIGTERM** — no server in the path | Must |
+| R5 | Each hook has `timeoutSeconds` (default 60) and `failurePolicy` (`Abort` default for `prePause`/`postResume`; `preTerminate` and `periodic` are fixed `Continue` — `Abort` is rejected for them) | Must |
 | R6 | A timed-out or failed hook with `failurePolicy: Abort` aborts the transition and leaves the sandbox in the pre-transition state with a machine-readable reason | Must |
-| R7 | Hooks never block sandbox termination: when the sandbox is unreachable or not `Running`, transition hooks are skipped and recorded, never fatal | Must |
+| R7 | Hooks never block sandbox termination: `preTerminate` runs only while the sandbox is `Running`; when the sandbox is unreachable or not `Running` (e.g. `Paused`), no SIGTERM handler runs and termination proceeds — never fatal | Must |
 | R8 | `periodic` hooks run on a cron schedule inside the sandbox via an execd ticker, without server liveness dependency | Must |
 | R9 | A `periodic` hook whose previous run is still in flight skips the current tick (no queueing) | Must |
-| R10 | Hook config survives server restarts (Docker: container label; K8s: BatchSandbox annotation) | Must |
+| R10 | Hook config survives server restarts (Docker: file-backed store; K8s: BatchSandbox/AgentSandbox annotation) | Must |
 | R11 | PATCH affects only future transitions; an in-flight transition uses the config snapshot taken when it started | Must |
 | R12 | Hook execution results are observable (execd records last run, exit code, consecutive failures) | Should |
 | R13 | Pool-mode sandboxes support the same hook contract via the Pool pod template | Should |
 | R14 | The effective lifecycle config is **persisted inside the sandbox** (a config file on the sandbox filesystem), not kept only in memory: execd restarts and pause/resume cycles (including K8s rootfs-snapshot resume) must preserve runtime-PATCHed schedules and hooks | Must |
+| R15 | Termination grace must cover the `preTerminate` hook: the server sets the K8s pod `terminationGracePeriodSeconds` / Docker `stop` timeout to `preTerminate.timeoutSeconds` + buffer, so SIGKILL never cuts the hook off | Must |
+| R16 | Lifecycle PATCH is rejected when the sandbox is not `Running` (409) — a paused/failed sandbox cannot receive the live execd update and deferred application would leave persisted config and live schedule inconsistent | Must |
+| R17 | Lifecycle configuration requires execd lifecycle-API capability: create/PATCH is rejected for sandboxes running an execd without the lifecycle endpoints, so an `Abort`-default hook never 404s mid-transition on an old daemon | Must |
 
 ## Proposal
 
@@ -117,43 +120,51 @@ guarantee a hook runs. This drives the declarative-first design.
 | `preStart` | in-process (bootstrap.sh) | yes | **no** | Abort | before entrypoint starts, on every boot (including K8s resume) |
 | `prePause` | orchestrated (server → execd) | yes | yes | Abort | before pause begins (manual, idle, or TTL-adjacent) |
 | `postResume` | orchestrated (server → execd) | yes | yes | Abort | after runtime resume, before the sandbox returns to `Running` |
-| `preTerminate` | orchestrated (server → execd) | yes | yes | Continue | before termination (delete or TTL), only when the sandbox is reachable |
+| `preTerminate` | **in-sandbox signal-driven (execd catches SIGTERM)** | yes | yes | Continue (only; `Abort` rejected) | on any platform termination of a `Running` sandbox (delete, TTL, eviction, `docker stop`) |
 | `periodic[]` | execd ticker | yes (injected) | yes (hot update) | Continue (always) | on cron schedule while the sandbox runs |
 
-### Two Execution Channels
+### Execution Channels
 
 ```
 ┌─────────────────────────────── sandbox lifecycle hooks ───────────────────────────────┐
 │                                                                                        │
-│  IN-PROCESS channel                    ORCHESTRATED channel                             │
-│  (no external caller exists)           (server drives the transition)                  │
+│  IN-SANDBOX channels                        ORCHESTRATED channel                        │
+│  (self-contained; no server in the path)    (server drives the transition)             │
 │                                                                                        │
-│  Create: inject config (env)      │   Create: persist config (label/annotation)        │
-│  bootstrap.sh reads OPEN_         │   PATCH: update config, push periodic hot-update    │
-│   SANDBOX_LIFECYCLE.preStart      │                                                   │
-│  → run hook → exec entrypoint     │   transition → server reads config snapshot        │
-│                                   │   → POST execd /v1/lifecycle/run (timeout)         │
-│  events: preStart                 │   → advance or abort transition                    │
+│  process-ordering:                 │   Create: persist config (label/annotation)       │
+│   bootstrap.sh materializes        │   PATCH: update config, push live update          │
+│   OPEN_SANDBOX_LIFECYCLE →         │   transition → server reads config snapshot       │
+│   /var/execd/lifecycle.toml        │   → POST execd /v1/lifecycle/run (timeout)        │
+│   → run preStart → exec entrypoint │   → advance or abort transition                   │
 │                                   │                                                    │
-│                                   │   events: prePause, postResume, preTerminate,      │
-│                                   │            periodic (execd ticker)                 │
+│  signal-driven:                    │   events: prePause, postResume                    │
+│   execd catches SIGTERM →          │                                                    │
+│   run preTerminate → shutdown      │                                                    │
+│                                   │                                                    │
+│  timer-driven:                     │                                                    │
+│   execd cron ticker → periodic     │                                                    │
 └───────────────────────────────────┴────────────────────────────────────────────────────┘
 ```
 
-Why two channels: `preStart` is a **process-ordering** semantic — the entrypoint
-is launched by `bootstrap.sh` immediately after execd, with no window for a
-server round trip; worker restarts and K8s resume (pod recreation) re-run it
-with no server involvement. Transition hooks are **state-machine** semantics
-owned by the server, which is the only component that sees both the stored hook
-config and the lifecycle event. execd stays stateless: it executes commands and
-runs a cron ticker; it never interprets lifecycle semantics itself.
+Why multiple channels: `preStart` is a **process-ordering** semantic — the
+entrypoint is launched by `bootstrap.sh` immediately after execd, with no window
+for a server round trip; worker restarts and K8s resume (pod recreation) re-run
+it with no server involvement. `preTerminate` is **signal-driven**: every
+platform termination path (K8s pod delete for TTL expiry, user delete,
+eviction, node drain; Docker `docker stop`) ends in a SIGTERM to the container,
+and `bootstrap.sh` already forwards it to execd — so execd runs the hook
+itself, with no server in the path, which makes TTL- and eviction-triggered
+termination as reliable as user-initiated ones. The remaining transition hooks
+are **state-machine** semantics owned by the server, which is the only
+component that sees both the stored hook config and the lifecycle event. execd
+executes commands, runs the cron ticker, and handles SIGTERM; it never
+interprets pause/resume semantics itself.
 
 ### Notes/Constraints/Caveats
 
 - **`preStart` cannot be PATCHed.** It is injected into the sandbox at creation and executed by `bootstrap.sh` before the entrypoint; by the time a PATCH could reach the sandbox, that boot is over. The PATCH API must reject `preStart` changes explicitly rather than silently accepting a never-effective value.
-- **Paused-state termination skips `preTerminate`.** The spec allows `Paused → Stopping`. A paused Docker sandbox is frozen (execd unreachable); a paused K8s sandbox has no pod. The executor records "skipped (sandbox not reachable)" instead of failing the termination.
+- **Paused-state termination skips `preTerminate`.** The spec allows `Paused → Stopping`. A paused Docker sandbox is frozen (its processes do not respond to signals); a paused K8s sandbox has no pod and therefore no execd at all. In both cases no SIGTERM handler runs, which naturally matches the "skipped, not fatal" semantics — termination is unaffected.
 - **Idle-pause (#1448) reuses the same `prePause` hook** — it is the same transition, only triggered by the platform.
-- **K8s TTL expiry deletes pods in the operator controller**, not in the server (see Risks; open implementation question in Design §7).
 
 ### Risks and Mitigations
 
@@ -163,7 +174,7 @@ runs a cron ticker; it never interprets lifecycle semantics itself.
 | PATCH races with an in-flight transition | Snapshot semantics: the transition uses the config read when it started (R11) |
 | Hook hangs forever | `timeoutSeconds` enforced at the execd runner (kill + error) and bounded by the transition state machine |
 | `prePause` fails after the runtime has partially advanced | Ordering guarantees: hooks run to completion (or policy result) *before* the runtime pause/resume/delete call |
-| K8s TTL termination bypasses the server (controller deletes the pod) | v1: server periodically scans near-expiry sandboxes and runs `preTerminate` best-effort before expiry; a controller-driven alternative is an open implementation question (§7) |
+| SIGKILL cuts `preTerminate` off (grace too short) | R15: server sets `terminationGracePeriodSeconds` (K8s) / `stop` timeout (Docker) to `preTerminate.timeoutSeconds` + buffer; execd treats grace remaining as the hard deadline |
 | execd unreachable during a transition (crashed pod, frozen container) | Skip + record (R7); the transition never blocks on a hook |
 | Cron dependency | Standard `robfig/cron/v3` (K8s CronJob parser), vendored with execd |
 | Hook commands run as the sandbox user and share the sandbox environment | Documented: hooks are in-sandbox by design; execd's credential env is already stripped from child processes (OSEP-0018 launcher) |
@@ -193,8 +204,7 @@ lifecycle:
     command: ["/opt/hooks/post-resume.sh"]
   preTerminate:
     timeoutSeconds: 30
-    failurePolicy: Continue      # default Continue for preTerminate
-    command: ["/opt/hooks/pre-terminate.sh"]
+    command: ["/opt/hooks/pre-terminate.sh"]   # failurePolicy not allowed; fixed Continue
   periodic:
     - name: checkpoint           # required; identity for dedup and observability
       schedule: "*/5 * * * *"    # standard 5-field cron; robfig descriptors (@hourly, @every 30s) allowed
@@ -205,7 +215,7 @@ lifecycle:
 Schema notes:
 
 - `command` is an argv array (no shell expansion; wrap in a script when needed), consistent with the task-executor `LifecycleHandler` (`kubernetes/pkg/task-executor/types.go`).
-- `failurePolicy` enum: `Abort` | `Continue`. Defaults: `Abort` for `prePause`/`postResume`, `Continue` for `preTerminate`, `Continue` (fixed) for `periodic`.
+- `failurePolicy` enum: `Abort` | `Continue`. Defaults: `Abort` for `prePause`/`postResume`. `preTerminate` and `periodic` are **fixed `Continue`** — supplying `Abort` is a validation error, because a signal-driven pre-termination hook is inherently best-effort (SIGKILL follows the grace period regardless) and a periodic failure must never affect the sandbox.
 - `periodic` is a list so multiple independent schedules (checkpoint, cleanup, heartbeat) can coexist; `name` must be unique within the sandbox.
 - Event enum stays open: unknown/disabled events are ignored gracefully.
 
@@ -225,9 +235,12 @@ Semantics:
 
 - Merge patch on the `lifecycle` object; `null` removes a hook; absent keys unchanged.
 - **Rejects `preStart`** with 400 (`PreStartNotPatchable`) — it cannot take effect after creation.
+- **Rejects PATCH on a non-`Running` sandbox** with 409 (`SandboxNotRunning`): a paused/failed sandbox cannot receive the live execd update, and deferred application would leave the persisted file and the live schedule inconsistent (Docker frozen / K8s pod gone). The client patches after resume.
+- **Rejects `failurePolicy: Abort` for `preTerminate`/`periodic`** with 400 (fixed `Continue`).
 - Applies to future transitions only; an in-flight transition keeps its start-time snapshot (R11).
 - No optimistic locking in v1 (single-writer assumption, same caveat documented for metadata PATCH).
-- Provider persistence: update the Docker container label / K8s BatchSandbox annotation; for `periodic`, push the new schedule to execd live (`POST /v1/lifecycle/periodic`, §4).
+- Provider persistence: Docker file-backed store / K8s workload CR annotation; for in-sandbox effects, push the updated config to execd live (`POST /v1/lifecycle/periodic`; `preTerminate` needs no push — execd reads the file fresh on SIGTERM).
+- **Capability gate**: creating or PATCHing lifecycle config requires the sandbox's execd to support the lifecycle API (versioned `/v1/lifecycle/capabilities` or the existing capabilities endpoint extended); sandboxes running an older execd image reject lifecycle configuration, so `Abort`-default hooks never 404 on an old daemon mid-transition.
 
 ### 3. Config Persistence by Provider
 
@@ -236,8 +249,8 @@ hook config survives server restarts by riding the existing per-provider state:
 
 | Provider | Storage | Rationale |
 |---|---|---|
-| Docker | container label `sandbox.opensandbox.io/lifecycle` (JSON) | matches the existing label-based config pattern (`opensandbox.io/embedding-proxy-port`); re-read by `_restore_existing_sandboxes` |
-| K8s | BatchSandbox annotation `sandbox.opensandbox.io/lifecycle` (JSON) | annotations are schemaless — no CRD change; the operator controller ignores the key entirely (server-only contract) |
+| Docker | **file-backed store**, same mechanism metadata/expiration already use (`services/docker/metadata.py`) | Docker labels on running containers are **immutable** — PATCH cannot update them; the existing file-backed store is the established writable pattern |
+| K8s | BatchSandbox **or AgentSandbox** annotation `sandbox.opensandbox.io/lifecycle` (JSON), whichever workload CR the configured provider manages (`provider_factory.py` registers both) | annotations are schemaless — no CRD change; the operator controller ignores the key entirely (server-only contract) |
 | Both | in-sandbox env `OPEN_SANDBOX_LIFECYCLE` (TOML content) at create | **transport only**: `bootstrap.sh` materializes it to `/var/execd/lifecycle.toml` on first provision (if absent); execd reads only the file. Contains only `preStart` + `periodic` (the in-sandbox halves) |
 
 The K8s annotation is added to the annotation contract list in
@@ -249,7 +262,7 @@ together.
 New routes in execd (`pkg/web/router.go`), documented in `specs/execd-api.yaml`:
 
 ```
-POST /v1/lifecycle/run          # run one command with timeout, wait for result
+POST /v1/lifecycle/run          # run one transition hook synchronously (prePause / postResume)
 {
   "event": "prePause",          # context only (logging/telemetry)
   "command": ["/opt/hooks/pre-pause.sh"],
@@ -273,8 +286,12 @@ Design notes:
 - `run` reuses the existing command runtime machinery (`pkg/runtime/command.go`)
   in a synchronous, bounded mode; it does not reuse `/command`'s background +
   polling shape because hooks need synchronous completion with a hard deadline.
+  It serves only the orchestrated transition hooks (`prePause`/`postResume`).
 - execd keeps no lifecycle semantics: it does not know what "pause" means, only
   that a command must run with a timeout. The server supplies everything.
+- **`preTerminate` has no endpoint**: execd installs a SIGTERM handler (its
+  existing signal-notify path, `main.go`) that runs the `preTerminate` command
+  from the config file and then exits — see Design §9.
 - Periodic scheduling is a `robfig/cron/v3` ticker inside execd (5-field cron +
   descriptors; container-local timezone). The ticker starts from the injected
   `OPEN_SANDBOX_LIFECYCLE` env at boot; `POST /v1/lifecycle/periodic` replaces
@@ -311,16 +328,21 @@ Design notes:
   recreation) nor the isolation volume (`/var/lib/execd/isolation`), so the
   file lives in the writable layer that is committed into the K8s rootfs
   snapshot on pause and restored on resume. `bootstrap.sh` creates the
-  directory (and execd may fall back gracefully if it cannot) so non-root
-  sandbox images can write it. On startup execd loads **persisted file first,
-  injected env as fallback** — `bootstrap.sh` writes the file only when it is
-  absent (first provision), so a runtime-PATCHed schedule survives:
+  directory when it can (root images). For **non-root images** (which cannot
+  create directories under `/var`, e.g. the `examples/chrome` and
+  `examples/vscode` images), execd resolves a writable state directory at
+  startup with the same order `bootstrap.sh` uses, so the boot path and execd
+  always agree: try `/var/execd`, fall back to `$HOME/.opensandbox` — both on
+  the container rootfs, so the K8s snapshot guarantee holds either way. On
+  startup execd loads **persisted file first, injected env as fallback** —
+  `bootstrap.sh` writes the file only when it is absent (first provision), so
+  a runtime-PATCHed schedule survives:
   - **execd restarts** — the updated schedule is reloaded from the file.
   - **Docker pause/resume** — the container rootfs persists, config intact.
   - **K8s pause/resume** — the pod is recreated from the rootfs snapshot,
     which contains the config file, so PATCHed schedules survive resume; the
     creation-time env only serves as the boot default on first provision.
-  The server-side label/annotation remains the source of truth for
+  The server-side file-backed store/annotation remains the source of truth for
   re-provisioning; the in-sandbox file is the runtime authority that keeps
   execd self-sufficient across restarts and resume.
 
@@ -385,14 +407,15 @@ structured `preStart` to the contract:
 
 ### 7. Orchestration: Server-Side Transitions
 
-The server (both providers) executes hooks around its existing transitions:
+The server (both providers) executes hooks around its existing transitions.
+`preTerminate` is **not** orchestrated — see Design §9 (signal-driven):
 
 | Transition | Sequence |
 |---|---|
 | Pause (manual, idle, TTL-adjacent) | read config snapshot → `run` `prePause` → policy result → Docker `pause` / K8s patch `spec.pause=true` |
 | Resume | Docker `unpause` / K8s patch `pause=false` → poll execd `/ping` (not pod readiness) → `run` `postResume` → success → sandbox state `Running` (abort → back to `Paused` + `ResumeFailed`-style reason) |
-| Terminate (delete) | if sandbox reachable and `Running`: `run` `preTerminate` (Continue) → delete container/pod; else skip + record |
-| K8s TTL expiry | controller deletes the pod; **v1**: server pre-scan of near-expiry sandboxes runs `preTerminate` best-effort before expiry. **Open implementation question**: alternatively hand the hook execution to the operator (controller calls execd), which would place hook orchestration in the controller for this path only |
+| Terminate (user delete, Docker `stop`) | server issues the delete; the runtime sends SIGTERM into the sandbox; execd runs `preTerminate` (if `Running`) and shuts down. Server only ensures the termination grace covers the hook timeout (R15) |
+| K8s TTL expiry / eviction / node drain | controller/kubelet deletes the pod; kubelet SIGTERMs the container; execd runs `preTerminate` — **no server involvement, no pre-scan** |
 
 State visibility for clients is unchanged: transitions already surface as
 `Pausing`/`Resuming`/`Stopping` in `SandboxStatus`, and hook results are carried
@@ -401,20 +424,81 @@ in `reason`/`message` (and 409 on aborted transitions).
 ### 8. Failure, Timeout, and Degradation Semantics
 
 - **Timeout**: enforced at the execd runner (kill on expiry, `504`), never
-  counted as a success.
+  counted as a success. For `preTerminate`, the effective deadline is
+  `min(timeoutSeconds, termination grace remaining)` — SIGKILL after the grace
+  period is the hard backstop (R15).
 - **Abort** (`prePause`/`postResume` default): hook fails or times out →
   transition aborts, sandbox returns to its pre-transition state
   (`Running`/`Paused`), reason recorded (e.g. `prePause_hook_failed`). The user
   may retry the transition.
-- **Continue** (`preTerminate` default, always for `periodic`): failure is
-  recorded and the transition proceeds.
-- **Unreachable sandbox** (`Paused`/`Failed`/pod gone): transition hooks are
-  skipped with a recorded reason; termination never blocks on a hook.
+- **Continue** (`preTerminate` and `periodic`; `Abort` rejected for both):
+  failure is recorded and the transition proceeds. For `preTerminate` this is
+  inherent — SIGKILL follows the grace period regardless, so the hook can only
+  ever be best-effort.
+- **Unreachable sandbox** (`Paused`/`Failed`/pod gone): no SIGTERM handler
+  runs (`preTerminate`), and orchestrated transition hooks are skipped with a
+  recorded reason; termination never blocks on a hook.
 - **Idempotency**: transition hooks are executed once per transition — the
   server's existing phase state machine (`Pausing`/`Resuming`/`Stopping`) and
   generation gating (K8s `PauseObservedGeneration`) already prevent re-entry;
   the hook itself should be idempotent (documented contract), since a failed
-  `Abort` transition may be retried.
+  `Abort` transition may be retried. A `preTerminate` hook runs at most once
+  per container lifetime: execd runs it on SIGTERM and exits immediately
+  after.
+
+### 9. Signal-Driven preTerminate
+
+Every platform termination path converges on the same primitive — a SIGTERM
+sent to the sandbox container:
+
+- **K8s** (TTL expiry, user delete, eviction, node drain): kubelet SIGTERMs
+  the container's PID 1 during pod deletion.
+- **Docker** (`docker stop` from the server or an operator): SIGTERM to the
+  container's PID 1.
+
+Today the container PID 1 is `bootstrap.sh`, which already traps TERM and
+forwards it to execd (`bootstrap.sh` `_shutdown_children`); under OSEP-0018
+execd becomes PID 1 and receives the external SIGTERM directly. In both
+topologies execd sees the signal:
+
+```go
+// execd main.go: extend the existing signal-notify path
+ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+go func() {
+    <-ctx.Done()
+    if hook := lifecycle.Load("/var/execd/lifecycle.toml").PreTerminate; hook != nil {
+        runHook(hook, timeUntilGraceDeadline())   // reads the file fresh, not a cached copy
+    }
+    shutdownServerAndExit()
+}()
+```
+
+Guarantees and properties:
+
+1. **Covers all platform-driven terminations, with no server in the path** —
+   TTL expiry (controller deletes the pod while the server may be down),
+   eviction, node drain, user delete, and `docker stop` are equivalent.
+2. **`Running`-only by construction**: a `Paused` Docker sandbox is frozen
+   (does not respond to signals) and a `Paused` K8s sandbox has no pod — no
+   handler runs, termination proceeds (R7).
+3. **Inherently best-effort (fixed `Continue`)**: SIGKILL follows the grace
+   period no matter what, so the hook cannot block termination and `Abort` is
+   rejected for it.
+4. **Grace period must cover the hook** (R15): the server sets K8s pod
+   `terminationGracePeriodSeconds` and the Docker `stop` timeout to
+   `preTerminate.timeoutSeconds` + buffer (default 30 s or configured value);
+   execd treats the grace deadline as the hard cap even if the hook's own
+   timeout is larger.
+5. **Runs concurrently with the app's own shutdown** in today's topology
+   (`bootstrap.sh` forwards TERM to both execd and the user command): the hook
+   contract is state flush, not application coordination.
+6. **Config is read fresh at signal time** from `/var/execd/lifecycle.toml`
+   (never a cached copy), so the latest PATCHed definition applies.
+7. **OSEP-0018 interaction**: when execd becomes PID 1, it must distinguish
+   the *external* container-stop SIGTERM from an in-namespace `kill 1` by a
+   workload process (an open item already tracked in OSEP-0018 §3); the v1
+   topology (bootstrap forwards only trusted external TERM to execd) is
+   unaffected.
 
 ## Test Plan
 
@@ -425,6 +509,10 @@ in `reason`/`message` (and 409 on aborted transitions).
   rejection (400).
 - execd `run`: timeout kill, output capture, exit-code propagation, env
   injection.
+- execd SIGTERM handler: reads `[preTerminate]` from the config file, runs it
+  with the grace-bounded deadline, exits after; no handler when the hook is
+  absent; `kill 1` from an in-namespace process is ignored in the v1 topology
+  (execd receives TERM only via bootstrap forwarding).
 - execd periodic: cron scheduling (descriptor + 5-field), in-flight skip
   (slow hook), hot schedule replacement, consecutive-failure recording.
 - execd lifecycle config file: TOML parse (valid/invalid/unsupported
@@ -443,11 +531,15 @@ in `reason`/`message` (and 409 on aborted transitions).
 **E2E (Kind for K8s, Docker for the Docker runtime)**
 
 - Docker: `prePause` writes a marker before `docker pause`; `postResume` runs
-  after `unpause`; `preTerminate` runs before delete; periodic hook writes
-  checkpoints on schedule; pause freezes the ticker.
+  after `unpause`; periodic hook writes checkpoints on schedule; pause freezes
+  the ticker; `preTerminate` runs on `docker stop` (marker file in the
+  container rootfs).
 - K8s: `prePause` before `spec.pause=true`; `postResume` after pod Ready +
   execd `/ping`, before `Running`; resume-from-snapshot re-runs `preStart`.
-- TTL termination with a near-expiry `preTerminate` (best-effort path).
+- K8s termination paths: TTL expiry, `kubectl delete` pod, and eviction all
+  produce the `preTerminate` marker (signal-driven, no server in the path);
+  a `Paused` sandbox deleted directly produces no marker and terminates
+  normally.
 - PATCH mid-flight: transition uses its start snapshot; a PATCH lands for the
   next transition.
 - Server restart: hook config restored from container label / BatchSandbox
@@ -463,8 +555,8 @@ in `reason`/`message` (and 409 on aborted transitions).
 
 1. **Contract surface grows** (`CreateSandboxRequest.lifecycle` + PATCH endpoint + execd API) — mitigated by keeping every field optional and additive.
 2. **execd takes on a scheduler** — cron ticker + lifecycle run endpoint extend the in-sandbox control plane; isolated from user code by the existing access token and (eventually) OSEP-0018 hardening.
-3. **Two execution channels** — more places for behavior to drift; the contract explicitly maps each event to exactly one channel to avoid ambiguity.
-4. **K8s TTL path** cannot guarantee `preTerminate` without server pre-scanning or controller involvement (open implementation question).
+3. **Multiple execution channels** — in-process, signal-driven, and orchestrated; the contract explicitly maps each event to exactly one channel to avoid ambiguity.
+4. **`preTerminate` is bounded by the termination grace period** — a hook longer than `terminationGracePeriodSeconds - buffer` is cut off by SIGKILL; the server must set the grace accordingly (R15) and hooks must stay small.
 5. **Hooks are in-sandbox code** — a buggy hook can slow transitions (bounded by timeout) or break boot (`preStart`); operators must keep hooks small and idempotent.
 
 ## Alternatives
@@ -488,11 +580,11 @@ no CRD schema change (K8s config rides a new, controller-ignored annotation).
 
 **Phased rollout:**
 
-1. execd lifecycle API (`run`, `periodic`, `status`) + unit/integration tests; execd image release.
-2. `specs/sandbox-lifecycle.yml` `lifecycle` field + PATCH endpoint; server orchestration in the Docker provider; e2e.
-3. K8s provider orchestration + annotation persistence; e2e (pause/resume/TTL).
+1. execd lifecycle API (`run` for `prePause`/`postResume`, `periodic`, `status`) + SIGTERM `preTerminate` handler + unit/integration tests; execd image release.
+2. `specs/sandbox-lifecycle.yml` `lifecycle` field + PATCH endpoint; server orchestration in the Docker provider (including `stop` timeout ≥ hook timeout, R15); e2e.
+3. K8s provider orchestration + annotation persistence + `terminationGracePeriodSeconds` wiring (R15); e2e (pause/resume/TTL/eviction).
 4. `preStart` in `bootstrap.sh` (env injection) on both providers.
-5. Pool-mode parity (pool pod template carries the injected env; hook config via the Pool CRD template).
+5. Pool-mode parity (per-sandbox injection via the existing task/alloc path, e.g. `spec.taskTemplate` env — the Pool pod template is shared across allocations and cannot carry per-sandbox hook config).
 
 **Docs**: `docs/` lifecycle hook guide (per hook, failure policies, idempotency
 contract, cron reference), `docs/kubernetes/` annotation contract note, SDK
