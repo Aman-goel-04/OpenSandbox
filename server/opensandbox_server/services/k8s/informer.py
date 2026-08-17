@@ -74,6 +74,9 @@ class WorkloadInformer:
         A watch can stop delivering without raising — a dead connection leaves the
         reader parked forever — so a "listed once" latch would keep readers on a
         frozen cache.  Going stale makes them fall back to a live request.
+
+        A stopped informer is likewise considered not synced, however recent its
+        last contact, since nothing will refresh the cache again.
         """
         if self._stop_event.is_set():
             # Stopped: nothing will refresh the cache again, however recent it is.
@@ -260,21 +263,12 @@ class WorkloadInformer:
             except Exception:
                 return
 
-        event_type = event.get("type")
-        if event_type == "ERROR":
-            # A Status, not a workload — usually 410 Gone. It carries no name, so
-            # force a fresh list instead of resuming from a dead cursor.
-            logger.warning(f"Informer watch error event, forcing resync: {obj.get('message')}")
-            with self._lock:
-                self._resource_version = None
-                self._has_synced = False
-            return
-
         metadata = obj.get("metadata", {})
         name = metadata.get("name")
         if not name:
             return
 
+        event_type = event.get("type")
         with self._lock:
             if event_type == "DELETED":
                 self._cache.pop(name, None)

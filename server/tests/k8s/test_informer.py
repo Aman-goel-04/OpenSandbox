@@ -15,6 +15,9 @@
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
+from kubernetes.client import ApiException
+
 from opensandbox_server.services.k8s.informer import WorkloadInformer
 
 
@@ -262,7 +265,7 @@ class TestWorkloadInformerStaleness:
 
 
 class TestWorkloadInformerWatchResilience:
-    """The watch stream cannot silently park or resume from a dead cursor."""
+    """The watch stream cannot silently park the informer thread."""
 
     def test_watch_stream_sets_client_side_request_timeout(self):
         """A client read timeout is passed, above the server-side watch timeout."""
@@ -281,21 +284,31 @@ class TestWorkloadInformerWatchResilience:
         assert connect_timeout > 0
         assert read_timeout > kwargs["timeout_seconds"]
 
-    def test_error_event_forces_a_fresh_list(self):
-        """A 410 Gone Status carries no name, so it must clear the cursor explicitly."""
-        informer = _make_informer()
-        informer._resource_version = "12345"
-        informer._has_synced = True
+    def test_raising_watch_stream_does_not_refresh_contact(self):
+        """A stream that raises proves nothing about reachability.
 
-        informer._handle_event(
-            {
-                "type": "ERROR",
-                "object": {"kind": "Status", "code": 410, "message": "too old resource version"},
-            }
+        This is the live error path: the client raises ApiException(410) rather
+        than yielding an ERROR event, and _run's handler then forces a relist.
+        """
+        informer = _make_informer(
+            list_fn=MagicMock(return_value=_list_response("x")),
+            resync_period_seconds=300,
+            watch_timeout_seconds=60,
         )
+        informer._full_resync()
+        informer._last_contact_at -= informer._staleness_limit_seconds + 1
 
-        assert informer._resource_version is None
-        assert informer._has_synced is False
+        fake_watch = MagicMock()
+        fake_watch.stream.side_effect = ApiException(status=410)
+
+        with patch(
+            "opensandbox_server.services.k8s.informer.watch.Watch",
+            return_value=fake_watch,
+        ):
+            with pytest.raises(ApiException):
+                informer._run_watch_loop(60)
+
+        assert informer.has_synced is False
 
 
 class TestWorkloadInformerStartStop:
