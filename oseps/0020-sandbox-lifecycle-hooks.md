@@ -192,14 +192,15 @@ config rides the existing per-provider state:
 | Both | env `OPEN_SANDBOX_LIFECYCLE` (TOML content) at create | **transport only** — `bootstrap.sh` materializes it to the config file on first provision (if absent); execd reads the file only |
 
 **Pod-creation source stays current.** On PATCH, the server also updates the
-pod-creation source (BatchSandbox `spec.template` / `taskTemplate` env, same
-per-sandbox path as R11), so a **replacement** pod created by eviction, node
-drain, or pod failure materializes the current config — creation-time env is a
-bootstrap default, never the source of truth. The env change must not recycle
-the running pod: the running pod receives the update via the live execd push
-only, and implementation must verify the controller does not recreate the pod
-for this env change (if it does, the update must be applied so its pod effect
-is deferred to replacement).
+pod-creation source — BatchSandbox `spec.template` / `taskTemplate` env, or
+AgentSandbox `spec.podTemplate` env, whichever provider manages the sandbox —
+so a **replacement** pod created by eviction, node drain, or pod failure
+materializes the current config; creation-time env is a bootstrap default,
+never the source of truth. The env change must not recycle the running pod:
+the running pod receives the update via the live execd push only, and
+implementation must verify the controller does not recreate the pod for this
+env change (if it does, the update must be applied so its pod effect is
+deferred to replacement).
 
 ### 3. In-Sandbox Config File
 
@@ -208,11 +209,28 @@ is deferred to replacement).
 
 ```toml
 version = 1
-[preStart]     command = ["/opt/hooks/pre-start.sh"]    timeout_seconds = 60
-[prePause]     command = ["/opt/hooks/pre-pause.sh"]    timeout_seconds = 60
-[postResume]   command = ["/opt/hooks/post-resume.sh"]  timeout_seconds = 60
-[preTerminate] command = ["/opt/hooks/pre-terminate.sh"] timeout_seconds = 30
-[[periodic]]   name = "checkpoint"  schedule = "*/5 * * * *"  command = ["/opt/hooks/checkpoint.sh"]  timeout_seconds = 60
+
+[preStart]
+command = ["/opt/hooks/pre-start.sh"]
+timeout_seconds = 60
+
+[prePause]
+command = ["/opt/hooks/pre-pause.sh"]
+timeout_seconds = 60
+
+[postResume]
+command = ["/opt/hooks/post-resume.sh"]
+timeout_seconds = 60
+
+[preTerminate]
+command = ["/opt/hooks/pre-terminate.sh"]
+timeout_seconds = 30
+
+[[periodic]]
+name = "checkpoint"
+schedule = "*/5 * * * *"
+command = ["/opt/hooks/checkpoint.sh"]
+timeout_seconds = 60
 ```
 
 - **Location**: container rootfs, deliberately **not** any mounted volume — not
@@ -278,6 +296,7 @@ Design notes:
 | Pause (manual, idle, TTL-adjacent) | trigger `prePause` → policy result → Docker `pause` / K8s patch `spec.pause=true` |
 | Resume | Docker `unpause` / K8s patch `pause=false` → wait pod re-creation + execd `/ping` → trigger `postResume` → success → public `Running`; abort → roll back to `Paused` |
 | Terminate (user delete, Docker `stop`) | server deletes; runtime SIGTERMs the container; execd runs `preTerminate` (§6); server only ensures grace ≥ hook timeout (R10) |
+| Docker TTL expiry | server timer routes expiration through a **grace-bounded `container.stop(timeout)`** (SIGTERM → hook → SIGKILL), then `remove` — never `kill` + `remove(force=True)` (the current `_expire_sandbox` path, which would skip the hook) |
 | K8s TTL/eviction/node drain | controller/kubelet deletes the pod; SIGTERM path — no server involvement |
 
 **K8s resume state gating**: the controller sets the CR phase to `Succeed`
@@ -306,15 +325,16 @@ kubelet during pod deletion; Docker: `docker stop`). Today PID 1 is
 OSEP-0018 execd is PID 1 and receives it directly. execd:
 
 ```go
-// main.go: extend the existing signal-notify path
-ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-go func() {
-    <-ctx.Done()
-    if hook := lifecycle.Load(resolvedConfigPath()).PreTerminate; hook != nil {
-        runHook(hook, timeUntilGraceDeadline())   // reads the file fresh, never a cached copy
-    }
-    shutdownServerAndExit()
-}()
+// main.go: intercept SIGTERM, run preTerminate to completion, then shut down.
+// The hook runs BEFORE the server context is canceled and before main returns —
+// a goroutine started after cancellation would race process exit.
+sig := make(chan os.Signal, 1)
+signal.Notify(sig, syscall.SIGTERM)          // external container stop; v1 topology
+<-sig                                        // (bootstrap forwards only trusted TERM to execd)
+if hook := lifecycle.Load(resolvedConfigPath()).PreTerminate; hook != nil {
+    runHook(hook, timeUntilGraceDeadline())  // bounded; reads the file fresh, never cached
+}
+server.Shutdown(shutdownCtx)                 // then stop HTTP and exit with the hook's outcome logged
 ```
 
 Properties:
@@ -339,7 +359,7 @@ Properties:
 
 - **Unit**: schema validation (shapes, `periodic.name` uniqueness, cron parse, PATCH merge, `preStart` rejection); execd `run` (timeout kill, output, exit code, `executed:false` differentiation); SIGTERM handler (file-resolved `[preTerminate]`, grace-bounded deadline, exit-after, absent-hook no-op); periodic (scheduling, in-flight skip, hot replacement, failure counter); config file (TOML parse, unsupported `version`, atomic write, load order, fail-open); failure-policy resolution.
 - **Integration**: `bootstrap.sh` runs `preStart` before execd/entrypoint (marker ordering), failure aborts boot; server orchestration against a fake execd (hook ordering, abort paths, unreachable-execd aborts per R5).
-- **E2E (Kind / Docker)**: Docker — `prePause` marker before `docker pause`, `postResume` after `unpause`, periodic checkpoints (ticker frozen while paused), `preTerminate` marker on `docker stop`. K8s — `prePause` before `spec.pause=true`, `postResume` after pod Ready + `/ping` before `Running`, resume re-runs `preStart`, TTL/delete/eviction all produce the `preTerminate` marker, paused sandbox deletion produces none. PATCH mid-flight snapshot; server restart restore (file-backed store/annotation); config persistence across execd restart and both pause/resume models.
+- **E2E (Kind / Docker)**: Docker — `prePause` marker before `docker pause`, `postResume` after `unpause`, periodic checkpoints (ticker frozen while paused), `preTerminate` marker on `docker stop` **and on TTL expiry** (grace-bounded stop path). K8s — `prePause` before `spec.pause=true`, `postResume` after pod Ready + `/ping` before `Running`, resume re-runs `preStart`, TTL/delete/eviction all produce the `preTerminate` marker, paused sandbox deletion produces none. PATCH mid-flight snapshot; server restart restore (file-backed store/annotation); config persistence across execd restart and both pause/resume models; replacement pod after eviction materializes the PATCHed config from the updated pod-creation source.
 
 ## Drawbacks
 
