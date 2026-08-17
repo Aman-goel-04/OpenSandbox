@@ -96,7 +96,7 @@ guarantee a hook runs. This drives the declarative-first design.
 | R1 | Hooks are declared in `CreateSandboxRequest.lifecycle`; all hooks optional | Must |
 | R2 | `prePause`, `postResume`, `preTerminate`, `periodic` are updatable at runtime via `PATCH /sandboxes/{sandboxId}/lifecycle`; `preStart` is rejected by PATCH | Must |
 | R3 | `preStart` executes before the sandbox entrypoint starts, in-sandbox, without any server round trip | Must |
-| R4 | `prePause` and `postResume` run through the orchestrated channel: server → execd `/v1/lifecycle/run`; `preTerminate` runs **in-sandbox via SIGTERM** — no server in the path | Must |
+| R4 | `prePause` and `postResume` are **triggered** through the orchestrated channel: the server POSTs an event-only trigger to execd (`/v1/lifecycle/run`, no command in the request); execd resolves the command from its in-sandbox config file. `preTerminate` runs in-sandbox via SIGTERM — no server in the path | Must |
 | R5 | Each hook has `timeoutSeconds` (default 60) and `failurePolicy` (`Abort` default for `prePause`/`postResume`; `preTerminate` and `periodic` are fixed `Continue` — `Abort` is rejected for them) | Must |
 | R6 | A timed-out or failed hook with `failurePolicy: Abort` aborts the transition and leaves the sandbox in the pre-transition state with a machine-readable reason | Must |
 | R7 | Hooks never block sandbox **termination**: `preTerminate` runs only while the sandbox is `Running`; when the sandbox is not `Running` (e.g. `Paused`), no SIGTERM handler runs and termination proceeds. This fail-open rule is termination-only — see R6/R18 for orchestrated hooks | Must |
@@ -253,7 +253,7 @@ hook config survives server restarts by riding the existing per-provider state:
 |---|---|---|
 | Docker | **file-backed store**, same mechanism metadata/expiration already use (`services/docker/metadata.py`) | Docker labels on running containers are **immutable** — PATCH cannot update them; the existing file-backed store is the established writable pattern |
 | K8s | BatchSandbox **or AgentSandbox** annotation `sandbox.opensandbox.io/lifecycle` (JSON), whichever workload CR the configured provider manages (`provider_factory.py` registers both) | annotations are schemaless — no CRD change; the operator controller ignores the key entirely (server-only contract) |
-| Both | in-sandbox env `OPEN_SANDBOX_LIFECYCLE` (TOML content) at create | **transport only**: `bootstrap.sh` materializes it to `/var/execd/lifecycle.toml` on first provision (if absent); execd reads only the file. Contains the in-sandbox halves: `preStart`, `preTerminate` (read by the SIGTERM handler), and `periodic` |
+| Both | in-sandbox env `OPEN_SANDBOX_LIFECYCLE` (TOML content) at create | **transport only**: `bootstrap.sh` materializes it to `/var/execd/lifecycle.toml` on first provision (if absent); execd reads only the file. Contains all five in-sandbox hooks: `preStart`, `prePause`, `postResume`, `preTerminate` (read by the SIGTERM handler), and `periodic` |
 
 The K8s annotation is added to the annotation contract list in
 `kubernetes/AGENTS.md` when implemented; readers/writers must be updated
@@ -264,18 +264,17 @@ together.
 New routes in execd (`pkg/web/router.go`), documented in `specs/execd-api.yaml`:
 
 ```
-POST /v1/lifecycle/run          # run one transition hook synchronously (prePause / postResume)
-{
-  "event": "prePause",          # context only (logging/telemetry)
-  "command": ["/opt/hooks/pre-pause.sh"],
-  "env": { "OPEN_SANDBOX_SANDBOX_ID": "sbx_..." },
-  "timeoutSeconds": 60
-}
-→ 200 { "exitCode": 0, "stdout": "...", "stderr": "...", "durationMs": 1240 }
-→ 504 { "error": "hook timeout" }          # process killed
+POST /v1/lifecycle/run          # trigger a transition hook by event; execd resolves the command
+{ "event": "prePause" }         # from its config file (no command/env in the request)
+→ 200 { "executed": true,  "exitCode": 0, "stdout": "...", "stderr": "...", "durationMs": 1240 }
+→ 200 { "executed": true,  "exitCode": 1, "stdout": "...", "stderr": "...", "durationMs": 320 }  # hook failed
+→ 504 { "executed": false, "reason": "hook timeout" }            # killed by the file's timeout
+→ 200 { "executed": false, "reason": "not_configured" }          # no hook for this event
+→ 200 { "executed": false, "reason": "config_unavailable" }      # file missing/unreadable
 
 POST /v1/lifecycle/config       # replace the whole in-sandbox hook config (hot update on PATCH)
-{ "preTerminate": { "command": ["/opt/hooks/pre-terminate.sh"], "timeout_seconds": 30 },
+{ "prePause": { "command": ["/opt/hooks/pre-pause.sh"], "timeout_seconds": 60 },
+  "preTerminate": { "command": ["/opt/hooks/pre-terminate.sh"], "timeout_seconds": 30 },
   "periodic": [ { "name": "checkpoint", "schedule": "*/10 * * * *",
                   "timeoutSeconds": 60, "command": ["/opt/hooks/checkpoint.sh"] } ] }
 
@@ -290,8 +289,21 @@ Design notes:
   in a synchronous, bounded mode; it does not reuse `/command`'s background +
   polling shape because hooks need synchronous completion with a hard deadline.
   It serves only the orchestrated transition hooks (`prePause`/`postResume`).
+- **The request carries only the event — never the command.** execd resolves
+  the hook (command, timeout, env) from its config file, which is the in-sandbox
+  authority for all hooks; the server stores config only for validation,
+  display, and re-provisioning, and its transition logic does not embed hook
+  commands. This makes every hook follow the same file-read pattern
+  (`preStart`, `preTerminate` on SIGTERM, `periodic` ticks, and now
+  `prePause`/`postResume` triggers), with a single source of truth inside the
+  sandbox and no drift between annotation, request body, and file.
+- **`executed: false` is an explicit, differentiated outcome.** The server
+  compares it against its own config knowledge: a hook it believes is
+  configured reporting `not_configured`/`config_unavailable` is treated as hook
+  failure (R18) — the configured state flush must not silently vanish.
 - execd keeps no lifecycle semantics: it does not know what "pause" means, only
-  that a command must run with a timeout. The server supplies everything.
+  that a command from its config must run with a timeout. The server supplies
+  the event.
 - **`preTerminate` has no endpoint**: execd installs a SIGTERM handler (its
   existing signal-notify path, `main.go`) that runs the `preTerminate` command
   from the config file and then exits — see Design §9.
@@ -318,6 +330,18 @@ Design notes:
   [preStart]
   command = ["/opt/hooks/pre-start.sh"]
   timeout_seconds = 60
+
+  [prePause]
+  command = ["/opt/hooks/pre-pause.sh"]
+  timeout_seconds = 60
+
+  [postResume]
+  command = ["/opt/hooks/post-resume.sh"]
+  timeout_seconds = 60
+
+  [preTerminate]
+  command = ["/opt/hooks/pre-terminate.sh"]
+  timeout_seconds = 30
 
   [[periodic]]
   name = "checkpoint"
@@ -379,10 +403,11 @@ env-preparation script) and the separate `opensandbox-supervisor` binary has
 worker-level `--pre-start`/`--post-exit` hooks with timeouts. This OSEP adds a
 structured `preStart` to the contract:
 
-- At create, the server serializes `lifecycle.preStart` (plus `periodic`) as
-  TOML into the `OPEN_SANDBOX_LIFECYCLE` env on the container/pod; `bootstrap.sh`
-  materializes it to `/var/execd/lifecycle.toml` when the file does not exist
-  yet (first provision), so execd and the boot path read the file only.
+- At create, the server serializes the full in-sandbox lifecycle (all five
+  hooks) as TOML into the `OPEN_SANDBOX_LIFECYCLE` env on the container/pod;
+  `bootstrap.sh` materializes it to `/var/execd/lifecycle.toml` when the file
+  does not exist yet (first provision), so execd and the boot path read the
+  file only.
 - `bootstrap.sh` parses `/var/execd/lifecycle.toml` `[preStart]` and, if
   present, runs it as a child process (exec semantics — not sourced; sourced
   env preparation stays with `EXECD_BOOTSTRAP_PRE_SCRIPT`) with a
@@ -415,8 +440,8 @@ The server (both providers) executes hooks around its existing transitions.
 
 | Transition | Sequence |
 |---|---|
-| Pause (manual, idle, TTL-adjacent) | read config snapshot → `run` `prePause` → policy result → Docker `pause` / K8s patch `spec.pause=true` |
-| Resume | Docker `unpause` / K8s patch `pause=false` → wait for pod re-creation + execd `/ping` → `run` `postResume` → success → public state `Running`; abort → roll back to `Paused` |
+| Pause (manual, idle, TTL-adjacent) | trigger `prePause` (`POST /v1/lifecycle/run {event}`) → execd runs its file-resolved hook → policy result → Docker `pause` / K8s patch `spec.pause=true` |
+| Resume | Docker `unpause` / K8s patch `pause=false` → wait for pod re-creation + execd `/ping` → trigger `postResume` → success → public state `Running`; abort → roll back to `Paused` |
 | Terminate (user delete, Docker `stop`) | server issues the delete; the runtime sends SIGTERM into the sandbox; execd runs `preTerminate` (if `Running`) and shuts down. Server only ensures the termination grace covers the hook timeout (R15) |
 | K8s TTL expiry / eviction / node drain | controller/kubelet deletes the pod; kubelet SIGTERMs the container; execd runs `preTerminate` — **no server involvement, no pre-scan** |
 
