@@ -99,7 +99,8 @@ guarantee a hook runs. This drives the declarative-first design.
 | R4 | `prePause` and `postResume` run through the orchestrated channel: server → execd `/v1/lifecycle/run`; `preTerminate` runs **in-sandbox via SIGTERM** — no server in the path | Must |
 | R5 | Each hook has `timeoutSeconds` (default 60) and `failurePolicy` (`Abort` default for `prePause`/`postResume`; `preTerminate` and `periodic` are fixed `Continue` — `Abort` is rejected for them) | Must |
 | R6 | A timed-out or failed hook with `failurePolicy: Abort` aborts the transition and leaves the sandbox in the pre-transition state with a machine-readable reason | Must |
-| R7 | Hooks never block sandbox termination: `preTerminate` runs only while the sandbox is `Running`; when the sandbox is unreachable or not `Running` (e.g. `Paused`), no SIGTERM handler runs and termination proceeds — never fatal | Must |
+| R7 | Hooks never block sandbox **termination**: `preTerminate` runs only while the sandbox is `Running`; when the sandbox is not `Running` (e.g. `Paused`), no SIGTERM handler runs and termination proceeds. This fail-open rule is termination-only — see R6/R18 for orchestrated hooks | Must |
+| R18 | For orchestrated hooks (`prePause`/`postResume`) with `Abort`, **execd unreachability is treated as hook failure**: a nominally `Running` sandbox whose execd cannot be reached aborts the transition (R6), never silently continues; only sandboxes that are legitimately not `Running` (`Paused`/`Failed`/pod gone) skip the hook | Must |
 | R8 | `periodic` hooks run on a cron schedule inside the sandbox via an execd ticker, without server liveness dependency | Must |
 | R9 | A `periodic` hook whose previous run is still in flight skips the current tick (no queueing) | Must |
 | R10 | Hook config survives server restarts (Docker: file-backed store; K8s: BatchSandbox/AgentSandbox annotation) | Must |
@@ -237,9 +238,10 @@ Semantics:
 - **Rejects `preStart`** with 400 (`PreStartNotPatchable`) — it cannot take effect after creation.
 - **Rejects PATCH on a non-`Running` sandbox** with 409 (`SandboxNotRunning`): a paused/failed sandbox cannot receive the live execd update, and deferred application would leave the persisted file and the live schedule inconsistent (Docker frozen / K8s pod gone). The client patches after resume.
 - **Rejects `failurePolicy: Abort` for `preTerminate`/`periodic`** with 400 (fixed `Continue`).
+- **Bounds `preTerminate.timeoutSeconds` to the provisioned grace** (R15): the pod's `terminationGracePeriodSeconds` / Docker `stop` timeout is set at creation from the then-current `preTerminate` timeout. A PATCH that raises the timeout beyond `grace - buffer` is rejected with 400 (`GraceTooSmall`) — TTL deletion, eviction, and node drain use the pod's original grace and bypass the server, so a later increase could never be honored.
 - Applies to future transitions only; an in-flight transition keeps its start-time snapshot (R11).
 - No optimistic locking in v1 (single-writer assumption, same caveat documented for metadata PATCH).
-- Provider persistence: Docker file-backed store / K8s workload CR annotation; for in-sandbox effects, push the updated config to execd live (`POST /v1/lifecycle/periodic`; `preTerminate` needs no push — execd reads the file fresh on SIGTERM).
+- Provider persistence: Docker file-backed store / K8s workload CR annotation; for in-sandbox effects, push the updated config to execd live (`POST /v1/lifecycle/config`, atomically persisted by execd); `preTerminate` needs no push at transition time — execd reads the file fresh on SIGTERM, and the live push keeps that file current.
 - **Capability gate**: creating or PATCHing lifecycle config requires the sandbox's execd to support the lifecycle API (versioned `/v1/lifecycle/capabilities` or the existing capabilities endpoint extended); sandboxes running an older execd image reject lifecycle configuration, so `Abort`-default hooks never 404 on an old daemon mid-transition.
 
 ### 3. Config Persistence by Provider
@@ -251,7 +253,7 @@ hook config survives server restarts by riding the existing per-provider state:
 |---|---|---|
 | Docker | **file-backed store**, same mechanism metadata/expiration already use (`services/docker/metadata.py`) | Docker labels on running containers are **immutable** — PATCH cannot update them; the existing file-backed store is the established writable pattern |
 | K8s | BatchSandbox **or AgentSandbox** annotation `sandbox.opensandbox.io/lifecycle` (JSON), whichever workload CR the configured provider manages (`provider_factory.py` registers both) | annotations are schemaless — no CRD change; the operator controller ignores the key entirely (server-only contract) |
-| Both | in-sandbox env `OPEN_SANDBOX_LIFECYCLE` (TOML content) at create | **transport only**: `bootstrap.sh` materializes it to `/var/execd/lifecycle.toml` on first provision (if absent); execd reads only the file. Contains only `preStart` + `periodic` (the in-sandbox halves) |
+| Both | in-sandbox env `OPEN_SANDBOX_LIFECYCLE` (TOML content) at create | **transport only**: `bootstrap.sh` materializes it to `/var/execd/lifecycle.toml` on first provision (if absent); execd reads only the file. Contains the in-sandbox halves: `preStart`, `preTerminate` (read by the SIGTERM handler), and `periodic` |
 
 The K8s annotation is added to the annotation contract list in
 `kubernetes/AGENTS.md` when implemented; readers/writers must be updated
@@ -272,8 +274,9 @@ POST /v1/lifecycle/run          # run one transition hook synchronously (prePaus
 → 200 { "exitCode": 0, "stdout": "...", "stderr": "...", "durationMs": 1240 }
 → 504 { "error": "hook timeout" }          # process killed
 
-POST /v1/lifecycle/periodic      # replace the periodic schedule (hot update on PATCH)
-{ "periodic": [ { "name": "checkpoint", "schedule": "*/10 * * * *",
+POST /v1/lifecycle/config       # replace the whole in-sandbox hook config (hot update on PATCH)
+{ "preTerminate": { "command": ["/opt/hooks/pre-terminate.sh"], "timeout_seconds": 30 },
+  "periodic": [ { "name": "checkpoint", "schedule": "*/10 * * * *",
                   "timeoutSeconds": 60, "command": ["/opt/hooks/checkpoint.sh"] } ] }
 
 GET  /v1/lifecycle/status        # per-hook state (observability; server may proxy)
@@ -294,8 +297,8 @@ Design notes:
   from the config file and then exits — see Design §9.
 - Periodic scheduling is a `robfig/cron/v3` ticker inside execd (5-field cron +
   descriptors; container-local timezone). The ticker starts from the injected
-  `OPEN_SANDBOX_LIFECYCLE` env at boot; `POST /v1/lifecycle/periodic` replaces
-  the schedule live.
+  `OPEN_SANDBOX_LIFECYCLE` env at boot; `POST /v1/lifecycle/config` replaces
+  the whole in-sandbox config (including `preTerminate`) live.
 - **Config is persisted inside the sandbox, never memory-only, and never as a
   monolithic daemon-state blob.** execd follows one-concern-one-file
   persistence under `/var/execd/`: the lifecycle config is a dedicated
@@ -395,7 +398,7 @@ structured `preStart` to the contract:
   against server downtime, naturally suspended by Docker freeze, automatically
   restarted on K8s pod recreation.
 - Initial schedule from injected env; runtime updates via PATCH → server →
-  `POST /v1/lifecycle/periodic`. Both the boot config and every runtime update
+  `POST /v1/lifecycle/config`. Both the boot config and every runtime update
   are **persisted to the in-sandbox config file** (§4): the ticker on a
   restarted execd (or a resumed sandbox) reflects the latest PATCHed schedule,
   never just the creation-time env or an in-memory copy.
@@ -413,9 +416,21 @@ The server (both providers) executes hooks around its existing transitions.
 | Transition | Sequence |
 |---|---|
 | Pause (manual, idle, TTL-adjacent) | read config snapshot → `run` `prePause` → policy result → Docker `pause` / K8s patch `spec.pause=true` |
-| Resume | Docker `unpause` / K8s patch `pause=false` → poll execd `/ping` (not pod readiness) → `run` `postResume` → success → sandbox state `Running` (abort → back to `Paused` + `ResumeFailed`-style reason) |
+| Resume | Docker `unpause` / K8s patch `pause=false` → wait for pod re-creation + execd `/ping` → `run` `postResume` → success → public state `Running`; abort → roll back to `Paused` |
 | Terminate (user delete, Docker `stop`) | server issues the delete; the runtime sends SIGTERM into the sandbox; execd runs `preTerminate` (if `Running`) and shuts down. Server only ensures the termination grace covers the hook timeout (R15) |
 | K8s TTL expiry / eviction / node drain | controller/kubelet deletes the pod; kubelet SIGTERMs the container; execd runs `preTerminate` — **no server involvement, no pre-scan** |
+
+**K8s resume state gating.** The BatchSandbox controller sets the CR phase to
+`Succeed` as soon as the recreated pod is ready (`continueResume` returns to
+normal reconciliation), independently of the server-side `postResume` call —
+the CR phase therefore cannot express "resuming, hooks in progress". The
+**server** owns the public `SandboxState` mapping and gates it explicitly:
+while a resume is in flight the server keeps reporting `Resuming` until
+`postResume` completes, then reports `Running` (the server marks the resume
+intent in its per-sandbox state, e.g. the same file-backed store/annotation
+that holds the hook config). On `Abort`, the server re-patches `spec.pause=true`
+so the controller re-pauses the sandbox and the public state returns to
+`Paused` — no controller/CRD change is needed.
 
 State visibility for clients is unchanged: transitions already surface as
 `Pausing`/`Resuming`/`Stopping` in `SandboxStatus`, and hook results are carried
@@ -435,9 +450,14 @@ in `reason`/`message` (and 409 on aborted transitions).
   failure is recorded and the transition proceeds. For `preTerminate` this is
   inherent — SIGKILL follows the grace period regardless, so the hook can only
   ever be best-effort.
-- **Unreachable sandbox** (`Paused`/`Failed`/pod gone): no SIGTERM handler
-  runs (`preTerminate`), and orchestrated transition hooks are skipped with a
-  recorded reason; termination never blocks on a hook.
+- **Unreachable sandbox — two distinct cases** (R7/R18):
+  - Sandbox is legitimately not `Running` (`Paused`/`Failed`/pod gone): no
+    SIGTERM handler runs (`preTerminate`), and orchestrated hooks are skipped
+    with a recorded reason — termination never blocks on a hook.
+  - Sandbox state is `Running` but execd cannot be reached (crashed or
+    unresponsive daemon): for `Abort`-policy orchestrated hooks this is
+    **hook failure** — the transition aborts (R6/R18) instead of silently
+    proceeding without the configured state flush.
 - **Idempotency**: transition hooks are executed once per transition — the
   server's existing phase state machine (`Pausing`/`Resuming`/`Stopping`) and
   generation gating (K8s `PauseObservedGeneration`) already prevent re-entry;
