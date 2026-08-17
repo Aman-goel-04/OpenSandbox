@@ -191,6 +191,16 @@ config rides the existing per-provider state:
 | K8s | `sandbox.opensandbox.io/lifecycle` annotation on BatchSandbox **or AgentSandbox** — whichever workload CR the configured provider manages (`provider_factory.py` registers both) | schemaless, no CRD change; controller ignores the key (server-only contract; add to `kubernetes/AGENTS.md` annotation list) |
 | Both | env `OPEN_SANDBOX_LIFECYCLE` (TOML content) at create | **transport only** — `bootstrap.sh` materializes it to the config file on first provision (if absent); execd reads the file only |
 
+**Pod-creation source stays current.** On PATCH, the server also updates the
+pod-creation source (BatchSandbox `spec.template` / `taskTemplate` env, same
+per-sandbox path as R11), so a **replacement** pod created by eviction, node
+drain, or pod failure materializes the current config — creation-time env is a
+bootstrap default, never the source of truth. The env change must not recycle
+the running pod: the running pod receives the update via the live execd push
+only, and implementation must verify the controller does not recreate the pod
+for this env change (if it does, the update must be applied so its pod effect
+is deferred to replacement).
+
 ### 3. In-Sandbox Config File
 
 `/var/execd/lifecycle.toml` is the in-sandbox authority for all five hooks
