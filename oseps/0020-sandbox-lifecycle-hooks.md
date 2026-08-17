@@ -106,6 +106,7 @@ guarantee a hook runs. This drives the declarative-first design.
 | R11 | PATCH affects only future transitions; an in-flight transition uses the config snapshot taken when it started | Must |
 | R12 | Hook execution results are observable (execd records last run, exit code, consecutive failures) | Should |
 | R13 | Pool-mode sandboxes support the same hook contract via the Pool pod template | Should |
+| R14 | The effective lifecycle config is **persisted inside the sandbox** (a config file on the sandbox filesystem), not kept only in memory: execd restarts and pause/resume cycles (including K8s rootfs-snapshot resume) must preserve runtime-PATCHed schedules and hooks | Must |
 
 ## Proposal
 
@@ -278,6 +279,20 @@ Design notes:
   descriptors; container-local timezone). The ticker starts from the injected
   `OPEN_SANDBOX_LIFECYCLE` env at boot; `POST /v1/lifecycle/periodic` replaces
   the schedule live.
+- **Config is persisted inside the sandbox, never memory-only.** execd writes
+  the effective lifecycle config (the runtime-updated `periodic` schedule; the
+  same file may later carry other in-sandbox hook state) to a file on the
+  sandbox filesystem, e.g. `/opt/opensandbox/lifecycle.json`, with an atomic
+  write (temp file + rename). On startup execd loads **persisted file first,
+  injected env as fallback**, so a runtime-PATCHed schedule survives:
+  - **execd restarts** — the updated schedule is reloaded from the file.
+  - **Docker pause/resume** — the filesystem persists, config intact.
+  - **K8s pause/resume** — the pod is recreated from the rootfs snapshot, which
+    contains the config file, so PATCHed schedules survive resume; the
+    creation-time env only serves as the boot default on first provision.
+  The server-side label/annotation remains the source of truth for
+  re-provisioning; the in-sandbox file is the runtime authority that keeps
+  execd self-sufficient across restarts and resume.
 - Concurrency: one in-flight run per `name`; a tick that finds its previous run
   still active is skipped (no queueing). Docker pause freezes execd, so the
   ticker naturally suspends; K8s resume recreates the pod and the ticker
@@ -306,7 +321,10 @@ structured `preStart` to the contract:
   against server downtime, naturally suspended by Docker freeze, automatically
   restarted on K8s pod recreation.
 - Initial schedule from injected env; runtime updates via PATCH → server →
-  `POST /v1/lifecycle/periodic`.
+  `POST /v1/lifecycle/periodic`. Both the boot config and every runtime update
+  are **persisted to the in-sandbox config file** (§4): the ticker on a
+  restarted execd (or a resumed sandbox) reflects the latest PATCHed schedule,
+  never just the creation-time env or an in-memory copy.
 - Failure is always `Continue`: a failed periodic run is recorded (status
   endpoint, consecutive-failure counter) and the schedule continues; a periodic
   hook failure never affects sandbox health or lifecycle transitions.
@@ -357,6 +375,8 @@ in `reason`/`message` (and 409 on aborted transitions).
   injection.
 - execd periodic: cron scheduling (descriptor + 5-field), in-flight skip
   (slow hook), hot schedule replacement, consecutive-failure recording.
+- execd lifecycle config file: atomic write (temp + rename), startup load order
+  (persisted file wins over injected env), malformed-file fallback.
 - Failure-policy resolution: Abort/Continue per event and per default.
 
 **Integration**
@@ -379,6 +399,12 @@ in `reason`/`message` (and 409 on aborted transitions).
   next transition.
 - Server restart: hook config restored from container label / BatchSandbox
   annotation; periodic schedule resumes.
+- **Config persistence across execd restart and pause/resume**: (1) execd
+  process restart after a PATCH — the updated schedule is reloaded from the
+  in-sandbox config file, not the creation-time env; (2) Docker pause/resume —
+  the PATCHed schedule survives; (3) K8s pause/resume — the PATCHed schedule
+  survives the rootfs-snapshot recreation (config file present in the snapshot
+  image), and the ticker resumes with it.
 
 ## Drawbacks
 
