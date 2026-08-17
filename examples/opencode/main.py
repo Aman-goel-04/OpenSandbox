@@ -55,7 +55,7 @@ async def main() -> None:
         env=env,
     )
 
-    async with sandbox:
+    try:
         # Install OpenCode (Node.js is already in the code-interpreter image).
         install_exec = await sandbox.commands.run("npm install -g opencode-ai@latest")
         await _print_execution_logs(install_exec)
@@ -68,8 +68,8 @@ async def main() -> None:
             '"Compute 1+1 and reply with only the final number."'
         )
         await _print_execution_logs(run_exec)
-
-        await sandbox.kill()
+    finally:
+        await sandbox.destroy()
 
 
 if __name__ == "__main__":
