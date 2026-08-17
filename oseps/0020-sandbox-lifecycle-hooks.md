@@ -92,6 +92,7 @@ Related: [#1458](https://github.com/opensandbox-group/OpenSandbox/issues/1458) (
 | R9 | PATCH affects future transitions only (start-time snapshot); rejected with 409 when not `Running`; rejected for sandboxes whose execd lacks the lifecycle API (capability gate) |
 | R10 | Termination grace covers `preTerminate` (K8s `terminationGracePeriodSeconds` / Docker `stop` timeout ≥ hook timeout + buffer); PATCH cannot raise the timeout beyond the provisioned grace |
 | R11 | Pool-mode: per-sandbox injection via the existing task/alloc path (`spec.taskTemplate`), never the shared Pool template |
+| R12 | `preTerminate` fires only on genuine termination, never on pause: K8s pause-induced pod deletions (`completePause` normal-mode deletion and pool-GC release deletion) use **grace-0 (immediate) deletion**, so no SIGTERM is delivered; Docker pause sends no signals — backend parity |
 
 ## Proposal
 
@@ -259,11 +260,14 @@ New routes (`pkg/web/router.go`), documented in `specs/execd-api.yaml`:
 POST /v1/lifecycle/run    # trigger by event; execd resolves the command from its config file
   body: { "event": "prePause" }
   200 → { executed: true,  exitCode, stdout, stderr, durationMs }
-  200 → { executed: false, reason: "hook timeout" | "not_configured" | "config_unavailable" }
-  504 → { executed: false, reason: "hook timeout" }
+  200 → { executed: false, reason: "not_configured" | "config_unavailable" }
+  504 → { executed: false, reason: "hook timeout" }        # 504 is the only timeout status
 
 POST /v1/lifecycle/config # replace the whole in-sandbox config (hot update on PATCH; atomic persist)
   body: { prePause: {...}, preTerminate: {...}, periodic: [...] }
+  # The server always sends the complete merged five-hook config from its
+  # stored state — omitting a section removes it (incl. immutable preStart
+  # and unchanged postResume must be re-sent).
 
 GET  /v1/lifecycle/status  # per-hook state: lastRunAt, lastExitCode, consecutiveFailures, nextRunAt
 ```
@@ -346,6 +350,7 @@ Properties:
 5. Runs concurrently with the app's own shutdown in today's topology (TERM forwarded to both) — hook contract is state flush, not app coordination.
 6. Reads the config file fresh at signal time, so the latest PATCHed definition applies.
 7. OSEP-0018 interaction: as PID 1, execd must distinguish the *external* container-stop SIGTERM from an in-namespace `kill 1` (open item already tracked in OSEP-0018 §3); the v1 topology is unaffected.
+8. **Never on pause** (R12): the K8s pause flow deletes the running pod (`completePause`), and kubelet would SIGTERM it — so pause-induced deletions (normal-mode `completePause` and pool-GC release) use grace-0 immediate deletion (SIGKILL, no SIGTERM). Docker pause sends no signals. `preTerminate` therefore runs only on genuine termination, with backend parity.
 
 ### 7. Failure, Timeout, and Degradation Semantics
 
