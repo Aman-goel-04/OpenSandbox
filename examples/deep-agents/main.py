@@ -74,7 +74,7 @@ def main() -> None:
 
         print(result["messages"][-1].content)
     finally:
-        sandbox.kill()
+        sandbox.destroy()
 
 
 if __name__ == "__main__":
