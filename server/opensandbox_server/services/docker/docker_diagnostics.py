@@ -24,6 +24,11 @@ from __future__ import annotations
 import re
 import time
 
+from docker.errors import DockerException
+from fastapi import HTTPException, status
+
+from opensandbox_server.services.constants import SandboxErrorCodes
+
 
 def _parse_since_to_timestamp(since: str) -> int:
     """Parse a human-readable duration string (e.g. '10m', '1h') into a Unix timestamp.
@@ -59,7 +64,16 @@ class DockerDiagnosticsMixin:
         kwargs: dict = {"tail": tail, "timestamps": True}
         if since:
             kwargs["since"] = _parse_since_to_timestamp(since)
-        output = docker_container.logs(**kwargs)
+        try:
+            output = docker_container.logs(**kwargs)
+        except DockerException as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={
+                    "code": SandboxErrorCodes.CONTAINER_QUERY_FAILED,
+                    "message": f"Failed to read logs for sandbox {sandbox_id}: {exc}",
+                },
+            ) from exc
         if isinstance(output, bytes):
             output = output.decode("utf-8", errors="replace")
         return output or "(no logs)"

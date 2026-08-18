@@ -13,8 +13,14 @@
 # limitations under the License.
 
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import MagicMock, patch
 
+from docker.errors import DockerException
+from fastapi import HTTPException, status
+import pytest
+
+from opensandbox_server.services.constants import SandboxErrorCodes
 from opensandbox_server.services.docker.docker_diagnostics import (
     DockerDiagnosticsMixin,
     _parse_since_to_timestamp,
@@ -66,6 +72,20 @@ def test_get_sandbox_logs_returns_placeholder_for_empty_output() -> None:
     service = _DiagnosticsService(container)
 
     assert service.get_sandbox_logs("sbx-1") == "(no logs)"
+
+
+def test_get_sandbox_logs_maps_docker_errors_to_contract_response() -> None:
+    container = _container({"State": {}})
+    container.logs.side_effect = DockerException("daemon disconnected")
+    service = _DiagnosticsService(container)
+
+    with pytest.raises(HTTPException) as exc:
+        service.get_sandbox_logs("sbx-1")
+
+    assert exc.value.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+    detail = cast(dict[str, str], exc.value.detail)
+    assert detail["code"] == SandboxErrorCodes.CONTAINER_QUERY_FAILED
+    assert detail["message"] == "Failed to read logs for sandbox sbx-1: daemon disconnected"
 
 
 def test_get_sandbox_inspect_formats_state_resources_ports_and_safe_env() -> None:
