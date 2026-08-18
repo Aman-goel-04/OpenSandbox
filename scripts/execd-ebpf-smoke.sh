@@ -126,11 +126,15 @@ import json, sys
 caps = json.load(open(sys.argv[1]))
 ebpf = (caps.get("hardening") or {}).get("ebpf") or {}
 state = ebpf.get("state", "missing")
+message = ebpf.get("message", "")
 print(f"ebpf state: {state}")
-if ebpf.get("message"):
-    print(f"ebpf message: {ebpf['message']}")
-# Fail-open means "degraded/unsupported" still boots execd, but the audit
-# hooks did NOT attach — nothing will be written. The smoke must see active.
+if message:
+    print(f"ebpf message: {message}")
+# Fail-open: "degraded/unsupported" still boots execd, but no hooks attached
+# — nothing will be written. The smoke must see active. A per-hook degrade
+# (e.g. the commit_creds kprobe CO-RE load failing on a 5.10 kernel) keeps
+# the state active and reports the missing hooks in the message; the audit
+# assertions below then still require exec+connect events.
 if state != "active":
     sys.exit(f"FAIL: ebpf state = {state}, want active (hooks did not attach)")
 PY
@@ -165,9 +169,10 @@ for want in ("exec", "connect"):
         print(f"FAIL: no {want} events", file=sys.stderr)
         ok = False
 if kinds["privilege"] == 0:
-    # The hook attach is already validated by state=active above; the event
-    # itself needs a setuid transition, which is harder to provoke reliably
-    # in a bare busybox container — warn, do not fail.
+    # The hook attach is validated by state=active (or the per-hook degrade
+    # reported in the message); the event itself needs a setuid transition,
+    # which is harder to provoke reliably in a bare busybox container —
+    # warn, do not fail.
     print("WARN: no privilege events (setuid transition not provoked)")
 sys.exit(0 if ok else 1)
 PY
