@@ -143,7 +143,7 @@ jobs:
           chmod +x components/execd/tests/init_container.sh
           bash components/execd/tests/init_container.sh
 
-      - name: Execd eBPF bare-container smoke (OSEP-0018 R-j/R-c)
+      - name: Execd eBPF bare-container smoke
         if: matrix.os != 'windows-latest'
         shell: bash
         timeout-minutes: 30
