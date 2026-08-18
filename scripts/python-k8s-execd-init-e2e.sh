@@ -53,10 +53,12 @@ k8s_e2e_kind_load_runtime_images
 k8s_e2e_apply_pvc_and_seed
 # The hardened isolation TOML travels to sandboxes via a ConfigMap mounted by
 # the e2e batchsandbox template (optional: true), and the hardening e2e points
-# EXECD_ISOLATION_CONFIG at it per request. No server config needed.
+# EXECD_ISOLATION_CONFIG at it per request. The custom-policy TOML (R-q) is a
+# second key in the same ConfigMap. No server config needed.
 kubectl create configmap opensandbox-e2e-execd-isolation \
   --namespace "${E2E_NAMESPACE}" \
   --from-file=isolation.hardened.toml="${REPO_ROOT}/components/execd/configs/isolation.hardened.toml" \
+  --from-file=isolation.custom.toml="${REPO_ROOT}/components/execd/configs/isolation.custom.toml" \
   --dry-run=client -o yaml | kubectl apply -f -
 k8s_e2e_write_server_helm_values
 k8s_e2e_helm_install_server
@@ -96,4 +98,4 @@ make generate-api
 cd "${REPO_ROOT}/tests/python"
 uv sync --all-extras --refresh
 uv run pytest tests/test_execd_init_e2e.py -v
-uv run pytest tests/test_execd_hardening_e2e.py -v -k "TestHardeningE2E"
+uv run pytest tests/test_execd_hardening_e2e.py -v -k "TestHardeningE2E or TestHardeningCustomPolicyE2E"
