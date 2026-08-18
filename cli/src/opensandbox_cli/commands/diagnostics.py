@@ -78,8 +78,8 @@ def diagnostics_group(ctx: click.Context) -> None:
     "-s",
     required=True,
     help=(
-        "Diagnostic log scope. Common scopes: lifecycle for manager logs, "
-        "container for sandbox stdout; other scopes are server-defined."
+        "Diagnostic log scope. Built-in server scopes: container and all; "
+        "other scopes are server-defined."
     ),
 )
 @output_option(

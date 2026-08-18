@@ -531,6 +531,8 @@ class TestSkillContentQuality:
         assert "osb diagnostics events <sandbox-id> --scope lifecycle -o raw" in content
         assert "osb diagnostics events <sandbox-id> --scope runtime -o raw" in content
         assert "osb diagnostics logs <sandbox-id> --scope container -o raw" in content
+        assert "osb diagnostics logs <sandbox-id> --scope all -o raw" in content
+        assert "osb diagnostics logs <sandbox-id> --scope lifecycle" not in content
         assert "## Diagnostics Streams" in content
         assert "## Evidence Semantics" in content
         assert "## URL Delivery" in content

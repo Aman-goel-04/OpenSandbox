@@ -75,7 +75,6 @@ osb diagnostics logs <sandbox-id> --scope container -o raw
 Then drill down only where the stable diagnostics point:
 
 ```bash
-osb diagnostics logs <sandbox-id> --scope lifecycle -o raw
 osb diagnostics events <sandbox-id> --scope all -o raw
 osb diagnostics logs <sandbox-id> --scope all -o raw
 ```
