@@ -46,6 +46,9 @@ class HttpMetricsMiddleware:
 
         try:
             await self.app(scope, receive, send_wrapper)
+        except Exception:
+            status_code = 500
+            raise
         finally:
             route = getattr(scope.get("route"), "path", None) or "unknown"
             try:

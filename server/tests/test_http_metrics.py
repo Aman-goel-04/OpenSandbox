@@ -14,6 +14,7 @@
 
 """Tests for low-cardinality Server HTTP request metrics."""
 
+from collections.abc import AsyncIterator
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -21,6 +22,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import Histogram, InMemoryMetricReader
+from starlette.responses import StreamingResponse
 
 import opensandbox_server.integrations.otel.metrics as otel_metrics
 from opensandbox_server.middleware.http_metrics import HttpMetricsMiddleware
@@ -36,6 +38,14 @@ def _test_app() -> FastAPI:
     @app.get("/explode")
     async def explode() -> None:
         raise RuntimeError("boom")
+
+    @app.get("/stream-error")
+    async def stream_error() -> StreamingResponse:
+        async def broken_body() -> AsyncIterator[bytes]:
+            yield b"partial"
+            raise RuntimeError("stream boom")
+
+        return StreamingResponse(broken_body())
 
     app.add_middleware(HttpMetricsMiddleware)
     return app
@@ -89,6 +99,18 @@ def test_http_middleware_does_not_fail_request_when_recorder_raises() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"item_id": 42}
+
+
+def test_http_middleware_records_streaming_failures_as_500() -> None:
+    client = TestClient(_test_app(), raise_server_exceptions=False)
+
+    with patch(
+        "opensandbox_server.middleware.http_metrics.record_http_request_duration"
+    ) as record:
+        client.get("/stream-error")
+
+    record.assert_called_once()
+    assert record.call_args.kwargs["status_code"] == 500
 
 
 def test_record_http_request_duration_uses_low_cardinality_attributes() -> None:
