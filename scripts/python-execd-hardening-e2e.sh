@@ -30,6 +30,9 @@
 # Phase 4: EXECD_INIT <-> TOML drift pin (R-s) — the hardened TOML with
 #          execd_run_as_init = false; the endpoint must report init_mode=none
 #          and degrade the enabled layers.
+# Phase 5: default-off pin (R-m) — plain server, no isolation TOML, init off;
+#          the endpoint must report init_mode=none with every layer disabled
+#          and the workload must be unaffected (no floor applied).
 #
 # Usage: bash scripts/python-execd-hardening-e2e.sh
 
@@ -93,6 +96,13 @@ write_server_config() {
   local drop_capabilities="$1"
   local toml_file="${2:-isolation.hardened.toml}"
   local run_as_init="${3:-true}"
+  local inject_toml="${4:-true}"
+  local sandbox_env_line=""
+  local toml_bind_line=""
+  if [ "${inject_toml}" = "true" ]; then
+    sandbox_env_line='sandbox_env = { EXECD_ISOLATION_CONFIG = "/etc/opensandbox/isolation.toml" }'
+    toml_bind_line="  \"/tmp/opensandbox-e2e/${toml_file}:/etc/opensandbox/isolation.toml\","
+  fi
   cat <<EOF > ~/.sandbox.toml
 [server]
 host = "127.0.0.1"
@@ -116,10 +126,10 @@ network_mode = "bridge"
 # the opensandbox-launcher.
 no_new_privileges = false
 seccomp_profile = "unconfined"
-sandbox_env = { EXECD_ISOLATION_CONFIG = "/etc/opensandbox/isolation.toml" }
+${sandbox_env_line}
 sandbox_binds = [
   "/tmp/opensandbox-e2e/workspace:/workspace",
-  "/tmp/opensandbox-e2e/${toml_file}:/etc/opensandbox/isolation.toml",
+${toml_bind_line}
 ]
 drop_capabilities = ${drop_capabilities}
 [storage]
@@ -161,4 +171,14 @@ run_server
 OPENSANDBOX_HARDENING_DRIFT=true run_pytest "TestHardeningDriftE2E"
 stop_server
 
-echo "Execd hardening E2E PASSED (phase 1: floor, phase 2: degradation, phase 3: custom policy, phase 4: drift)"
+# ---------------------------------------------------------------------------
+# Phase 5: default-off pin (R-m) — plain server, no TOML, init off. The
+# endpoint must report init_mode=none with every layer disabled, and the
+# workload must be unaffected (no floor applied).
+# ---------------------------------------------------------------------------
+write_server_config '["AUDIT_WRITE", "MKNOD", "NET_ADMIN", "NET_RAW", "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_TIME", "SYS_TTY_CONFIG"]' isolation.hardened.toml false false
+run_server
+OPENSANDBOX_HARDENING_DEFAULT_OFF=true run_pytest "TestHardeningDefaultOffE2E"
+stop_server
+
+echo "Execd hardening E2E PASSED (phase 1: floor, phase 2: degradation, phase 3: custom policy, phase 4: drift, phase 5: default-off)"

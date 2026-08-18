@@ -557,6 +557,60 @@ class TestHardeningDriftE2E:
         assert status["NoNewPrivs"] == "1", status
 
 
+@pytest.mark.skipif(
+    os.environ.get("OPENSANDBOX_HARDENING_DEFAULT_OFF") != "true",
+    reason="requires the plain server (no isolation TOML, execd_run_as_init = "
+    "false); run via scripts/python-execd-hardening-e2e.sh phase 5",
+)
+@pytest.mark.skipif(
+    is_kubernetes_runtime(),
+    reason="default-off needs a plain server (the k8s e2e server runs with "
+    "execd_run_as_init = true and the hardened TOML); docker-only",
+)
+class TestHardeningDefaultOffE2E:
+    """Default-off pin (OSEP-0018 R-m).
+
+    With no isolation TOML and no EXECD_INIT, execd must be exactly the
+    pre-OSEP binary: the capabilities endpoint reports init_mode=none with
+    every layer disabled (no drift, no fabricated states), and the workload
+    is unaffected — /command runs with the container ceiling caps and no
+    seccomp floor.
+    """
+
+    @pytest.fixture(scope="module", autouse=True)
+    def sandbox(self):
+        sbx = _create_sandbox(
+            entrypoint=["sh", "-c", "while :; do sleep 1; done"],
+            tag="execd-hardening-default-off-e2e",
+        )
+        logger.info("✓ default-off sandbox created: %s", sbx.id)
+        yield sbx
+        _destroy(sbx)
+
+    def test_all_layers_disabled_without_config(self, sandbox) -> None:
+        report = _hardening_report(sandbox)
+        assert report.init_mode == "none", f"init_mode = {report.init_mode}"
+        assert report.signal_shield is False
+        for layer, name in (
+            (report.cap_drop, "cap_drop"),
+            (report.seccomp, "seccomp"),
+            (report.landlock, "landlock"),
+            (report.ebpf, "ebpf"),
+        ):
+            assert layer is not None, name
+            assert layer.state == "disabled", f"{name} state = {layer.state}"
+            assert layer.message is not None, f"{name} message missing"
+
+    def test_workload_unaffected_without_hardening(self, sandbox) -> None:
+        # No floor: the workload keeps the container ceiling (cap_drop list
+        # still removes the dangerous caps from the ceiling, but nothing the
+        # launcher would subtract on top of that) and no seccomp filter.
+        status = _status_fields(sandbox, ["CapEff", "Seccomp", "NoNewPrivs"])
+        assert status["CapEff"] != "0000000000000000", status
+        assert status["Seccomp"] == "0", status
+        assert status["NoNewPrivs"] == "0", status
+
+
 class TestIsolatedSessionHardeningE2E:
     """bwrap isolated sessions under init mode + the hardening floor
     (OSEP-0018 R-o).

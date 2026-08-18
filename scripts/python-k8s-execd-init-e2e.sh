@@ -90,6 +90,8 @@ export OPENSANDBOX_SANDBOX_DEFAULT_IMAGE="${SANDBOX_TEST_IMAGE}"
 export OPENSANDBOX_E2E_RUNTIME="kubernetes"
 export OPENSANDBOX_TEST_USE_SERVER_PROXY="true"
 export OPENSANDBOX_TEST_PVC_NAME="${PVC_NAME}"
+export OPENSANDBOX_E2E_NAMESPACE="${E2E_NAMESPACE}"
+export OPENSANDBOX_EXECD_IMAGE="${EXECD_IMG}"
 
 k8s_e2e_export_sandbox_resource_env
 
@@ -99,3 +101,4 @@ cd "${REPO_ROOT}/tests/python"
 uv sync --all-extras --refresh
 uv run pytest tests/test_execd_init_e2e.py -v
 uv run pytest tests/test_execd_hardening_e2e.py -v -k "TestHardeningE2E or TestHardeningCustomPolicyE2E"
+uv run pytest tests/test_execd_k8s_restart_recycle_e2e.py -v
