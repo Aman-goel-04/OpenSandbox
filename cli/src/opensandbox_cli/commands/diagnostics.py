@@ -110,8 +110,8 @@ def diagnostics_logs(
     "-s",
     required=True,
     help=(
-        "Diagnostic event scope. Common scopes: lifecycle for audit events, "
-        "runtime for scheduler/container events; other scopes are server-defined."
+        "Diagnostic event scope. Built-in server scopes: runtime and all; "
+        "other scopes are server-defined."
     ),
 )
 @output_option(

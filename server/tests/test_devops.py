@@ -262,14 +262,17 @@ def test_diagnostics_events_reports_and_applies_line_limit(
     assert response.json()["truncated"] is True
 
 
-def test_diagnostics_events_lifecycle_scope_discloses_runtime_mapping(
+def test_diagnostics_events_rejects_unavailable_lifecycle_scope(
     client: TestClient,
     auth_headers: dict,
     monkeypatch,
 ) -> None:
+    calls: list[tuple[str, int]] = []
+
     class StubService:
         @staticmethod
-        def get_sandbox_events(*args, **kwargs) -> str:
+        def get_sandbox_events(sandbox_id: str, limit: int) -> str:
+            calls.append((sandbox_id, limit))
             return "runtime event"
 
     monkeypatch.setattr(devops, "sandbox_service", StubService())
@@ -279,9 +282,37 @@ def test_diagnostics_events_lifecycle_scope_discloses_runtime_mapping(
         headers=auth_headers,
     )
 
+    assert response.status_code == 400
+    assert response.json() == {
+        "code": "DIAGNOSTICS_SCOPE_UNSUPPORTED",
+        "message": (
+            "Unsupported events diagnostics scope 'lifecycle'. "
+            "Supported scopes: runtime, all."
+        ),
+    }
+    assert calls == []
+
+
+def test_diagnostics_events_all_scope_discloses_backend_limit(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+) -> None:
+    class StubService:
+        @staticmethod
+        def get_sandbox_events(sandbox_id: str, limit: int) -> str:
+            return "runtime event"
+
+    monkeypatch.setattr(devops, "sandbox_service", StubService())
+
+    response = client.get(
+        "/v1/sandboxes/sbx-001/diagnostics/events?scope=all",
+        headers=auth_headers,
+    )
+
     assert response.status_code == 200
     assert response.json()["warnings"] == [
-        "The current backend maps lifecycle diagnostics to runtime events."
+        "The current backend only contributes runtime events to the all scope."
     ]
 
 

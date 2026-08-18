@@ -263,8 +263,8 @@ credential values as command-line flags; keep them in the payload stream or file
 Use the stable diagnostics commands for API-backed log and event descriptors.
 
 ```bash
-osb diagnostics events <sandbox-id> --scope lifecycle -o raw
 osb diagnostics events <sandbox-id> --scope runtime -o raw
+osb diagnostics events <sandbox-id> --scope all -o raw
 osb diagnostics logs <sandbox-id> --scope container -o raw
 osb diagnostics logs <sandbox-id> --scope all -o json
 osb diagnostics events <sandbox-id> --scope runtime -o json
@@ -272,9 +272,10 @@ osb diagnostics logs <sandbox-id> --scope container -o yaml
 ```
 
 `--scope` is required for stable diagnostics. The built-in server supports
-`container` and `all` for logs, and `runtime`, `lifecycle`, and `all` for events.
+`container` and `all` for logs, and `runtime` and `all` for events. It returns
+`DIAGNOSTICS_SCOPE_UNSUPPORTED` for unavailable scopes, including lifecycle events.
 Best-effort scopes may include a `warnings` field when the backend can only
-provide a subset or maps the request to runtime events. Raw output prints inline
+provide a subset. Raw output prints inline
 diagnostic text, or the content URL when diagnostics are delivered as a
 temporary URL. Structured CLI output follows the SDK/Python field style, for
 example `content_url`, `content_length`, and `expires_at`. Older server builds

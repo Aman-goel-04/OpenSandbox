@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["DevOps"])
 
 _SUPPORTED_LOG_SCOPES = ("container", "all")
-_SUPPORTED_EVENT_SCOPES = ("runtime", "lifecycle", "all")
+_SUPPORTED_EVENT_SCOPES = ("runtime", "all")
 
 
 def _diagnostic_inline_response(
@@ -216,9 +216,9 @@ def get_sandbox_events(
         text = sandbox_service.get_sandbox_events(sandbox_id, limit=limit + 1)
         text, truncated = _limit_diagnostic_lines(text, limit, keep_tail=False)
         warnings = None
-        if normalized_scope != "runtime":
+        if normalized_scope == "all":
             warnings = [
-                f"The current backend maps {normalized_scope} diagnostics to runtime events."
+                "The current backend only contributes runtime events to the all scope."
             ]
         return _diagnostic_inline_response(
             sandbox_id,
