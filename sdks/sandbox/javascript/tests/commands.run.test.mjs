@@ -130,6 +130,50 @@ test("CommandsAdapter.run still surfaces stream errors for foreground commands",
   await assert.rejects(() => adapter.run("sleep 1"));
 });
 
+test("CommandsAdapter.run cancels the reader when a background command breaks early", async () => {
+  // The stream never signals `done` or errors on its own past
+  // execution_complete -- it simply stops delivering data, the way a
+  // peer that never sends the chunked terminator would behave. If the
+  // completion break left the reader un-cancelled, the stream's `cancel`
+  // hook would never fire and the body would stay locked indefinitely.
+  let cancelled = false;
+  const encoder = new TextEncoder();
+  const chunks = [
+    'data: {"type":"init","text":"cmd-cancel","timestamp":1}\n\n',
+    'data: {"type":"execution_complete","timestamp":2,"execution_time":3}\n\n',
+  ].map((chunk) => encoder.encode(chunk));
+  let index = 0;
+  const stream = new ReadableStream({
+    pull(controller) {
+      if (index < chunks.length) {
+        controller.enqueue(chunks[index]);
+        index += 1;
+      }
+      // Beyond the known chunks: no-op. The underlying source never
+      // closes or errors the stream by itself.
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+
+  const fetchImpl = async () =>
+    new Response(stream, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+
+  const adapter = new CommandsAdapter(
+    {},
+    { baseUrl: "http://127.0.0.1:8080", fetch: fetchImpl },
+  );
+
+  const execution = await adapter.run("sleep 1", { background: true });
+
+  assert.equal(execution.id, "cmd-cancel");
+  assert.equal(cancelled, true);
+});
+
 test("CommandsAdapter.runInSession sends command and timeout fields", async () => {
   let requestBody;
   const fetchImpl = async (url, init) => {
