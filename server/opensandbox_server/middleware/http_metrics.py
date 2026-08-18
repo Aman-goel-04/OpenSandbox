@@ -17,11 +17,35 @@
 import logging
 from time import perf_counter
 
+from starlette.routing import Match, Router
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from opensandbox_server.integrations.otel import record_http_request_duration
 
 logger = logging.getLogger(__name__)
+
+
+def _matched_route_path(scope: Scope) -> str:
+    route_path = getattr(scope.get("route"), "path", None)
+    if route_path:
+        return route_path
+
+    router = scope.get("router")
+    if not isinstance(router, Router):
+        return "unknown"
+
+    partial_path = None
+    for registered_route in router.routes:
+        match, _ = registered_route.matches(scope)
+        registered_path = getattr(registered_route, "path", None)
+        if not registered_path:
+            continue
+        if match == Match.FULL:
+            return registered_path
+        if match == Match.PARTIAL and partial_path is None:
+            partial_path = registered_path
+
+    return partial_path or "unknown"
 
 
 class HttpMetricsMiddleware:
@@ -50,8 +74,8 @@ class HttpMetricsMiddleware:
             status_code = 500
             raise
         finally:
-            route = getattr(scope.get("route"), "path", None) or "unknown"
             try:
+                route = _matched_route_path(scope)
                 record_http_request_duration(
                     duration_ms=(perf_counter() - started_at) * 1000.0,
                     method=scope.get("method", "unknown"),

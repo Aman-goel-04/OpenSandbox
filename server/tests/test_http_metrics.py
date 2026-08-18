@@ -78,6 +78,18 @@ def test_http_middleware_records_status_and_route_template(
     assert record.call_args.kwargs["duration_ms"] >= 0
 
 
+@pytest.mark.parametrize("path", ["/docs", "/redoc", "/openapi.json"])
+def test_http_middleware_records_registered_starlette_routes(path: str) -> None:
+    client = TestClient(_test_app())
+
+    with patch("opensandbox_server.middleware.http_metrics.record_http_request_duration") as record:
+        response = client.get(path)
+
+    assert response.status_code == 200
+    record.assert_called_once()
+    assert record.call_args.kwargs["route"] == path
+
+
 def test_http_middleware_covers_auth_rejection(client: TestClient) -> None:
     with patch("opensandbox_server.middleware.http_metrics.record_http_request_duration") as record:
         response = client.get("/v1/sandboxes")
