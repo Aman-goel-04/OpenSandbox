@@ -13,13 +13,14 @@
 # limitations under the License.
 
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
 from fastapi import HTTPException
 from kubernetes.client import V1ResourceRequirements
 
-from opensandbox_server.services.constants import SANDBOX_ID_LABEL
+from opensandbox_server.services.constants import SANDBOX_ID_LABEL, SandboxErrorCodes
 from opensandbox_server.services.k8s.k8s_diagnostics import (
     K8sDiagnosticsMixin,
     _parse_since,
@@ -365,3 +366,36 @@ def test_get_sandbox_events_uses_found_pod_namespace() -> None:
         field_selector="involvedObject.name=pod-1",
         limit=50,
     )
+
+
+@pytest.mark.parametrize(
+    ("api_status", "expected_status", "expected_code"),
+    [
+        (400, 400, SandboxErrorCodes.K8S_API_ERROR),
+        (403, 403, SandboxErrorCodes.K8S_API_ERROR),
+        (404, 404, SandboxErrorCodes.K8S_SANDBOX_NOT_FOUND),
+        (503, 500, SandboxErrorCodes.K8S_API_ERROR),
+    ],
+)
+def test_get_sandbox_events_maps_kubernetes_api_errors(
+    api_status: int,
+    expected_status: int,
+    expected_code: str,
+) -> None:
+    from kubernetes.client.exceptions import ApiException
+
+    service = _DiagnosticsService([_pod()])
+    api_exc = ApiException(status=api_status, reason="Kubernetes event API error")
+    api_exc.body = f"event API failed with status {api_status}"
+    service.core_v1.list_namespaced_event.side_effect = api_exc
+
+    with pytest.raises(HTTPException) as exc:
+        service.get_sandbox_events("sbx-1")
+
+    assert exc.value.status_code == expected_status
+    detail = exc.value.detail
+    assert isinstance(detail, dict)
+    typed_detail = cast(dict[str, str], detail)
+    assert typed_detail["code"] == expected_code
+    assert "pod-1" in typed_detail["message"]
+    assert api_exc.body in typed_detail["message"]

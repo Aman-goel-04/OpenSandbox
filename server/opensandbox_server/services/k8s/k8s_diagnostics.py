@@ -240,11 +240,14 @@ class K8sDiagnosticsMixin:
         pod_name = pod.metadata.name
         core_v1 = self.k8s_client.get_core_v1_api()
 
-        events_resp = core_v1.list_namespaced_event(
-            namespace=pod.metadata.namespace,
-            field_selector=f"involvedObject.name={pod_name}",
-            limit=limit,
-        )
+        try:
+            events_resp = core_v1.list_namespaced_event(
+                namespace=pod.metadata.namespace,
+                field_selector=f"involvedObject.name={pod_name}",
+                limit=limit,
+            )
+        except ApiException as exc:
+            raise _map_pod_event_error(pod_name, exc) from exc
 
         if not events_resp.items:
             return "(no events)"
@@ -309,6 +312,49 @@ def _map_pod_log_error(pod_name: str, container: str, exc: ApiException) -> HTTP
             "message": (
                 f"Kubernetes returned {raw_status} when reading logs for pod "
                 f"'{pod_name}' container '{container}': {body}"
+            ),
+        },
+    )
+
+
+def _map_pod_event_error(pod_name: str, exc: ApiException) -> HTTPException:
+    """Translate a Kubernetes event ApiException into a contract error."""
+    raw_status = getattr(exc, "status", None) or 0
+    body = getattr(exc, "body", None) or str(exc)
+
+    if raw_status == 400:
+        return HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": SandboxErrorCodes.K8S_API_ERROR,
+                "message": (
+                    f"Kubernetes rejected event request for pod '{pod_name}': {body}"
+                ),
+            },
+        )
+    if raw_status in (401, 403):
+        return HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": SandboxErrorCodes.K8S_API_ERROR,
+                "message": f"Kubernetes denied event access for pod '{pod_name}': {body}",
+            },
+        )
+    if raw_status == 404:
+        return HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "code": SandboxErrorCodes.K8S_SANDBOX_NOT_FOUND,
+                "message": f"Pod '{pod_name}' not found when reading events: {body}",
+            },
+        )
+    return HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail={
+            "code": SandboxErrorCodes.K8S_API_ERROR,
+            "message": (
+                f"Kubernetes returned {raw_status} when reading events for pod "
+                f"'{pod_name}': {body}"
             ),
         },
     )
