@@ -33,6 +33,8 @@ router = APIRouter(tags=["DevOps"])
 
 _SUPPORTED_LOG_SCOPES = ("container", "all")
 _SUPPORTED_EVENT_SCOPES = ("runtime", "all")
+_STABLE_LOG_LINE_LIMIT = 100
+_STABLE_EVENT_LINE_LIMIT = 50
 
 
 def _diagnostic_inline_response(
@@ -145,9 +147,13 @@ def get_sandbox_logs(
         if normalized_scope not in _SUPPORTED_LOG_SCOPES:
             return _unsupported_scope_response("logs", scope, _SUPPORTED_LOG_SCOPES)
         text = sandbox_service.get_sandbox_logs(
-            sandbox_id, tail=tail + 1, since=None, container=None
+            sandbox_id, tail=_STABLE_LOG_LINE_LIMIT + 1, since=None, container=None
         )
-        text, truncated = _limit_diagnostic_lines(text, tail, keep_tail=True)
+        text, truncated = _limit_diagnostic_lines(
+            text,
+            _STABLE_LOG_LINE_LIMIT,
+            keep_tail=True,
+        )
         warnings = None
         if normalized_scope == "all":
             warnings = [
@@ -213,8 +219,15 @@ def get_sandbox_events(
         normalized_scope = scope.strip().lower()
         if normalized_scope not in _SUPPORTED_EVENT_SCOPES:
             return _unsupported_scope_response("events", scope, _SUPPORTED_EVENT_SCOPES)
-        text = sandbox_service.get_sandbox_events(sandbox_id, limit=limit + 1)
-        text, truncated = _limit_diagnostic_lines(text, limit, keep_tail=False)
+        text = sandbox_service.get_sandbox_events(
+            sandbox_id,
+            limit=_STABLE_EVENT_LINE_LIMIT + 1,
+        )
+        text, truncated = _limit_diagnostic_lines(
+            text,
+            _STABLE_EVENT_LINE_LIMIT,
+            keep_tail=False,
+        )
         warnings = None
         if normalized_scope == "all":
             warnings = [

@@ -156,6 +156,39 @@ def test_diagnostics_logs_with_scope_ignores_legacy_since_filter(
     assert since_values == [None, None]
 
 
+def test_diagnostics_logs_with_scope_ignores_legacy_tail_bound(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+) -> None:
+    tails: list[int] = []
+
+    class StubService:
+        @staticmethod
+        def get_sandbox_logs(
+            sandbox_id: str,
+            tail: int,
+            since: str | None = None,
+            container: str | None = None,
+        ) -> str:
+            tails.append(tail)
+            return "first line\nsecond line"
+
+    monkeypatch.setattr(devops, "sandbox_service", StubService())
+
+    for scope in ("container", "all"):
+        for tail in (1, 10000):
+            response = client.get(
+                f"/v1/sandboxes/sbx-001/diagnostics/logs?scope={scope}&tail={tail}",
+                headers=auth_headers,
+            )
+
+            assert response.status_code == 200
+            assert response.json()["content"] == "first line\nsecond line"
+
+    assert tails == [101, 101, 101, 101]
+
+
 def test_diagnostics_logs_rejects_unsupported_scope(
     client: TestClient,
     auth_headers: dict,
@@ -324,6 +357,34 @@ def test_diagnostics_events_reports_and_applies_line_limit(
     assert response.status_code == 200
     assert response.json()["content"].splitlines() == events[:50]
     assert response.json()["truncated"] is True
+
+
+def test_diagnostics_events_with_scope_ignores_legacy_limit_bound(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+) -> None:
+    limits: list[int] = []
+
+    class StubService:
+        @staticmethod
+        def get_sandbox_events(sandbox_id: str, limit: int) -> str:
+            limits.append(limit)
+            return "first event\nsecond event"
+
+    monkeypatch.setattr(devops, "sandbox_service", StubService())
+
+    for scope in ("runtime", "all"):
+        for limit in (1, 500):
+            response = client.get(
+                f"/v1/sandboxes/sbx-001/diagnostics/events?scope={scope}&limit={limit}",
+                headers=auth_headers,
+            )
+
+            assert response.status_code == 200
+            assert response.json()["content"] == "first event\nsecond event"
+
+    assert limits == [51, 51, 51, 51]
 
 
 def test_diagnostics_events_rejects_unavailable_lifecycle_scope(
