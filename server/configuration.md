@@ -96,6 +96,7 @@ Example files in this repository:
 |-----|------|---------|-------------|
 | `type` | string | — | **`docker`** or **`kubernetes`**. Selects which runtime implementation loads. |
 | `execd_image` | string | — | OCI image containing the **execd** binary used to bootstrap command/file access inside the sandbox. |
+| `execd_run_as_init` | boolean | `false` | Run **execd as the sandbox init** (OSEP-0018): sets `EXECD_INIT` in the sandbox environment so `bootstrap.sh` `exec`s into `execd --init` and execd becomes PID 1 — reaping children, owning the container lifecycle, and exposing the hardening floor. Defaults to `false` (classic background-and-wait topology); intended to be flipped on after validation in production. |
 
 ---
 
@@ -206,6 +207,7 @@ Configures the **egress sidecar** image and enforcement mode. The server only at
 | `image` | string \| omitted | `null` | OCI image for the egress sidecar. **Required in config** when clients send **`networkPolicy`** (create request). |
 | `mode` | string | `"dns"` | Passed to the sidecar as `OPENSANDBOX_EGRESS_MODE`. Values: **`dns`** — DNS-proxy-based enforcement (CIDR/static IP rules **not** enforced); **`dns+nft`** — adds nftables where available so **CIDR/IP** rules can be enforced. |
 | `disable_ipv6` | bool | `true` | IPv6 egress is incomplete (especially on Kubernetes). **Default on**; set `false` only when you want IPv6 left up in the netns. Details in [IPv6 and egress](#ipv6-and-egress) below. |
+| `readiness_timeout_seconds` | float | `30.0` | **Docker only.** Maximum time to wait for the egress sidecar health endpoint to become ready. Must be greater than `0`. |
 
 ### IPv6 and egress
 
@@ -215,6 +217,7 @@ OpenSandbox egress does **not** treat IPv6 as a first-class, fully covered path�
 
 - `egress.image` must be set when using `networkPolicy`.
 - Outbound policy requires **`docker.network_mode = "bridge"`**; `networkPolicy` is rejected for incompatible network modes.
+- Increase `egress.readiness_timeout_seconds` when the sidecar needs more than 30 seconds to become ready in the deployment environment.
 
 **Kubernetes notes:**
 
