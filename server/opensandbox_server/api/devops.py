@@ -40,6 +40,7 @@ def _diagnostic_inline_response(
     kind: str,
     scope: str,
     content: str,
+    truncated: bool = False,
     warnings: list[str] | None = None,
 ) -> JSONResponse:
     """Build a Diagnostics API descriptor for inline plain-text content."""
@@ -51,11 +52,25 @@ def _diagnostic_inline_response(
         "contentType": "text/plain; charset=utf-8",
         "content": content,
         "contentLength": len(content.encode("utf-8")),
-        "truncated": False,
+        "truncated": truncated,
     }
     if warnings:
         payload["warnings"] = warnings
     return JSONResponse(status_code=status.HTTP_200_OK, content=payload)
+
+
+def _limit_diagnostic_lines(
+    content: str,
+    limit: int,
+    *,
+    keep_tail: bool,
+) -> tuple[str, bool]:
+    """Apply a line limit after fetching one extra line to detect truncation."""
+    lines = content.splitlines(keepends=True)
+    if len(lines) <= limit:
+        return content, False
+    bounded_lines = lines[-limit:] if keep_tail else lines[:limit]
+    return "".join(bounded_lines), True
 
 
 def _unsupported_scope_response(
@@ -130,8 +145,9 @@ def get_sandbox_logs(
         if normalized_scope not in _SUPPORTED_LOG_SCOPES:
             return _unsupported_scope_response("logs", scope, _SUPPORTED_LOG_SCOPES)
         text = sandbox_service.get_sandbox_logs(
-            sandbox_id, tail=tail, since=since, container=container
+            sandbox_id, tail=tail + 1, since=since, container=container
         )
+        text, truncated = _limit_diagnostic_lines(text, tail, keep_tail=True)
         warnings = None
         if normalized_scope == "all":
             warnings = [
@@ -142,6 +158,7 @@ def get_sandbox_logs(
             "logs",
             normalized_scope,
             text,
+            truncated=truncated,
             warnings=warnings,
         )
     text = sandbox_service.get_sandbox_logs(sandbox_id, tail=tail, since=since, container=container)
@@ -196,7 +213,8 @@ def get_sandbox_events(
         normalized_scope = scope.strip().lower()
         if normalized_scope not in _SUPPORTED_EVENT_SCOPES:
             return _unsupported_scope_response("events", scope, _SUPPORTED_EVENT_SCOPES)
-        text = sandbox_service.get_sandbox_events(sandbox_id, limit=limit)
+        text = sandbox_service.get_sandbox_events(sandbox_id, limit=limit + 1)
+        text, truncated = _limit_diagnostic_lines(text, limit, keep_tail=False)
         warnings = None
         if normalized_scope != "runtime":
             warnings = [
@@ -207,6 +225,7 @@ def get_sandbox_events(
             "events",
             normalized_scope,
             text,
+            truncated=truncated,
             warnings=warnings,
         )
     text = sandbox_service.get_sandbox_events(sandbox_id, limit=limit)

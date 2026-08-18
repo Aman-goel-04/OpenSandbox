@@ -33,7 +33,7 @@ def test_diagnostics_logs_with_scope_returns_stable_inline_descriptor(
             container: str | None = None,
         ) -> str:
             assert sandbox_id == "sbx-001"
-            assert tail == 100
+            assert tail == 101
             assert since is None
             assert container is None
             return content
@@ -57,6 +57,39 @@ def test_diagnostics_logs_with_scope_returns_stable_inline_descriptor(
         "contentLength": len(content.encode("utf-8")),
         "truncated": False,
     }
+
+
+def test_diagnostics_logs_reports_and_applies_line_limit(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+) -> None:
+    lines = [f"line {index}" for index in range(101)]
+
+    class StubService:
+        @staticmethod
+        def get_sandbox_logs(
+            sandbox_id: str,
+            tail: int,
+            since: str | None = None,
+            container: str | None = None,
+        ) -> str:
+            assert sandbox_id == "sbx-001"
+            assert tail == 101
+            assert since is None
+            assert container is None
+            return "\n".join(lines)
+
+    monkeypatch.setattr(devops, "sandbox_service", StubService())
+
+    response = client.get(
+        "/v1/sandboxes/sbx-001/diagnostics/logs?scope=container",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["content"].splitlines() == lines[-100:]
+    assert response.json()["truncated"] is True
 
 
 def test_diagnostics_logs_rejects_unsupported_scope(
@@ -179,7 +212,7 @@ def test_diagnostics_events_with_scope_returns_stable_inline_descriptor(
         @staticmethod
         def get_sandbox_events(sandbox_id: str, limit: int) -> str:
             assert sandbox_id == "sbx-001"
-            assert limit == 50
+            assert limit == 51
             return "runtime event"
 
     monkeypatch.setattr(devops, "sandbox_service", StubService())
@@ -201,6 +234,32 @@ def test_diagnostics_events_with_scope_returns_stable_inline_descriptor(
         "contentLength": 13,
         "truncated": False,
     }
+
+
+def test_diagnostics_events_reports_and_applies_line_limit(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+) -> None:
+    events = [f"event {index}" for index in range(51)]
+
+    class StubService:
+        @staticmethod
+        def get_sandbox_events(sandbox_id: str, limit: int) -> str:
+            assert sandbox_id == "sbx-001"
+            assert limit == 51
+            return "\n".join(events)
+
+    monkeypatch.setattr(devops, "sandbox_service", StubService())
+
+    response = client.get(
+        "/v1/sandboxes/sbx-001/diagnostics/events?scope=runtime",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["content"].splitlines() == events[:50]
+    assert response.json()["truncated"] is True
 
 
 def test_diagnostics_events_lifecycle_scope_discloses_runtime_mapping(
