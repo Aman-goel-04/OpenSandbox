@@ -31,6 +31,16 @@ class PoolRateLimitStateTest {
     private val now: Instant = Instant.parse("2026-08-14T00:00:00Z")
 
     @Test
+    fun `zero or non-positive retry after falls back to default delay`() {
+        val state = PoolRateLimitState()
+
+        state.recordRateLimit(retryAfter = Duration.ZERO, now = now)
+
+        assertTrue(state.isActive(now.plusSeconds(9)))
+        assertFalse(state.isActive(now.plusSeconds(10)))
+    }
+
+    @Test
     fun `missing retry after uses bounded default delay`() {
         val state = PoolRateLimitState()
 

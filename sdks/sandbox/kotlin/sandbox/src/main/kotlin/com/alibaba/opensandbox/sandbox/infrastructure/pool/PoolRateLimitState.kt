@@ -39,7 +39,7 @@ internal class PoolRateLimitState(
         retryAfter: Duration?,
         now: Instant = Instant.now(),
     ) {
-        val requestedDelay = retryAfter?.takeUnless { it.isNegative } ?: defaultDelay
+        val requestedDelay = retryAfter?.takeUnless { it.isNegative || it.isZero } ?: defaultDelay
         val candidate = now.plus(minOf(requestedDelay, maxDelay))
         val current = throttleUntil
         if (current == null || candidate.isAfter(current)) {
