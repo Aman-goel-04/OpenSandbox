@@ -14,7 +14,7 @@
 
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import MagicMock
+from unittest.mock import call, MagicMock
 
 import pytest
 from fastapi import HTTPException
@@ -387,6 +387,49 @@ def test_get_sandbox_events_uses_found_pod_namespace() -> None:
         field_selector="involvedObject.name=pod-1",
         limit=50,
     )
+
+
+def test_get_sandbox_events_follows_continuation_until_limit() -> None:
+    service = _DiagnosticsService([_pod()])
+
+    def event(index: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            last_timestamp=f"2026-01-01T00:00:{index:02d}Z",
+            event_time=None,
+            first_timestamp=None,
+            type="Normal",
+            reason="Started",
+            message=f"event-{index}",
+        )
+
+    service.core_v1.list_namespaced_event.side_effect = [
+        SimpleNamespace(
+            items=[event(index) for index in range(50)],
+            metadata=SimpleNamespace(_continue="next-page-token"),
+        ),
+        SimpleNamespace(
+            items=[event(50)],
+            metadata=SimpleNamespace(_continue=None),
+        ),
+    ]
+
+    output = service.get_sandbox_events("sbx-1", limit=51)
+
+    assert len(output.splitlines()) == 51
+    assert "event-50" in output
+    assert service.core_v1.list_namespaced_event.call_args_list == [
+        call(
+            namespace="sandbox-system",
+            field_selector="involvedObject.name=pod-1",
+            limit=51,
+        ),
+        call(
+            namespace="sandbox-system",
+            field_selector="involvedObject.name=pod-1",
+            limit=51,
+            _continue="next-page-token",
+        ),
+    ]
 
 
 @pytest.mark.parametrize(

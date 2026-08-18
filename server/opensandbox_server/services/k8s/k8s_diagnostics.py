@@ -22,6 +22,7 @@ by querying K8s Pod state and events. Mixed into KubernetesSandboxService.
 from __future__ import annotations
 
 import re
+from typing import Any
 
 from fastapi import HTTPException, status
 from kubernetes.client.exceptions import ApiException
@@ -240,20 +241,38 @@ class K8sDiagnosticsMixin:
         pod_name = pod.metadata.name
         core_v1 = self.k8s_client.get_core_v1_api()
 
+        events: list[Any] = []
+        continuation: str | None = None
         try:
-            events_resp = core_v1.list_namespaced_event(
-                namespace=pod.metadata.namespace,
-                field_selector=f"involvedObject.name={pod_name}",
-                limit=limit,
-            )
+            while len(events) < limit:
+                if continuation is None:
+                    events_resp = core_v1.list_namespaced_event(
+                        namespace=pod.metadata.namespace,
+                        field_selector=f"involvedObject.name={pod_name}",
+                        limit=limit,
+                    )
+                else:
+                    events_resp = core_v1.list_namespaced_event(
+                        namespace=pod.metadata.namespace,
+                        field_selector=f"involvedObject.name={pod_name}",
+                        limit=limit,
+                        _continue=continuation,
+                    )
+
+                events.extend(events_resp.items or [])
+                metadata = getattr(events_resp, "metadata", None)
+                next_continuation = getattr(metadata, "_continue", None)
+                if not next_continuation or next_continuation == continuation:
+                    break
+                continuation = next_continuation
         except ApiException as exc:
             raise _map_pod_event_error(pod_name, exc) from exc
 
-        if not events_resp.items:
+        if not events:
             return "(no events)"
 
         lines: list[str] = []
-        for ev in events_resp.items:
+        for ev in events[:limit]:
             ts = ev.last_timestamp or ev.event_time or ev.first_timestamp or "N/A"
             lines.append(
                 f"[{ts}] {ev.type:8s} {ev.reason or 'N/A':20s} {ev.message or ''}"
