@@ -124,6 +124,38 @@ def test_diagnostics_logs_with_scope_ignores_legacy_container_selector(
     assert containers == [None, None]
 
 
+def test_diagnostics_logs_with_scope_ignores_legacy_since_filter(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+) -> None:
+    since_values: list[str | None] = []
+
+    class StubService:
+        @staticmethod
+        def get_sandbox_logs(
+            sandbox_id: str,
+            tail: int,
+            since: str | None = None,
+            container: str | None = None,
+        ) -> str:
+            since_values.append(since)
+            return "sandbox logs"
+
+    monkeypatch.setattr(devops, "sandbox_service", StubService())
+
+    for scope in ("container", "all"):
+        response = client.get(
+            f"/v1/sandboxes/sbx-001/diagnostics/logs?scope={scope}&since=5m",
+            headers=auth_headers,
+        )
+
+        assert response.status_code == 200
+        assert response.json()["scope"] == scope
+
+    assert since_values == [None, None]
+
+
 def test_diagnostics_logs_rejects_unsupported_scope(
     client: TestClient,
     auth_headers: dict,
