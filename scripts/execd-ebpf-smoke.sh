@@ -86,6 +86,11 @@ fi
 
 # Minimal isolation TOML: only the eBPF section, audit file in a host dir.
 mkdir -p "${WORKDIR}/audit"
+# Pre-create the audit file writable by the container (root) and readable by
+# the host runner (non-root): lumberjack appends in place, so the file stays
+# world-readable and the runner can assert on it after the container stops.
+: > "${WORKDIR}/audit/ebpf-audit.jsonl"
+chmod 0666 "${WORKDIR}/audit/ebpf-audit.jsonl"
 cat > "${WORKDIR}/ebpf.toml" <<EOF
 [ebpf]
 enabled = true
@@ -140,7 +145,7 @@ if state != "active":
 PY
 
 echo "== generating events inside the sandbox cgroup =="
-docker exec "${CTR_NAME}" sh -c 'sleep 0.05; echo exec-event-ok >/dev/null' >/dev/null
+docker exec "${CTR_NAME}" sh -c '/bin/sleep 0.05; echo exec-event-ok >/dev/null' >/dev/null
 docker exec "${CTR_NAME}" wget -qO- http://example.com/ >/dev/null 2>&1 || true
 # Privilege event: busybox su setuids -> commit_creds fires.
 docker exec "${CTR_NAME}" su nobody -s /bin/sh -c 'true' >/dev/null 2>&1 || true
