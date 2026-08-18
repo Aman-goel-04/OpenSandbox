@@ -46,13 +46,19 @@ def render_diagnostic_content(
     )
 
     if output.fmt == "raw":
+        if content.truncated:
+            click.echo("Warning: diagnostic content was truncated.", err=True)
+        for warning in content.warnings or []:
+            click.echo(f"Warning: {warning}", err=True)
         if content.delivery == "inline":
             click.echo(content.content or "")
             return
         if content.content_url:
             click.echo(content.content_url)
             return
-        raise click.ClickException("Diagnostic response did not include inline content or a content URL.")
+        raise click.ClickException(
+            "Diagnostic response did not include inline content or a content URL."
+        )
 
     output.print_dict(_diagnostic_to_dict(content), title=title)
 
