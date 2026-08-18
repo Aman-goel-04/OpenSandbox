@@ -126,6 +126,7 @@ done
 }
 
 echo "== hardening/ebpf report =="
+set +e
 python3 - "${WORKDIR}/caps.json" <<'PY'
 import json, sys
 caps = json.load(open(sys.argv[1]))
@@ -149,6 +150,7 @@ if "hooks not active" in message:
     sys.exit(2)
 PY
 report_rc=$?
+set -e
 if [ "${report_rc}" -eq 1 ]; then
   exit 1
 fi
