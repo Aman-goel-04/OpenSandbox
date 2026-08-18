@@ -306,7 +306,7 @@ def _map_pod_log_error(pod_name: str, container: str, exc: ApiException) -> HTTP
             },
         )
     return HTTPException(
-        status_code=status.HTTP_502_BAD_GATEWAY,
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         detail={
             "code": SandboxErrorCodes.K8S_API_ERROR,
             "message": (

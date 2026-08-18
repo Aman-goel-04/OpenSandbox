@@ -281,6 +281,27 @@ def test_get_sandbox_logs_maps_kubernetes_403_to_forbidden_response() -> None:
     assert exc.value.status_code == 403
 
 
+@pytest.mark.parametrize("api_status", [None, 503])
+def test_get_sandbox_logs_maps_undocumented_kubernetes_failures_to_500(
+    api_status: int | None,
+) -> None:
+    from kubernetes.client.exceptions import ApiException
+
+    service = _DiagnosticsService([_multi_container_pod()])
+    api_exc = ApiException(status=api_status, reason="Kubernetes log API error")
+    api_exc.body = "log API unavailable"
+    service.core_v1.read_namespaced_pod_log.side_effect = api_exc
+
+    with pytest.raises(HTTPException) as exc:
+        service.get_sandbox_logs("sbx-1")
+
+    assert exc.value.status_code == 500
+    detail = cast(dict[str, str], exc.value.detail)
+    assert detail["code"] == SandboxErrorCodes.K8S_API_ERROR
+    assert "pod-1" in detail["message"]
+    assert api_exc.body in detail["message"]
+
+
 def test_get_sandbox_inspect_formats_runtime_statuses_and_resources() -> None:
     running_status = _status(running=SimpleNamespace(started_at="2026-01-01T00:00:01Z"))
     waiting_status = _status(waiting=SimpleNamespace(reason="ImagePullBackOff", message="pull failed"))
