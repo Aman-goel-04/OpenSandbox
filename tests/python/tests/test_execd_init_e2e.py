@@ -344,7 +344,11 @@ class TestExecdInitE2E:
         # end with the entrypoint's status. The entrypoint traps TERM, writes
         # a marker, and exits 7 — the sandbox must report "exited with code 7"
         # and the marker must be present, proving the workload saw the signal.
-        marker = "/tmp/runtime-stop-mark-$OPENSANDBOX_ID.txt"
+        # Fixed path (not $OPENSANDBOX_ID): docker cp runs on the host where
+        # the variable is not expanded — a literal $... path would not match
+        # the file the container-side shell created. Each container has its
+        # own layer, so a fixed path cannot collide.
+        marker = "/tmp/runtime-stop-marker.txt"
         sbx = _create_sandbox(
             entrypoint=[
                 "sh",
