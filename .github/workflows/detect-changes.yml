@@ -89,7 +89,8 @@ jobs:
               execd: (path) =>
                 workflowChanged(path, "execd-test.yml") ||
                 path.startsWith("components/execd/") ||
-                path.startsWith("components/internal/"),
+                path.startsWith("components/internal/") ||
+                path === "scripts/execd-ebpf-smoke.sh",
               nodeagent: (path) =>
                 workflowChanged(path, "nodeagent-test.yml") ||
                 path.startsWith("components/nodeagent/") ||
