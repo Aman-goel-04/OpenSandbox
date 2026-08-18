@@ -92,6 +92,38 @@ def test_diagnostics_logs_reports_and_applies_line_limit(
     assert response.json()["truncated"] is True
 
 
+def test_diagnostics_logs_with_scope_ignores_legacy_container_selector(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+) -> None:
+    containers: list[str | None] = []
+
+    class StubService:
+        @staticmethod
+        def get_sandbox_logs(
+            sandbox_id: str,
+            tail: int,
+            since: str | None = None,
+            container: str | None = None,
+        ) -> str:
+            containers.append(container)
+            return "sandbox logs"
+
+    monkeypatch.setattr(devops, "sandbox_service", StubService())
+
+    for scope in ("container", "all"):
+        response = client.get(
+            f"/v1/sandboxes/sbx-001/diagnostics/logs?scope={scope}&container=egress",
+            headers=auth_headers,
+        )
+
+        assert response.status_code == 200
+        assert response.json()["scope"] == scope
+
+    assert containers == [None, None]
+
+
 def test_diagnostics_logs_rejects_unsupported_scope(
     client: TestClient,
     auth_headers: dict,

@@ -145,7 +145,7 @@ def get_sandbox_logs(
         if normalized_scope not in _SUPPORTED_LOG_SCOPES:
             return _unsupported_scope_response("logs", scope, _SUPPORTED_LOG_SCOPES)
         text = sandbox_service.get_sandbox_logs(
-            sandbox_id, tail=tail + 1, since=since, container=container
+            sandbox_id, tail=tail + 1, since=since, container=None
         )
         text, truncated = _limit_diagnostic_lines(text, tail, keep_tail=True)
         warnings = None
