@@ -86,9 +86,9 @@ Important properties of the diagnostics commands:
 
 - `diagnostics events` and `diagnostics logs` are stable API-backed commands
 - `--scope` is required for stable diagnostics; requests without scope use deprecated plain-text DevOps behavior
-- if the server returns `DIAGNOSTICS_NOT_IMPLEMENTED`, state that stable diagnostics are unavailable on this server and stop diagnostics collection
-- use known supported scopes first: `events:lifecycle`, `events:runtime`, `logs:lifecycle`, and `logs:container`
-- `--scope all` is useful when the server supports aggregate diagnostics; if it is empty, retry concrete supported scopes
+- older server builds may return `DIAGNOSTICS_NOT_IMPLEMENTED`; state that stable diagnostics are unavailable on that server and stop diagnostics collection
+- use built-in server scopes first: `events:lifecycle`, `events:runtime`, `events:all`, `logs:container`, and `logs:all`
+- best-effort scopes may include `warnings` when the backend contributes only a subset or maps the request to runtime events; preserve those warnings in the evidence
 - other scopes such as `network` or `process` are server-defined and may be empty on some deployments
 - `-o raw` prints inline diagnostic text directly, or a content URL when the server returns URL delivery
 - `-o json` / `-o yaml` prints the CLI descriptor including `delivery`, `content_url`, `expires_at`, `truncated`, and `warnings`
@@ -98,8 +98,8 @@ Use:
 
 - `osb diagnostics events <sandbox-id> --scope lifecycle -o raw` for sandbox actions such as `CREATE`, `RENEW`, `DELETE`, `PAUSE`, `RESUME`, and `FORK`
 - `osb diagnostics events <sandbox-id> --scope runtime -o raw` for scheduler and container events such as `Scheduled`, `Pulling`, `Pulled`, `Created`, `Started`, and `ContainerDied`
-- `osb diagnostics logs <sandbox-id> --scope lifecycle -o raw` for manager server logs related to create, renew, delete, callbacks, request IDs, and server-side failures
 - `osb diagnostics logs <sandbox-id> --scope container -o raw` for sandbox main-process stdout, including application errors, missing binaries, bad entrypoints, startup hangs, and health-check failures
+- `osb diagnostics logs <sandbox-id> --scope all -o raw` for the best-effort aggregate available from the server; check `warnings` before treating it as complete
 
 ## Evidence Semantics
 

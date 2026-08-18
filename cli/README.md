@@ -266,18 +266,19 @@ Use the stable diagnostics commands for API-backed log and event descriptors.
 osb diagnostics events <sandbox-id> --scope lifecycle -o raw
 osb diagnostics events <sandbox-id> --scope runtime -o raw
 osb diagnostics logs <sandbox-id> --scope container -o raw
-osb diagnostics logs <sandbox-id> --scope lifecycle -o json
+osb diagnostics logs <sandbox-id> --scope all -o json
 osb diagnostics events <sandbox-id> --scope runtime -o json
 osb diagnostics logs <sandbox-id> --scope container -o yaml
 ```
 
-`--scope` is required for stable diagnostics. Common scopes are `lifecycle` and
-`container` for logs, and `lifecycle` and `runtime` for events. Raw output
-prints inline diagnostic text, or the content URL when diagnostics are
-delivered as a temporary URL. Structured CLI output follows the SDK/Python field
-style, for example `content_url`, `content_length`, and `expires_at`.
-Some server builds may return `DIAGNOSTICS_NOT_IMPLEMENTED` for scoped
-diagnostics until the stable backend implementation is enabled.
+`--scope` is required for stable diagnostics. The built-in server supports
+`container` and `all` for logs, and `runtime`, `lifecycle`, and `all` for events.
+Best-effort scopes may include a `warnings` field when the backend can only
+provide a subset or maps the request to runtime events. Raw output prints inline
+diagnostic text, or the content URL when diagnostics are delivered as a
+temporary URL. Structured CLI output follows the SDK/Python field style, for
+example `content_url`, `content_length`, and `expires_at`. Older server builds
+may still return `DIAGNOSTICS_NOT_IMPLEMENTED` for scoped diagnostics.
 
 Legacy DevOps diagnostics remain experimental. Prefer `osb diagnostics logs/events`
 for stable API-backed log and event collection.

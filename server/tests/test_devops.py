@@ -17,11 +17,13 @@ from fastapi.testclient import TestClient
 from opensandbox_server.api import devops
 
 
-def test_diagnostics_logs_with_scope_returns_not_implemented(
+def test_diagnostics_logs_with_scope_returns_stable_inline_descriptor(
     client: TestClient,
     auth_headers: dict,
     monkeypatch,
 ) -> None:
+    content = "sandbox log: 测试"
+
     class StubService:
         @staticmethod
         def get_sandbox_logs(
@@ -30,7 +32,11 @@ def test_diagnostics_logs_with_scope_returns_not_implemented(
             since: str | None = None,
             container: str | None = None,
         ) -> str:
-            raise AssertionError("stable diagnostics requests must not call legacy logs")
+            assert sandbox_id == "sbx-001"
+            assert tail == 100
+            assert since is None
+            assert container is None
+            return content
 
     monkeypatch.setattr(devops, "sandbox_service", StubService())
 
@@ -39,9 +45,67 @@ def test_diagnostics_logs_with_scope_returns_not_implemented(
         headers=auth_headers,
     )
 
-    assert response.status_code == 501
+    assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/json")
-    assert response.json()["code"] == "DIAGNOSTICS_NOT_IMPLEMENTED"
+    assert response.json() == {
+        "sandboxId": "sbx-001",
+        "kind": "logs",
+        "scope": "container",
+        "delivery": "inline",
+        "contentType": "text/plain; charset=utf-8",
+        "content": content,
+        "contentLength": len(content.encode("utf-8")),
+        "truncated": False,
+    }
+
+
+def test_diagnostics_logs_rejects_unsupported_scope(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+) -> None:
+    class StubService:
+        @staticmethod
+        def get_sandbox_logs(*args, **kwargs) -> str:
+            raise AssertionError("unsupported scope must not query the backend")
+
+    monkeypatch.setattr(devops, "sandbox_service", StubService())
+
+    response = client.get(
+        "/v1/sandboxes/sbx-001/diagnostics/logs?scope=lifecycle",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "code": "DIAGNOSTICS_SCOPE_UNSUPPORTED",
+        "message": (
+            "Unsupported logs diagnostics scope 'lifecycle'. Supported scopes: container, all."
+        ),
+    }
+
+
+def test_diagnostics_logs_all_scope_discloses_backend_limit(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+) -> None:
+    class StubService:
+        @staticmethod
+        def get_sandbox_logs(*args, **kwargs) -> str:
+            return "container logs only"
+
+    monkeypatch.setattr(devops, "sandbox_service", StubService())
+
+    response = client.get(
+        "/v1/sandboxes/sbx-001/diagnostics/logs?scope=all",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["warnings"] == [
+        "The current backend only contributes sandbox container logs to the all scope."
+    ]
 
 
 def test_diagnostics_logs_without_scope_preserves_deprecated_plain_text(
@@ -106,7 +170,7 @@ def test_diagnostics_logs_forwards_container_query_to_service(
     assert captured == {"container": "egress"}
 
 
-def test_diagnostics_events_with_scope_returns_not_implemented(
+def test_diagnostics_events_with_scope_returns_stable_inline_descriptor(
     client: TestClient,
     auth_headers: dict,
     monkeypatch,
@@ -114,18 +178,98 @@ def test_diagnostics_events_with_scope_returns_not_implemented(
     class StubService:
         @staticmethod
         def get_sandbox_events(sandbox_id: str, limit: int) -> str:
-            raise AssertionError("stable diagnostics requests must not call legacy events")
+            assert sandbox_id == "sbx-001"
+            assert limit == 50
+            return "runtime event"
 
     monkeypatch.setattr(devops, "sandbox_service", StubService())
 
     response = client.get(
-        "/v1/sandboxes/sbx-001/diagnostics/events?scope=runtime",
+        "/v1/sandboxes/sbx-001/diagnostics/events?scope=RUNTIME",
         headers=auth_headers,
     )
 
-    assert response.status_code == 501
+    assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/json")
-    assert response.json()["code"] == "DIAGNOSTICS_NOT_IMPLEMENTED"
+    assert response.json() == {
+        "sandboxId": "sbx-001",
+        "kind": "events",
+        "scope": "runtime",
+        "delivery": "inline",
+        "contentType": "text/plain; charset=utf-8",
+        "content": "runtime event",
+        "contentLength": 13,
+        "truncated": False,
+    }
+
+
+def test_diagnostics_events_lifecycle_scope_discloses_runtime_mapping(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+) -> None:
+    class StubService:
+        @staticmethod
+        def get_sandbox_events(*args, **kwargs) -> str:
+            return "runtime event"
+
+    monkeypatch.setattr(devops, "sandbox_service", StubService())
+
+    response = client.get(
+        "/v1/sandboxes/sbx-001/diagnostics/events?scope=lifecycle",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["warnings"] == [
+        "The current backend maps lifecycle diagnostics to runtime events."
+    ]
+
+
+def test_diagnostics_events_rejects_unsupported_scope(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+) -> None:
+    class StubService:
+        @staticmethod
+        def get_sandbox_events(*args, **kwargs) -> str:
+            raise AssertionError("unsupported scope must not query the backend")
+
+    monkeypatch.setattr(devops, "sandbox_service", StubService())
+
+    response = client.get(
+        "/v1/sandboxes/sbx-001/diagnostics/events?scope=network",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "DIAGNOSTICS_SCOPE_UNSUPPORTED"
+
+
+def test_diagnostics_events_without_scope_preserves_deprecated_plain_text(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+) -> None:
+    class StubService:
+        @staticmethod
+        def get_sandbox_events(sandbox_id: str, limit: int) -> str:
+            assert sandbox_id == "sbx-001"
+            assert limit == 10
+            return "legacy events"
+
+    monkeypatch.setattr(devops, "sandbox_service", StubService())
+
+    response = client.get(
+        "/v1/sandboxes/sbx-001/diagnostics/events?limit=10",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    assert response.headers["deprecation"] == "true"
+    assert response.text == "legacy events"
 
 
 def test_diagnostics_summary_redacts_unexpected_exception_details(

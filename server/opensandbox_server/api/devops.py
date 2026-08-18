@@ -15,10 +15,9 @@
 """
 API routes for OpenSandbox DevOps diagnostics.
 
-Requests that include `scope` target the stable Diagnostics API. The open-source
-server has not implemented that API yet, so these requests return a uniform
-not-implemented error. Requests without `scope` preserve the deprecated DevOps
-plain-text behavior for legacy humans, agents, and CLI clients.
+Requests that include ``scope`` target the stable Diagnostics API and return an
+inline JSON descriptor. Requests without ``scope`` preserve the deprecated
+DevOps plain-text behavior for legacy humans, agents, and CLI clients.
 """
 
 import logging
@@ -32,13 +31,47 @@ from opensandbox_server.api.lifecycle import sandbox_service
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["DevOps"])
 
+_SUPPORTED_LOG_SCOPES = ("container", "all")
+_SUPPORTED_EVENT_SCOPES = ("runtime", "lifecycle", "all")
 
-def _diagnostics_not_implemented_response() -> JSONResponse:
+
+def _diagnostic_inline_response(
+    sandbox_id: str,
+    kind: str,
+    scope: str,
+    content: str,
+    warnings: list[str] | None = None,
+) -> JSONResponse:
+    """Build a Diagnostics API descriptor for inline plain-text content."""
+    payload: dict[str, object] = {
+        "sandboxId": sandbox_id,
+        "kind": kind,
+        "scope": scope,
+        "delivery": "inline",
+        "contentType": "text/plain; charset=utf-8",
+        "content": content,
+        "contentLength": len(content.encode("utf-8")),
+        "truncated": False,
+    }
+    if warnings:
+        payload["warnings"] = warnings
+    return JSONResponse(status_code=status.HTTP_200_OK, content=payload)
+
+
+def _unsupported_scope_response(
+    kind: str,
+    scope: str,
+    supported: tuple[str, ...],
+) -> JSONResponse:
+    """Return a stable error for a scope the current backend cannot provide."""
     return JSONResponse(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        status_code=status.HTTP_400_BAD_REQUEST,
         content={
-            "code": "DIAGNOSTICS_NOT_IMPLEMENTED",
-            "message": "The stable Diagnostics API is not implemented by this OpenSandbox server.",
+            "code": "DIAGNOSTICS_SCOPE_UNSUPPORTED",
+            "message": (
+                f"Unsupported {kind} diagnostics scope {scope!r}. "
+                f"Supported scopes: {', '.join(supported)}."
+            ),
         },
     )
 
@@ -56,13 +89,10 @@ def _deprecated_plain_text_response(content: str) -> PlainTextResponse:
     status_code=status.HTTP_200_OK,
     responses={
         200: {
-            "description": "Deprecated plain-text logs when scope is omitted",
-            "content": {"text/plain": {}},
+            "description": "Stable JSON descriptor, or deprecated text when scope is omitted",
+            "content": {"application/json": {}, "text/plain": {}},
         },
-        501: {
-            "description": "Stable Diagnostics API is not implemented by this server",
-            "content": {"application/json": {}},
-        },
+        400: {"description": "Unsupported diagnostics scope"},
         404: {"description": "Sandbox not found"},
     },
 )
@@ -96,10 +126,25 @@ def get_sandbox_logs(
 ) -> JSONResponse | PlainTextResponse:
     """Retrieve diagnostic logs for a sandbox."""
     if scope is not None:
-        return _diagnostics_not_implemented_response()
-    text = sandbox_service.get_sandbox_logs(
-        sandbox_id, tail=tail, since=since, container=container
-    )
+        normalized_scope = scope.strip().lower()
+        if normalized_scope not in _SUPPORTED_LOG_SCOPES:
+            return _unsupported_scope_response("logs", scope, _SUPPORTED_LOG_SCOPES)
+        text = sandbox_service.get_sandbox_logs(
+            sandbox_id, tail=tail, since=since, container=container
+        )
+        warnings = None
+        if normalized_scope == "all":
+            warnings = [
+                "The current backend only contributes sandbox container logs to the all scope."
+            ]
+        return _diagnostic_inline_response(
+            sandbox_id,
+            "logs",
+            normalized_scope,
+            text,
+            warnings=warnings,
+        )
+    text = sandbox_service.get_sandbox_logs(sandbox_id, tail=tail, since=since, container=container)
     return _deprecated_plain_text_response(text)
 
 
@@ -125,13 +170,10 @@ def get_sandbox_inspect(sandbox_id: str) -> PlainTextResponse:
     status_code=status.HTTP_200_OK,
     responses={
         200: {
-            "description": "Deprecated plain-text events when scope is omitted",
-            "content": {"text/plain": {}},
+            "description": "Stable JSON descriptor, or deprecated text when scope is omitted",
+            "content": {"application/json": {}, "text/plain": {}},
         },
-        501: {
-            "description": "Stable Diagnostics API is not implemented by this server",
-            "content": {"application/json": {}},
-        },
+        400: {"description": "Unsupported diagnostics scope"},
         404: {"description": "Sandbox not found"},
     },
 )
@@ -151,7 +193,22 @@ def get_sandbox_events(
 ) -> JSONResponse | PlainTextResponse:
     """Retrieve diagnostic events for a sandbox."""
     if scope is not None:
-        return _diagnostics_not_implemented_response()
+        normalized_scope = scope.strip().lower()
+        if normalized_scope not in _SUPPORTED_EVENT_SCOPES:
+            return _unsupported_scope_response("events", scope, _SUPPORTED_EVENT_SCOPES)
+        text = sandbox_service.get_sandbox_events(sandbox_id, limit=limit)
+        warnings = None
+        if normalized_scope != "runtime":
+            warnings = [
+                f"The current backend maps {normalized_scope} diagnostics to runtime events."
+            ]
+        return _diagnostic_inline_response(
+            sandbox_id,
+            "events",
+            normalized_scope,
+            text,
+            warnings=warnings,
+        )
     text = sandbox_service.get_sandbox_events(sandbox_id, limit=limit)
     return _deprecated_plain_text_response(text)
 
