@@ -38,11 +38,13 @@ status: implementing
 
 > Updated 2026-08-18. Status: **implementing** — the phased rollout below is
 > implemented on branch `feat/execd-init-mode` (Phases 1–5 plus the server
-> switch); remaining items are the trusted stop channel (§3), kernel-5.10
-> empirical validation, the eBPF audit e2e, and the default-on rollout (see
-> the Remaining work table below). R-i (server-path hardening e2e, docker
-> bridge) landed in PR #1554; R-q (custom seccomp/caps e2e) and R-s
-> (EXECD_INIT drift pin) landed in the hardening e2e.
+> switch); remaining items are kernel-5.10 empirical validation (smoke
+> script ready), the eBPF audit e2e, and the default-on rollout (see
+> the Remaining work table below). R-a (trusted stop channel) declined
+> 2026-08-18 — the `kill 1` SIGTERM contract is kept as-is. R-i
+> (server-path hardening e2e, docker bridge) landed in PR #1554; R-q
+> (custom seccomp/caps e2e) and R-s (EXECD_INIT drift pin) landed in the
+> hardening e2e.
 
 | Phase | Scope | Status |
 |---|---|---|
@@ -77,7 +79,7 @@ status: implementing
 
 | # | Item | Status / plan |
 |---|---|---|
-| R-a | Trusted out-of-band stop channel (§3, R2) | **Open — biggest remaining item, separate PR.** Any SIGTERM (incl. in-namespace `kill 1`) still stops the sandbox (same as pre-OSEP behavior); `kill -9 1` is inert. Target: authenticated channel unreachable from the workload; then point the K8s Restart recycle at it instead of `kill 1` (`restart_default.go`; current SIGTERM semantics confirmed compatible, comment added) |
+| R-a | Trusted out-of-band stop channel (§3, R2) | **Declined follow-up.** Decision (2026-08-18): keep the current `kill 1` SIGTERM contract — in-namespace SIGTERM stops the sandbox exactly as in the pre-OSEP era (accepted exposure; no regression), and `kill -9 1` stays inert via the PID 1 signal shield, which is the property R2 is really about. No stop endpoint, no credential channel: the K8s Restart recycle keeps `DefaultRestartCommand = ["kill", "1"]` (`restart_default.go` comment stays accurate under the kept semantics). External (out-of-namespace) runtime SIGTERM still forwards to the entrypoint for graceful shutdown (§2/Open question 2). R2 is downgraded from a must-have to a documented non-goal for this revision |
 | R-b | Pool pod-level PID 1 | **Declined follow-up.** Pool sandboxes run execd as task-level subreaper (Phase 5): the per-child floor holds without PID 1; the lost signal shield is no regression (pool exposure equals the pre-OSEP era; task-executor owns pod reaping). Operators wanting full PID 1 configure the Pool template command manually (`bootstrap.sh` + keepalive + `EXECD_INIT=1`); server auto-injection out of scope |
 | R-c | Kernel-5.10 eBPF empirical validation | Open. The 5.10–5.15 exec-hook fallback (inline `filename[1024]`, `__data_loc` argv) is derived from the tracepoint definition, not boot-tested; worst case the hook degrades (fail-open). Needs a real 5.10 node with BTF + `CAP_BPF` |
 | R-d | Cross-language SDK e2e | **Declined follow-up.** Python covers the init-mode/hardening surface (docker-bridge + k8s nightly: PID 1, reaping, kill-9 inert, `/proc/1/environ` denial, capabilities endpoint). The execd-init surface is server-config-driven, so a passing Python suite exercises the same server → sandbox → execd path every SDK talks to; the remaining per-language value (SDK transport of the `hardening` model) is low. Cancel cross-language init-mode e2e |

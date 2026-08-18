@@ -225,11 +225,11 @@ class TestExecdInitE2E:
             _destroy(sbx)
 
     def test_in_namespace_sigterm_kill1_stops_sandbox(self, kill1_sandbox) -> None:
-        # Interim-behavior pin (OSEP-0018 §3, R-a): today an in-namespace
-        # `kill 1` SIGTERM reaches execd's forwarding loop and stops the
-        # sandbox, matching the pre-OSEP bootstrap behavior. Once the trusted
-        # out-of-band stop channel lands, execd must ignore in-namespace
-        # SIGTERM and this test flips to asserting the sandbox stays Running.
+        # Behavior pin (OSEP-0018 §3, R-a): an in-namespace `kill 1` SIGTERM
+        # reaches execd's forwarding loop and stops the sandbox, matching the
+        # pre-OSEP bootstrap behavior. The trusted out-of-band stop channel
+        # was declined (2026-08-18): this SIGTERM contract is kept as-is, and
+        # `kill -9 1` stays inert via the PID 1 signal shield.
         try:
             kill1_sandbox.commands.run(
                 "kill 1; sleep 5; echo alive", opts=RunCommandOpts()
