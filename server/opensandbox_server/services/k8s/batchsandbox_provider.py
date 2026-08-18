@@ -61,6 +61,26 @@ from opensandbox_server.services.runtime_resolver import SecureRuntimeResolver
 logger = logging.getLogger(__name__)
 
 
+def _merge_security_context(
+    template_sc: Dict[str, Any], runtime_sc: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Merge the template's container securityContext into the runtime one.
+
+    Nested dicts (capabilities, seccompProfile, ...) merge recursively so a
+    template member on one key (e.g. capabilities.add) survives even when the
+    runtime populates another key of the same field (e.g. capabilities.drop from
+    network-policy wiring). On actual conflicting leaves, the runtime value wins.
+    """
+    merged = dict(template_sc)
+    for key, runtime_value in runtime_sc.items():
+        template_value = merged.get(key)
+        if isinstance(runtime_value, dict) and isinstance(template_value, dict):
+            merged[key] = _merge_security_context(template_value, runtime_value)
+        else:
+            merged[key] = runtime_value
+    return merged
+
+
 class BatchSandboxProvider(WorkloadProvider):
     """Workload provider for BatchSandbox CRDs."""
     
@@ -488,14 +508,15 @@ class BatchSandboxProvider(WorkloadProvider):
             return
         main_container = containers[0]
         if extra_security_context and isinstance(main_container, dict):
-            # The template's container securityContext is a base default: supplement
-            # the runtime container's own securityContext key-by-key (e.g. the
-            # capabilities set by network-policy/isolation wiring win) instead of
-            # replacing it, and fill the whole context when the runtime sets none.
+            # The template's container securityContext is a base default: merge it
+            # into the runtime container's own securityContext (runtime leaves win,
+            # nested dicts merge so template members like capabilities.add survive),
+            # and fill the whole context when the runtime sets none.
             runtime_security_context = main_container.get("securityContext")
             if isinstance(runtime_security_context, dict):
-                for key, value in extra_security_context.items():
-                    runtime_security_context.setdefault(key, value)
+                main_container["securityContext"] = _merge_security_context(
+                    extra_security_context, runtime_security_context
+                )
             else:
                 main_container["securityContext"] = extra_security_context
         mounts = main_container.get("volumeMounts", []) or []
