@@ -126,7 +126,7 @@ done
 }
 
 echo "== hardening/ebpf report =="
-python3 - "${WORKDIR}/caps.json" <<'PY' || exit 1
+python3 - "${WORKDIR}/caps.json" <<'PY'
 import json, sys
 caps = json.load(open(sys.argv[1]))
 ebpf = (caps.get("hardening") or {}).get("ebpf") or {}
@@ -137,12 +137,25 @@ if message:
     print(f"ebpf message: {message}")
 # Fail-open: "degraded/unsupported" still boots execd, but no hooks attached
 # — nothing will be written. The smoke must see active. A per-hook degrade
-# (e.g. the commit_creds kprobe CO-RE load failing on a 5.10 kernel) keeps
-# the state active and reports the missing hooks in the message; the audit
-# assertions below then still require exec+connect events.
+# (e.g. the commit_creds kprobe failing on a given kernel) keeps the state
+# active and reports the missing hooks in the message; the audit assertions
+# below then still require exec+connect events.
 if state != "active":
-    sys.exit(f"FAIL: ebpf state = {state}, want active (hooks did not attach)")
+    print(f"FAIL: ebpf state = {state}, want active (hooks did not attach)", file=sys.stderr)
+    sys.exit(1)
+if "hooks not active" in message:
+    # Partial hook degrade: keep the smoke running (exec+connect must still
+    # flow), but flag the container-log dump below.
+    sys.exit(2)
 PY
+report_rc=$?
+if [ "${report_rc}" -eq 1 ]; then
+  exit 1
+fi
+if [ "${report_rc}" -eq 2 ]; then
+  echo "NOTE: hooks degraded — dumping container logs for the load/attach error"
+  docker logs "${CTR_NAME}" 2>&1 | grep -E "ebpf|hardening" | head -20 || true
+fi
 
 echo "== generating events inside the sandbox cgroup =="
 docker exec "${CTR_NAME}" sh -c '/bin/sleep 0.05; echo exec-event-ok >/dev/null' >/dev/null
