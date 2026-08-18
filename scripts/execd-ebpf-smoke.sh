@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# execd-ebpf bare-container smoke test (OSEP-0018 R-j, R-c).
+# execd-ebpf bare-container smoke test.
 #
 # Runs the execd-ebpf observation variant in a bare container on THIS
 # machine's kernel — no server, no SDK — generates exec / connect /

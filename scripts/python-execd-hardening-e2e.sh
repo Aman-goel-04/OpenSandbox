@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Runs the server-path hardening E2E (OSEP-0018, R-i) against a local
+# Runs the server-path hardening E2E (execd-as-init, OSEP-0018) against a local
 # Docker-bridge server with runtime.execd_run_as_init = true. The hardened
 # isolation TOML (hardening + landlock) is injected into every sandbox via
 # a config-level bind mount + EXECD_ISOLATION_CONFIG, so the whole

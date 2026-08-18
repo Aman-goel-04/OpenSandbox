@@ -14,7 +14,7 @@
 # limitations under the License.
 #
 """
-E2E tests for the server-path hardening floor (OSEP-0018 R-i).
+E2E tests for the server-path hardening floor (execd-as-init, OSEP-0018).
 
 Requires a server running with ``runtime.execd_run_as_init = true``. Docker
 bridge (scripts/python-execd-hardening-e2e.sh) injects the hardened TOML via
@@ -57,21 +57,24 @@ OPENSANDBOX_HARDENING_DEGRADATION=true):
   NOT trimmed (fail-open: workloads keep the container ceiling's bounding
   set)
 
-A third class covers bwrap isolated sessions under init mode + the floor
-(OSEP-0018 R-o): sessions run with the bwrap namespace + seccomp/NNP floor
-and the credential env strip, and the hardening report stays intact around
+A third class covers bwrap isolated sessions under init mode + the floor:
+sessions run with the bwrap namespace + seccomp/NNP floor and the
+credential env strip, and the hardening report stays intact around
 session create/run/delete.
 
-A fourth class (R-q) runs a custom-policy TOML variant
+A fourth class runs a custom-policy TOML variant
 (configs/isolation.custom.toml): a `[seccomp] deny` override (chmod family,
 which REPLACES the built-in denylist) + `keep_capabilities=["CAP_NET_RAW"]`.
 It asserts the denied syscall fails with EACCES in /command while the kept
 capability is raised in the ambient set and survives execve (CapEff=0x2000).
 
-A fifth class (R-s) pins the EXECD_INIT <-> TOML drift state: the hardened
+A fifth class pins the EXECD_INIT <-> TOML drift state: the hardened
 TOML with `runtime.execd_run_as_init = false` must report init_mode=none and
 degrade the enabled layers (with EXECD_INIT guidance), while execd-spawned
 /command still runs through the floor.
+
+A sixth class pins the default-off state: with no isolation TOML and no
+EXECD_INIT, every layer reports disabled and the workload is unaffected.
 """
 
 import logging
@@ -180,7 +183,7 @@ def _hardening_report(sandbox: SandboxSync, refresh: bool = False) -> HardeningS
     ``refresh=True`` forces a live probe (used where the assertion must
     observe the endpoint AFTER a state change, e.g. session teardown).
     Consuming ``IsolatedCapabilities.hardening`` also pins the spec -> SDK
-    -> implementation alignment of the hardening object (OSEP-0018 R-r)."""
+    -> implementation alignment of the hardening object."""
     if refresh or sandbox.id not in _HARDENING_REPORT:
         caps = sandbox.isolation.capabilities()
         if caps.hardening is None:
@@ -200,7 +203,7 @@ def _status_fields(sandbox: SandboxSync, fields: list[str]) -> dict:
 
     Two constraints: (1) the read happens with the shell's own read loop,
     NOT with forked helpers — under Landlock the ruleset only grants the
-    launcher's own /proc/<pid> (documented OSEP-0018 limitation), so a
+    launcher's own /proc/<pid> (a documented limitation), so a
     forked grep/cat would get EACCES on its own /proc/self; (2) execd's
     /command SSE output strips newlines, so the values must come out as a
     single line (space-separated key=value pairs).
@@ -269,7 +272,7 @@ class TestHardeningE2E:
         # reflects exactly the launcher-applied floor. The status is read
         # with the shell's own loop, NOT `cat`: under Landlock a forked
         # descendant resolves its own /proc/<pid>, which the inherited
-        # ruleset does not grant (documented OSEP-0018 limitation), so a
+        # ruleset does not grant (a documented limitation), so a
         # forked helper would get EACCES.
         sbx = _create_sandbox(
             entrypoint=[
@@ -367,7 +370,7 @@ class TestHardeningE2E:
             # k8s regression probe: confirm the PVC mount is really present
             # and executable. /proc must be read with the shell's own loop:
             # the Landlock /proc/self rule pins the launcher's pid, so forked
-            # helpers get EACCES on their own procfs (documented OSEP-0018
+            # helpers get EACCES on their own procfs (a documented
             # limitation).
             diag = _run_command(
                 sandbox,
@@ -432,7 +435,7 @@ class TestHardeningDegradationE2E:
 
 
 class TestHardeningCustomPolicyE2E:
-    """Custom `[seccomp] deny` override + `keep_capabilities` (OSEP-0018 R-q).
+    """Custom `[seccomp] deny` override + `keep_capabilities`.
 
     The sandbox runs with configs/isolation.custom.toml: hardening enabled,
     a `[seccomp] deny` override (chmod/fchmodat/fchmodat2 — REPLACES the
@@ -511,7 +514,7 @@ class TestHardeningCustomPolicyE2E:
     "false (the k8s e2e server runs with it on); docker-only",
 )
 class TestHardeningDriftE2E:
-    """EXECD_INIT <-> TOML drift pin (OSEP-0018 R-s).
+    """EXECD_INIT <-> TOML drift pin.
 
     `[hardening] enabled` with `runtime.execd_run_as_init = false`: the
     hardening endpoint must report init_mode=none and degrade the enabled
@@ -568,7 +571,7 @@ class TestHardeningDriftE2E:
     "execd_run_as_init = true and the hardened TOML); docker-only",
 )
 class TestHardeningDefaultOffE2E:
-    """Default-off pin (OSEP-0018 R-m).
+    """Default-off pin.
 
     With no isolation TOML and no EXECD_INIT, execd must be exactly the
     pre-OSEP binary: the capabilities endpoint reports init_mode=none with
@@ -612,8 +615,7 @@ class TestHardeningDefaultOffE2E:
 
 
 class TestIsolatedSessionHardeningE2E:
-    """bwrap isolated sessions under init mode + the hardening floor
-    (OSEP-0018 R-o).
+    """bwrap isolated sessions under init mode + the hardening floor.
 
     The sandbox runs with ``[hardening]``/``[landlock]`` enabled and execd as
     PID 1, so the whole server -> sandbox -> execd -> launcher -> bwrap chain

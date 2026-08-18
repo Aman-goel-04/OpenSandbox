@@ -27,11 +27,10 @@ container-level init contract through the SDK:
 - application signals (HUP/USR1/USR2/WINCH) are forwarded to the entrypoint
 - the entrypoint's exit code propagates to the container/runtime (docker
   bridge; on Kubernetes the test skips — BatchSandbox does not surface the
-  container exit code or a terminal lifecycle state, OSEP-0018 R-l)
-- an in-namespace ``kill 1`` (SIGTERM) still stops the sandbox — interim
-  behavior pin for OSEP-0018 §3 (R-a: trusted out-of-band stop channel);
-  on Kubernetes the pin asserts execd becomes unreachable instead of a
-  lifecycle state transition
+  container exit code or a terminal lifecycle state)
+- an in-namespace ``kill 1`` (SIGTERM) still stops the sandbox — behavior
+  pin for the trusted out-of-band stop channel; on Kubernetes the pin
+  asserts execd becomes unreachable instead of a lifecycle state transition
 - the workload cannot read execd's environment (``/proc/1/environ`` denied by
   non-dumpable, independent of Landlock)
 - ``GET /v1/isolated/capabilities`` reports ``hardening.init_mode = pid1``
@@ -194,16 +193,15 @@ class TestExecdInitE2E:
 
     def test_entrypoint_exit_code_propagates(self) -> None:
         # When the user entrypoint exits, execd exits with the same status so
-        # Docker/kubelet observe it (OSEP-0018 §2 "entrypoint owns the
-        # container lifecycle"). The sleep gives the sandbox time to become
-        # ready before the entrypoint exits.
+        # Docker/kubelet observe it ("entrypoint owns the container
+        # lifecycle"). The sleep gives the sandbox time to become ready
+        # before the entrypoint exits.
         if is_kubernetes_runtime():
             # BatchSandbox stays Pending after the pod completes and does not
-            # surface the container exit code (OSEP-0018 R-l): the lifecycle
-            # state-transition assertion below is docker-runtime-specific.
+            # surface the container exit code: the lifecycle state-transition
+            # assertion below is docker-runtime-specific.
             pytest.skip(
-                "BatchSandbox does not surface the container exit code "
-                "(OSEP-0018 R-l)"
+                "BatchSandbox does not surface the container exit code"
             )
         sbx = _create_sandbox(
             entrypoint=["sh", "-c", "sleep 20; exit 42"],
@@ -228,11 +226,11 @@ class TestExecdInitE2E:
             _destroy(sbx)
 
     def test_in_namespace_sigterm_kill1_stops_sandbox(self, kill1_sandbox) -> None:
-        # Behavior pin (OSEP-0018 §3, R-a): an in-namespace `kill 1` SIGTERM
-        # reaches execd's forwarding loop and stops the sandbox, matching the
-        # pre-OSEP bootstrap behavior. The trusted out-of-band stop channel
-        # was declined (2026-08-18): this SIGTERM contract is kept as-is, and
-        # `kill -9 1` stays inert via the PID 1 signal shield.
+        # Behavior pin: an in-namespace `kill 1` SIGTERM reaches execd's
+        # forwarding loop and stops the sandbox, matching the pre-OSEP
+        # bootstrap behavior. The trusted out-of-band stop channel was
+        # declined: this SIGTERM contract is kept as-is, and `kill -9 1`
+        # stays inert via the PID 1 signal shield.
         try:
             kill1_sandbox.commands.run(
                 "kill 1; sleep 5; echo alive", opts=RunCommandOpts()
@@ -254,8 +252,8 @@ class TestExecdInitE2E:
     def _assert_execd_unreachable(self, kill1_sandbox) -> None:
         """k8s leg of the kill-1 pin: the pod exits after ``kill 1`` but
         BatchSandbox stays Pending (it never transitions to a terminal
-        lifecycle state — OSEP-0018 R-l), so assert the observable effect
-        instead: execd is gone and the sandbox is unusable.
+        lifecycle state), so assert the observable effect instead: execd is
+        gone and the sandbox is unusable.
         """
         deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
@@ -289,11 +287,10 @@ class TestExecdInitE2E:
         assert total <= baseline + 10, f"process table grew: {baseline} -> {total}"
 
     def test_sustained_fork_heavy_mix_keeps_process_table_bounded(self, sandbox) -> None:
-        # OSEP-0018 §Test-Plan shape: a long-running mix of /command churn
-        # interleaved with background sleepers, sustained over ~30s, must
-        # keep the process table bounded and zombie-free throughout. This
-        # closes the R-m gap (the short 20x5 loop above is the minimal
-        # form; this is the sustained variant).
+        # Long-running mix of /command churn interleaved with background
+        # sleepers, sustained over ~30s, must keep the process table bounded
+        # and zombie-free throughout. This closes the gap left by the short
+        # 20x5 loop above (the minimal form; this is the sustained variant).
         baseline = _process_count(sandbox)
         deadline = time.monotonic() + 30
         round_n = 0
@@ -335,14 +332,13 @@ class TestExecdInitE2E:
     @pytest.mark.skipif(
         is_kubernetes_runtime(),
         reason="runtime-initiated container stop (docker stop) is a docker-bridge "
-        "scenario (OSEP-0018 R-u); the k8s path does not surface the container "
-        "exit code",
+        "scenario; the k8s path does not surface the container exit code",
     )
     def test_runtime_stop_forwards_sigterm_and_propagates_exit_code(self) -> None:
-        # OSEP-0018 R-u: when the RUNTIME stops the container (docker stop),
-        # execd must forward SIGTERM to the entrypoint and the sandbox must
-        # end with the entrypoint's status. The entrypoint traps TERM, writes
-        # a marker, and exits 7 — the sandbox must report "exited with code 7"
+        # When the RUNTIME stops the container (docker stop), execd must
+        # forward SIGTERM to the entrypoint and the sandbox must end with
+        # the entrypoint's status. The entrypoint traps TERM, writes a
+        # marker, and exits 7 — the sandbox must report "exited with code 7"
         # and the marker must be present, proving the workload saw the signal.
         # Fixed path (not $OPENSANDBOX_ID): docker cp runs on the host where
         # the variable is not expanded — a literal $... path would not match

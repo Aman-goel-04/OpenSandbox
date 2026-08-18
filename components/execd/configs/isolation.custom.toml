@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Custom-policy hardening configuration for the execd-as-init e2e (OSEP-0018,
-# R-q): a [seccomp] deny override (which REPLACES the built-in denylist) plus
+# Custom-policy hardening configuration for the execd-as-init e2e: a
+# [seccomp] deny override (which REPLACES the built-in denylist) plus
 # keep_capabilities. Proves both overrides reach the workload:
 #   - the denied syscall family (chmod/fchmodat/fchmodat2; glibc coreutils
 #     chmod uses fchmodat, busybox uses chmod) fails with EACCES in /command

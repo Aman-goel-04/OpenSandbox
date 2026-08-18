@@ -14,7 +14,7 @@
 # limitations under the License.
 #
 """
-K8s Restart-recycle e2e against an init-mode execd pod (OSEP-0018 R-l(b)).
+K8s Restart-recycle e2e against an init-mode execd pod (OSEP-0018).
 
 Verifies the ``restart_default.go`` "contract compatible" claim end to end:
 a Pool whose pod template runs execd as PID 1 (``bootstrap.sh`` +
