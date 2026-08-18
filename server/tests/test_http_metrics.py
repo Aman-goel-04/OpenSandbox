@@ -112,6 +112,20 @@ def test_record_http_request_duration_uses_low_cardinality_attributes() -> None:
     )
 
 
+def test_record_http_request_duration_bounds_unknown_methods() -> None:
+    histogram = MagicMock()
+
+    with patch.object(otel_metrics, "_http_request_duration_histogram", histogram):
+        otel_metrics.record_http_request_duration(
+            duration_ms=12.5,
+            method="BREW-sandbox-123",
+            route="/sandboxes/{sandbox_id}",
+            status_code=200,
+        )
+
+    assert histogram.record.call_args.kwargs["attributes"]["http_method"] == "OTHER"
+
+
 def test_http_request_histogram_is_collectable() -> None:
     reader = InMemoryMetricReader()
     provider = MeterProvider(metric_readers=[reader])

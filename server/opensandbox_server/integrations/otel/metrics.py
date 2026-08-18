@@ -51,6 +51,9 @@ _HTTP_REQUEST_DURATION_UNIT = "ms"
 _HTTP_REQUEST_DURATION_DESCRIPTION = (
     "Server HTTP request duration by method, route template, and status code"
 )
+_HTTP_REQUEST_METHODS = frozenset(
+    {"CONNECT", "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "TRACE"}
+)
 _HTTP_REQUEST_DURATION_BOUNDARIES = (
     1.0,
     5.0,
@@ -216,11 +219,14 @@ def record_http_request_duration(
     hist = _http_request_duration_histogram
     if hist is None:
         return
+    normalized_method = method.upper()
+    if normalized_method not in _HTTP_REQUEST_METHODS:
+        normalized_method = "OTHER"
     try:
         hist.record(
             duration_ms,
             attributes={
-                "http_method": method or "unknown",
+                "http_method": normalized_method,
                 "http_route": route or "unknown",
                 "http_status_code": status_code,
             },

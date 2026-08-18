@@ -84,7 +84,9 @@ listener.
 HTTP metrics use matched route templates such as `/v1/sandboxes/{sandbox_id}`,
 not raw paths. Requests that do not reach a matched route, including early
 authentication failures, use `http_route=unknown`. Sandbox IDs, tenant IDs,
-API keys, bodies, and query strings are never metric attributes.
+API keys, bodies, and query strings are never metric attributes. Standard HTTP
+methods are recorded in uppercase, while extension methods use
+`http_method=OTHER` to keep attribute cardinality bounded.
 
 The HTTP histogram's sample count can be used for request rate, its status-code
 attribute for error rate, and its buckets for latency percentiles. See the

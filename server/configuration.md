@@ -321,7 +321,7 @@ Exported metrics:
 | `server.http.request.duration` | Histogram | `ms` | `http_method`, `http_route`, `http_status_code` | Server HTTP request latency. Histogram count provides request volume. |
 | `opensandbox.sandbox.create.duration` | Histogram | `ms` | `sdk.language`, `sdk.version`, `success` | SDK-reported creation latency from create start until ready or failure. |
 
-The HTTP metric uses the matched route template rather than the raw request path. Requests that do not reach a matched route, including early authentication failures and unmatched URLs, use `http_route=unknown`. It never includes sandbox IDs, tenant IDs, API keys, request or response bodies, query strings, or other unbounded request data.
+The HTTP metric uses the matched route template rather than the raw request path. Requests that do not reach a matched route, including early authentication failures and unmatched URLs, use `http_route=unknown`. Standard HTTP methods are recorded in uppercase, while extension methods use `http_method=OTHER` to keep attribute cardinality bounded. The metric never includes sandbox IDs, tenant IDs, API keys, request or response bodies, query strings, or other unbounded request data.
 
 ---
 
