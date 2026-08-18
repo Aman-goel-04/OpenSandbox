@@ -31,6 +31,16 @@ from opensandbox_server.services.constants import (
     SANDBOX_ID_LABEL,
     SandboxErrorCodes,
 )
+from opensandbox_server.services.diagnostics import (
+    DiagnosticResult,
+    limit_diagnostic_lines,
+    unsupported_scope_error,
+)
+
+_SUPPORTED_LOG_SCOPES = ("container", "all")
+_SUPPORTED_EVENT_SCOPES = ("runtime", "all")
+_STABLE_LOG_LINE_LIMIT = 100
+_STABLE_EVENT_LINE_LIMIT = 50
 
 #: Default container to pull logs from when the caller does not specify one.
 #: OSB-managed sandbox pods canonically run the user workload in a container
@@ -52,6 +62,72 @@ def _parse_since(since: str) -> int:
 
 class K8sDiagnosticsMixin:
     """Mixin that implements diagnostics methods for the Kubernetes backend."""
+
+    def get_sandbox_log_diagnostics(
+        self,
+        sandbox_id: str,
+        scope: str,
+    ) -> DiagnosticResult:
+        """Collect stable log diagnostics using Kubernetes capabilities."""
+        normalized_scope = scope.strip().lower()
+        if normalized_scope not in _SUPPORTED_LOG_SCOPES:
+            raise unsupported_scope_error("logs", scope, _SUPPORTED_LOG_SCOPES)
+
+        content = self.get_sandbox_logs(
+            sandbox_id,
+            tail=_STABLE_LOG_LINE_LIMIT + 1,
+            since=None,
+            container=None,
+        )
+        content, truncated = limit_diagnostic_lines(
+            content,
+            _STABLE_LOG_LINE_LIMIT,
+            keep_tail=True,
+        )
+        warnings: tuple[str, ...] = ()
+        if normalized_scope == "all":
+            warnings = (
+                "The current backend only contributes sandbox container logs to the all scope.",
+            )
+        return DiagnosticResult(
+            sandbox_id=sandbox_id,
+            kind="logs",
+            scope=normalized_scope,
+            content=content,
+            truncated=truncated,
+            warnings=warnings,
+        )
+
+    def get_sandbox_event_diagnostics(
+        self,
+        sandbox_id: str,
+        scope: str,
+    ) -> DiagnosticResult:
+        """Collect stable event diagnostics using Kubernetes capabilities."""
+        normalized_scope = scope.strip().lower()
+        if normalized_scope not in _SUPPORTED_EVENT_SCOPES:
+            raise unsupported_scope_error("events", scope, _SUPPORTED_EVENT_SCOPES)
+
+        content = self.get_sandbox_events(
+            sandbox_id,
+            limit=_STABLE_EVENT_LINE_LIMIT + 1,
+        )
+        content, truncated = limit_diagnostic_lines(
+            content,
+            _STABLE_EVENT_LINE_LIMIT,
+            keep_tail=False,
+        )
+        warnings: tuple[str, ...] = ()
+        if normalized_scope == "all":
+            warnings = ("The current backend only contributes runtime events to the all scope.",)
+        return DiagnosticResult(
+            sandbox_id=sandbox_id,
+            kind="events",
+            scope=normalized_scope,
+            content=content,
+            truncated=truncated,
+            warnings=warnings,
+        )
 
     def _find_pod_for_sandbox(self, sandbox_id: str):
         """Find the Pod associated with a sandbox ID via label selector."""

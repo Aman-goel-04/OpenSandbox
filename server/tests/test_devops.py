@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from opensandbox_server.api import devops
+from opensandbox_server.services.diagnostics import DiagnosticResult
 
 
 def test_diagnostics_logs_with_scope_returns_stable_inline_descriptor(
@@ -26,17 +28,18 @@ def test_diagnostics_logs_with_scope_returns_stable_inline_descriptor(
 
     class StubService:
         @staticmethod
-        def get_sandbox_logs(
+        def get_sandbox_log_diagnostics(
             sandbox_id: str,
-            tail: int,
-            since: str | None = None,
-            container: str | None = None,
-        ) -> str:
+            scope: str,
+        ) -> DiagnosticResult:
             assert sandbox_id == "sbx-001"
-            assert tail == 101
-            assert since is None
-            assert container is None
-            return content
+            assert scope == "container"
+            return DiagnosticResult(
+                sandbox_id=sandbox_id,
+                kind="logs",
+                scope=scope,
+                content=content,
+            )
 
     monkeypatch.setattr(devops, "sandbox_service", StubService())
 
@@ -59,7 +62,7 @@ def test_diagnostics_logs_with_scope_returns_stable_inline_descriptor(
     }
 
 
-def test_diagnostics_logs_reports_and_applies_line_limit(
+def test_diagnostics_logs_serializes_service_truncation_result(
     client: TestClient,
     auth_headers: dict,
     monkeypatch,
@@ -68,17 +71,19 @@ def test_diagnostics_logs_reports_and_applies_line_limit(
 
     class StubService:
         @staticmethod
-        def get_sandbox_logs(
+        def get_sandbox_log_diagnostics(
             sandbox_id: str,
-            tail: int,
-            since: str | None = None,
-            container: str | None = None,
-        ) -> str:
+            scope: str,
+        ) -> DiagnosticResult:
             assert sandbox_id == "sbx-001"
-            assert tail == 101
-            assert since is None
-            assert container is None
-            return "\n".join(lines)
+            assert scope == "container"
+            return DiagnosticResult(
+                sandbox_id=sandbox_id,
+                kind="logs",
+                scope=scope,
+                content="\n".join(lines[-100:]),
+                truncated=True,
+            )
 
     monkeypatch.setattr(devops, "sandbox_service", StubService())
 
@@ -97,18 +102,16 @@ def test_diagnostics_logs_with_scope_ignores_legacy_container_selector(
     auth_headers: dict,
     monkeypatch,
 ) -> None:
-    containers: list[str | None] = []
+    scopes: list[str] = []
 
     class StubService:
         @staticmethod
-        def get_sandbox_logs(
+        def get_sandbox_log_diagnostics(
             sandbox_id: str,
-            tail: int,
-            since: str | None = None,
-            container: str | None = None,
-        ) -> str:
-            containers.append(container)
-            return "sandbox logs"
+            scope: str,
+        ) -> DiagnosticResult:
+            scopes.append(scope)
+            return DiagnosticResult(sandbox_id, "logs", scope, "sandbox logs")
 
     monkeypatch.setattr(devops, "sandbox_service", StubService())
 
@@ -121,7 +124,7 @@ def test_diagnostics_logs_with_scope_ignores_legacy_container_selector(
         assert response.status_code == 200
         assert response.json()["scope"] == scope
 
-    assert containers == [None, None]
+    assert scopes == ["container", "all"]
 
 
 def test_diagnostics_logs_with_scope_ignores_legacy_since_filter(
@@ -129,18 +132,16 @@ def test_diagnostics_logs_with_scope_ignores_legacy_since_filter(
     auth_headers: dict,
     monkeypatch,
 ) -> None:
-    since_values: list[str | None] = []
+    scopes: list[str] = []
 
     class StubService:
         @staticmethod
-        def get_sandbox_logs(
+        def get_sandbox_log_diagnostics(
             sandbox_id: str,
-            tail: int,
-            since: str | None = None,
-            container: str | None = None,
-        ) -> str:
-            since_values.append(since)
-            return "sandbox logs"
+            scope: str,
+        ) -> DiagnosticResult:
+            scopes.append(scope)
+            return DiagnosticResult(sandbox_id, "logs", scope, "sandbox logs")
 
     monkeypatch.setattr(devops, "sandbox_service", StubService())
 
@@ -153,7 +154,7 @@ def test_diagnostics_logs_with_scope_ignores_legacy_since_filter(
         assert response.status_code == 200
         assert response.json()["scope"] == scope
 
-    assert since_values == [None, None]
+    assert scopes == ["container", "all"]
 
 
 def test_diagnostics_logs_with_scope_ignores_legacy_tail_bound(
@@ -161,18 +162,21 @@ def test_diagnostics_logs_with_scope_ignores_legacy_tail_bound(
     auth_headers: dict,
     monkeypatch,
 ) -> None:
-    tails: list[int] = []
+    scopes: list[str] = []
 
     class StubService:
         @staticmethod
-        def get_sandbox_logs(
+        def get_sandbox_log_diagnostics(
             sandbox_id: str,
-            tail: int,
-            since: str | None = None,
-            container: str | None = None,
-        ) -> str:
-            tails.append(tail)
-            return "first line\nsecond line"
+            scope: str,
+        ) -> DiagnosticResult:
+            scopes.append(scope)
+            return DiagnosticResult(
+                sandbox_id,
+                "logs",
+                scope,
+                "first line\nsecond line",
+            )
 
     monkeypatch.setattr(devops, "sandbox_service", StubService())
 
@@ -186,7 +190,7 @@ def test_diagnostics_logs_with_scope_ignores_legacy_tail_bound(
             assert response.status_code == 200
             assert response.json()["content"] == "first line\nsecond line"
 
-    assert tails == [101, 101, 101, 101]
+    assert scopes == ["container", "container", "all", "all"]
 
 
 def test_diagnostics_logs_rejects_unsupported_scope(
@@ -196,8 +200,20 @@ def test_diagnostics_logs_rejects_unsupported_scope(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_sandbox_logs(*args, **kwargs) -> str:
-            raise AssertionError("unsupported scope must not query the backend")
+        def get_sandbox_log_diagnostics(
+            sandbox_id: str,
+            scope: str,
+        ) -> DiagnosticResult:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "DIAGNOSTICS_SCOPE_UNSUPPORTED",
+                    "message": (
+                        f"Unsupported logs diagnostics scope {scope!r}. "
+                        "Supported scopes: container, all."
+                    ),
+                },
+            )
 
     monkeypatch.setattr(devops, "sandbox_service", StubService())
 
@@ -222,8 +238,19 @@ def test_diagnostics_logs_all_scope_discloses_backend_limit(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_sandbox_logs(*args, **kwargs) -> str:
-            return "container logs only"
+        def get_sandbox_log_diagnostics(
+            sandbox_id: str,
+            scope: str,
+        ) -> DiagnosticResult:
+            return DiagnosticResult(
+                sandbox_id,
+                "logs",
+                scope,
+                "container logs only",
+                warnings=(
+                    "The current backend only contributes sandbox container logs to the all scope.",
+                ),
+            )
 
     monkeypatch.setattr(devops, "sandbox_service", StubService())
 
@@ -307,10 +334,18 @@ def test_diagnostics_events_with_scope_returns_stable_inline_descriptor(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_sandbox_events(sandbox_id: str, limit: int) -> str:
+        def get_sandbox_event_diagnostics(
+            sandbox_id: str,
+            scope: str,
+        ) -> DiagnosticResult:
             assert sandbox_id == "sbx-001"
-            assert limit == 51
-            return "runtime event"
+            assert scope == "RUNTIME"
+            return DiagnosticResult(
+                sandbox_id,
+                "events",
+                scope.lower(),
+                "runtime event",
+            )
 
     monkeypatch.setattr(devops, "sandbox_service", StubService())
 
@@ -333,7 +368,7 @@ def test_diagnostics_events_with_scope_returns_stable_inline_descriptor(
     }
 
 
-def test_diagnostics_events_reports_and_applies_line_limit(
+def test_diagnostics_events_serializes_service_truncation_result(
     client: TestClient,
     auth_headers: dict,
     monkeypatch,
@@ -342,10 +377,19 @@ def test_diagnostics_events_reports_and_applies_line_limit(
 
     class StubService:
         @staticmethod
-        def get_sandbox_events(sandbox_id: str, limit: int) -> str:
+        def get_sandbox_event_diagnostics(
+            sandbox_id: str,
+            scope: str,
+        ) -> DiagnosticResult:
             assert sandbox_id == "sbx-001"
-            assert limit == 51
-            return "\n".join(events)
+            assert scope == "runtime"
+            return DiagnosticResult(
+                sandbox_id,
+                "events",
+                scope,
+                "\n".join(events[:50]),
+                truncated=True,
+            )
 
     monkeypatch.setattr(devops, "sandbox_service", StubService())
 
@@ -364,13 +408,21 @@ def test_diagnostics_events_with_scope_ignores_legacy_limit_bound(
     auth_headers: dict,
     monkeypatch,
 ) -> None:
-    limits: list[int] = []
+    scopes: list[str] = []
 
     class StubService:
         @staticmethod
-        def get_sandbox_events(sandbox_id: str, limit: int) -> str:
-            limits.append(limit)
-            return "first event\nsecond event"
+        def get_sandbox_event_diagnostics(
+            sandbox_id: str,
+            scope: str,
+        ) -> DiagnosticResult:
+            scopes.append(scope)
+            return DiagnosticResult(
+                sandbox_id,
+                "events",
+                scope,
+                "first event\nsecond event",
+            )
 
     monkeypatch.setattr(devops, "sandbox_service", StubService())
 
@@ -384,7 +436,7 @@ def test_diagnostics_events_with_scope_ignores_legacy_limit_bound(
             assert response.status_code == 200
             assert response.json()["content"] == "first event\nsecond event"
 
-    assert limits == [51, 51, 51, 51]
+    assert scopes == ["runtime", "runtime", "all", "all"]
 
 
 def test_diagnostics_events_rejects_unavailable_lifecycle_scope(
@@ -392,13 +444,25 @@ def test_diagnostics_events_rejects_unavailable_lifecycle_scope(
     auth_headers: dict,
     monkeypatch,
 ) -> None:
-    calls: list[tuple[str, int]] = []
+    calls: list[tuple[str, str]] = []
 
     class StubService:
         @staticmethod
-        def get_sandbox_events(sandbox_id: str, limit: int) -> str:
-            calls.append((sandbox_id, limit))
-            return "runtime event"
+        def get_sandbox_event_diagnostics(
+            sandbox_id: str,
+            scope: str,
+        ) -> DiagnosticResult:
+            calls.append((sandbox_id, scope))
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "DIAGNOSTICS_SCOPE_UNSUPPORTED",
+                    "message": (
+                        f"Unsupported events diagnostics scope {scope!r}. "
+                        "Supported scopes: runtime, all."
+                    ),
+                },
+            )
 
     monkeypatch.setattr(devops, "sandbox_service", StubService())
 
@@ -415,7 +479,7 @@ def test_diagnostics_events_rejects_unavailable_lifecycle_scope(
             "Supported scopes: runtime, all."
         ),
     }
-    assert calls == []
+    assert calls == [("sbx-001", "lifecycle")]
 
 
 def test_diagnostics_events_all_scope_discloses_backend_limit(
@@ -425,8 +489,17 @@ def test_diagnostics_events_all_scope_discloses_backend_limit(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_sandbox_events(sandbox_id: str, limit: int) -> str:
-            return "runtime event"
+        def get_sandbox_event_diagnostics(
+            sandbox_id: str,
+            scope: str,
+        ) -> DiagnosticResult:
+            return DiagnosticResult(
+                sandbox_id,
+                "events",
+                scope,
+                "runtime event",
+                warnings=("The current backend only contributes runtime events to the all scope.",),
+            )
 
     monkeypatch.setattr(devops, "sandbox_service", StubService())
 
@@ -448,8 +521,20 @@ def test_diagnostics_events_rejects_unsupported_scope(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_sandbox_events(*args, **kwargs) -> str:
-            raise AssertionError("unsupported scope must not query the backend")
+        def get_sandbox_event_diagnostics(
+            sandbox_id: str,
+            scope: str,
+        ) -> DiagnosticResult:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "DIAGNOSTICS_SCOPE_UNSUPPORTED",
+                    "message": (
+                        f"Unsupported events diagnostics scope {scope!r}. "
+                        "Supported scopes: runtime, all."
+                    ),
+                },
+            )
 
     monkeypatch.setattr(devops, "sandbox_service", StubService())
 

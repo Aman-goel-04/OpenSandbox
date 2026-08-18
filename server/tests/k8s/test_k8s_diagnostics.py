@@ -432,6 +432,71 @@ def test_get_sandbox_events_follows_continuation_until_limit() -> None:
     ]
 
 
+def test_stable_event_diagnostics_policy_is_owned_by_kubernetes_service() -> None:
+    service = _DiagnosticsService([_pod()])
+    events = [f"event {index}" for index in range(51)]
+    service.get_sandbox_events = MagicMock(return_value="\n".join(events))
+
+    result = service.get_sandbox_event_diagnostics("sbx-1", scope="ALL")
+
+    assert result.scope == "all"
+    assert result.content.splitlines() == events[:50]
+    assert result.truncated is True
+    assert result.warnings == (
+        "The current backend only contributes runtime events to the all scope.",
+    )
+    service.get_sandbox_events.assert_called_once_with("sbx-1", limit=51)
+
+
+def test_stable_log_diagnostics_policy_is_owned_by_kubernetes_service() -> None:
+    service = _DiagnosticsService([_pod()])
+    lines = [f"line {index}" for index in range(101)]
+    service.get_sandbox_logs = MagicMock(return_value="\n".join(lines))
+
+    result = service.get_sandbox_log_diagnostics("sbx-1", scope="ALL")
+
+    assert result.scope == "all"
+    assert result.content.splitlines() == lines[-100:]
+    assert result.truncated is True
+    assert result.warnings == (
+        "The current backend only contributes sandbox container logs to the all scope.",
+    )
+    service.get_sandbox_logs.assert_called_once_with(
+        "sbx-1",
+        tail=101,
+        since=None,
+        container=None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("method_name", "scope", "kind", "supported"),
+    [
+        ("get_sandbox_log_diagnostics", "lifecycle", "logs", "container, all"),
+        ("get_sandbox_event_diagnostics", "network", "events", "runtime, all"),
+    ],
+)
+def test_stable_diagnostics_reject_unsupported_kubernetes_scopes(
+    method_name: str,
+    scope: str,
+    kind: str,
+    supported: str,
+) -> None:
+    service = _DiagnosticsService([_pod()])
+
+    with pytest.raises(HTTPException) as exc:
+        getattr(service, method_name)("sbx-1", scope)
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail == {
+        "code": "DIAGNOSTICS_SCOPE_UNSUPPORTED",
+        "message": (
+            f"Unsupported {kind} diagnostics scope {scope!r}. Supported scopes: {supported}."
+        ),
+    }
+    service.k8s_client.list_pods.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("api_status", "expected_status", "expected_code"),
     [

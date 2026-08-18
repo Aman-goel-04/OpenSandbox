@@ -27,70 +27,29 @@ from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from opensandbox_server.api.lifecycle import sandbox_service
+from opensandbox_server.services.diagnostics import DiagnosticResult
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["DevOps"])
 
-_SUPPORTED_LOG_SCOPES = ("container", "all")
-_SUPPORTED_EVENT_SCOPES = ("runtime", "all")
-_STABLE_LOG_LINE_LIMIT = 100
-_STABLE_EVENT_LINE_LIMIT = 50
-
 
 def _diagnostic_inline_response(
-    sandbox_id: str,
-    kind: str,
-    scope: str,
-    content: str,
-    truncated: bool = False,
-    warnings: list[str] | None = None,
+    result: DiagnosticResult,
 ) -> JSONResponse:
     """Build a Diagnostics API descriptor for inline plain-text content."""
     payload: dict[str, object] = {
-        "sandboxId": sandbox_id,
-        "kind": kind,
-        "scope": scope,
+        "sandboxId": result.sandbox_id,
+        "kind": result.kind,
+        "scope": result.scope,
         "delivery": "inline",
         "contentType": "text/plain; charset=utf-8",
-        "content": content,
-        "contentLength": len(content.encode("utf-8")),
-        "truncated": truncated,
+        "content": result.content,
+        "contentLength": len(result.content.encode("utf-8")),
+        "truncated": result.truncated,
     }
-    if warnings:
-        payload["warnings"] = warnings
+    if result.warnings:
+        payload["warnings"] = list(result.warnings)
     return JSONResponse(status_code=status.HTTP_200_OK, content=payload)
-
-
-def _limit_diagnostic_lines(
-    content: str,
-    limit: int,
-    *,
-    keep_tail: bool,
-) -> tuple[str, bool]:
-    """Apply a line limit after fetching one extra line to detect truncation."""
-    lines = content.splitlines(keepends=True)
-    if len(lines) <= limit:
-        return content, False
-    bounded_lines = lines[-limit:] if keep_tail else lines[:limit]
-    return "".join(bounded_lines), True
-
-
-def _unsupported_scope_response(
-    kind: str,
-    scope: str,
-    supported: tuple[str, ...],
-) -> JSONResponse:
-    """Return a stable error for a scope the current backend cannot provide."""
-    return JSONResponse(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        content={
-            "code": "DIAGNOSTICS_SCOPE_UNSUPPORTED",
-            "message": (
-                f"Unsupported {kind} diagnostics scope {scope!r}. "
-                f"Supported scopes: {', '.join(supported)}."
-            ),
-        },
-    )
 
 
 def _deprecated_plain_text_response(content: str) -> PlainTextResponse:
@@ -143,30 +102,8 @@ def get_sandbox_logs(
 ) -> JSONResponse | PlainTextResponse:
     """Retrieve diagnostic logs for a sandbox."""
     if scope is not None:
-        normalized_scope = scope.strip().lower()
-        if normalized_scope not in _SUPPORTED_LOG_SCOPES:
-            return _unsupported_scope_response("logs", scope, _SUPPORTED_LOG_SCOPES)
-        text = sandbox_service.get_sandbox_logs(
-            sandbox_id, tail=_STABLE_LOG_LINE_LIMIT + 1, since=None, container=None
-        )
-        text, truncated = _limit_diagnostic_lines(
-            text,
-            _STABLE_LOG_LINE_LIMIT,
-            keep_tail=True,
-        )
-        warnings = None
-        if normalized_scope == "all":
-            warnings = [
-                "The current backend only contributes sandbox container logs to the all scope."
-            ]
-        return _diagnostic_inline_response(
-            sandbox_id,
-            "logs",
-            normalized_scope,
-            text,
-            truncated=truncated,
-            warnings=warnings,
-        )
+        result = sandbox_service.get_sandbox_log_diagnostics(sandbox_id, scope)
+        return _diagnostic_inline_response(result)
     text = sandbox_service.get_sandbox_logs(sandbox_id, tail=tail, since=since, container=container)
     return _deprecated_plain_text_response(text)
 
@@ -216,31 +153,8 @@ def get_sandbox_events(
 ) -> JSONResponse | PlainTextResponse:
     """Retrieve diagnostic events for a sandbox."""
     if scope is not None:
-        normalized_scope = scope.strip().lower()
-        if normalized_scope not in _SUPPORTED_EVENT_SCOPES:
-            return _unsupported_scope_response("events", scope, _SUPPORTED_EVENT_SCOPES)
-        text = sandbox_service.get_sandbox_events(
-            sandbox_id,
-            limit=_STABLE_EVENT_LINE_LIMIT + 1,
-        )
-        text, truncated = _limit_diagnostic_lines(
-            text,
-            _STABLE_EVENT_LINE_LIMIT,
-            keep_tail=False,
-        )
-        warnings = None
-        if normalized_scope == "all":
-            warnings = [
-                "The current backend only contributes runtime events to the all scope."
-            ]
-        return _diagnostic_inline_response(
-            sandbox_id,
-            "events",
-            normalized_scope,
-            text,
-            truncated=truncated,
-            warnings=warnings,
-        )
+        result = sandbox_service.get_sandbox_event_diagnostics(sandbox_id, scope)
+        return _diagnostic_inline_response(result)
     text = sandbox_service.get_sandbox_events(sandbox_id, limit=limit)
     return _deprecated_plain_text_response(text)
 
