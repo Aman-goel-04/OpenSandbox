@@ -1263,6 +1263,56 @@ spec:
         assert result["state"] == "Pending"
         assert result["reason"] == "BATCHSANDBOX_PENDING"
 
+    def test_get_status_reports_pool_capacity_condition(self):
+        provider = BatchSandboxProvider(MagicMock())
+        workload = {
+            "status": {
+                "phase": "Pending",
+                "replicas": 0,
+                "ready": 0,
+                "allocated": 0,
+                "conditions": [
+                    {
+                        "type": "PoolAllocationPending",
+                        "status": "True",
+                        "reason": "PoolCapacityExhausted",
+                        "message": "Pool example-pool is at capacity",
+                    }
+                ],
+            },
+            "metadata": {"creationTimestamp": "2025-12-24T10:00:00Z"},
+        }
+
+        result = provider.get_status(workload)
+
+        assert result["state"] == "Pending"
+        assert result["reason"] == "POOL_CAPACITY_EXHAUSTED"
+        assert result["message"] == "Pool example-pool is at capacity"
+
+    def test_get_status_succeed_phase_wins_over_stale_pool_capacity_condition(self):
+        provider = BatchSandboxProvider(MagicMock())
+        workload = {
+            "status": {
+                "phase": "Succeed",
+                "replicas": 1,
+                "ready": 1,
+                "allocated": 1,
+                "conditions": [
+                    {
+                        "type": "PoolAllocationPending",
+                        "status": "True",
+                        "reason": "PoolCapacityExhausted",
+                    }
+                ],
+            },
+            "metadata": {"creationTimestamp": "2025-12-24T10:00:00Z"},
+        }
+
+        result = provider.get_status(workload)
+
+        assert result["state"] == "Running"
+        assert result["reason"] == "RUNNING"
+
     def test_get_status_returns_failed_when_pod_unschedulable(self):
         mock_k8s_client = MagicMock()
         provider = BatchSandboxProvider(mock_k8s_client)

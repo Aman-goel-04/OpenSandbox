@@ -873,7 +873,29 @@ class BatchSandboxProvider(WorkloadProvider):
             "Resuming": ("Resuming", "RESUMING", "Resuming sandbox"),
             "Failed": ("Failed", "FAILED", failed_message or "Operation failed"),
         }
-        if phase in phase_map:
+        if phase in phase_map and phase != "Pending":
+            state, reason, message = phase_map[phase]
+            return {
+                "state": state,
+                "reason": reason,
+                "message": message,
+                "last_transition_at": creation_timestamp,
+            }
+
+        conditions = status.get("conditions", [])
+        if self._has_true_condition(conditions, "PoolAllocationPending"):
+            pool_capacity_message = self._first_true_condition_message(
+                conditions,
+                ["PoolAllocationPending"],
+            ) or "Pool capacity is currently unavailable"
+            return {
+                "state": "Pending",
+                "reason": "POOL_CAPACITY_EXHAUSTED",
+                "message": pool_capacity_message,
+                "last_transition_at": creation_timestamp,
+            }
+
+        if phase == "Pending":
             state, reason, message = phase_map[phase]
             return {
                 "state": state,
