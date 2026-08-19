@@ -30,8 +30,14 @@ typedef unsigned char __u8;
 typedef unsigned int __u32;
 typedef unsigned long long __u64;
 typedef unsigned short __u16;
+typedef int __s32;
+typedef long long __s64;
 typedef __u32 __be32;
 typedef __u16 __be16;
+typedef __u32 __wsum;
+
+/* Forward declarations used by bpf_helper_defs.h helper prototypes. */
+struct __sk_buff;
 
 struct task_struct {
 	void *real_parent;
