@@ -126,18 +126,18 @@ WORKDIR /build/components/execd
 # TARGETARCH (bpf2go embeds it into audit_bpf_<arch>.go, picked up by the
 # Go build tags). Requires clang's bpf target only — no host kernel BTF.
 RUN case "${TARGETARCH}" in \
-      amd64) VMLINUX=prog/vmlinux-x86_64.h ;; \
-      arm64) VMLINUX=prog/vmlinux-arm64.h ;; \
+      amd64) VMLINUX=pkg/ebpf/prog/vmlinux-x86_64.h ;; \
+      arm64) VMLINUX=pkg/ebpf/prog/vmlinux-arm64.h ;; \
       *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
     esac \
-    && cp "$VMLINUX" prog/vmlinux.h \
+    && cp "$VMLINUX" pkg/ebpf/prog/vmlinux.h \
     && go run github.com/cilium/ebpf/cmd/bpf2go@v0.16.0 \
        -cc clang -no-strip \
-       -cflags "-Iprog -I$(go env GOMODCACHE)/github.com/cilium/ebpf@v0.16.0/btf/testdata" \
+       -cflags "-Ipkg/ebpf/prog -I$(go env GOMODCACHE)/github.com/cilium/ebpf@v0.16.0/btf/testdata" \
        -target "${TARGETARCH}" \
        -go-package ebpf -output-dir pkg/ebpf \
-       audit prog/audit.bpf.c \
-    && rm -f prog/vmlinux.h
+       audit pkg/ebpf/prog/audit.bpf.c \
+    && rm -f pkg/ebpf/prog/vmlinux.h
 # cilium/ebpf is pure Go, so the variant builds fully static.
 RUN CGO_ENABLED=0 go build -tags ebpf -trimpath -buildvcs=false \
     -ldflags "-buildid= -B none \
