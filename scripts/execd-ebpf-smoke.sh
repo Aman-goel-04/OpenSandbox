@@ -156,7 +156,7 @@ if [ "${report_rc}" -eq 1 ]; then
 fi
 if [ "${report_rc}" -eq 2 ]; then
   echo "NOTE: hooks degraded — dumping container logs for the load/attach error"
-  docker logs "${CTR_NAME}" 2>&1 | grep -E "ebpf|hardening" | head -20 || true
+  docker logs "${CTR_NAME}" 2>&1 | tail -60 || true
 fi
 
 echo "== generating events inside the sandbox cgroup =="
