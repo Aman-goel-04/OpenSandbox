@@ -36,19 +36,12 @@ status: implementing
 
 ## Implementation Status
 
-> Updated 2026-08-19. Status: **implementing** — the phased rollout below is
-> implemented (Phases 1–5 plus the server switch); remaining items are the
-> execd-ebpf server-side selection (R-e), the `OPENSANDBOX_ID` reserved-env
-> override (R-g) and the default-on rollout (R-f, operator decision). R-a
-> (trusted stop channel) declined 2026-08-18 — the `kill 1` SIGTERM
-> contract is kept as-is. R-i (server-path hardening e2e, docker bridge)
-> landed in PR #1554; R-q (custom seccomp/caps e2e), R-s (EXECD_INIT drift
-> pin), R-l(b) (K8s Restart recycle e2e), R-m (default-off + sustained
-> fork-heavy) and R-u (runtime-initiated stop e2e) landed in the
-> init/hardening e2e suites; R-c (kernel-5.10 eBPF validation) and R-j
-> (eBPF JSONL audit e2e) landed via the execd-ebpf smoke + per-arch
-> bytecode fix (issue #1563) — both CI legs now emit exec/connect/privilege
-> events.
+> Updated 2026-08-19. Status: **implementing**. Phases 1–5 + server switch +
+> all test/validation items done. **Remaining:**
+>
+> - **R-e** — `execd-ebpf` server-side selection not wired (`components/execd/README.md` Known issue)
+> - **R-g** — `OPENSANDBOX_ID` reserved-env override (deferred, low)
+> - **R-f** — default-on rollout (operator decision)
 
 | Phase | Scope | Status |
 |---|---|---|
