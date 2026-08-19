@@ -112,6 +112,7 @@ FROM golang:1.25.9 AS ebpf-builder
 ARG VERSION=dev
 ARG GIT_COMMIT=unknown
 ARG BUILD_TIME=unknown
+ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends clang
 WORKDIR /build
 COPY components/internal/go.mod components/internal/go.sum ./components/internal/
