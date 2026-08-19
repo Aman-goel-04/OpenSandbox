@@ -171,22 +171,22 @@ build-ebpf: ## Build the execd-ebpf observation variant (CGO + cilium/ebpf).
 # Requires clang with the bpf target. bpf2go writes audit_bpf_<target>.{go,o};
 # the Go build picks the right one via build tags.
 .PHONY: generate-ebpf
+ARCH ?= $(shell go env GOARCH)
 generate-ebpf:
-	@ARCH ?= $(shell go env GOARCH)
 	@case "$(ARCH)" in \
 		amd64) VMLINUX=pkg/ebpf/prog/vmlinux-x86_64.h ;; \
 		arm64) VMLINUX=pkg/ebpf/prog/vmlinux-arm64.h ;; \
 		*) echo "generate-ebpf: unsupported ARCH=$(ARCH) (amd64|arm64)" >&2; exit 1 ;; \
-	esac
-	@test -f "$(VMLINUX)" || { echo "missing $(VMLINUX) — commit the per-arch vmlinux.h first" >&2; exit 1; }
-	@cp "$(VMLINUX)" pkg/ebpf/prog/vmlinux.h
-	@cd pkg/ebpf && go run github.com/cilium/ebpf/cmd/bpf2go@v0.16.0 \
+	esac; \
+	test -f "$$VMLINUX" || { echo "missing $$VMLINUX — commit the per-arch vmlinux.h first" >&2; exit 1; }; \
+	cp "$$VMLINUX" pkg/ebpf/prog/vmlinux.h; \
+	go run github.com/cilium/ebpf/cmd/bpf2go@v0.16.0 \
 		-cc clang -no-strip \
-		-cflags "-Iprog" \
+		-cflags "-Ipkg/ebpf/prog" \
 		-target $(ARCH) \
-		-go-package ebpf -output-dir . \
-		audit prog/audit.bpf.c
-	@rm -f pkg/ebpf/prog/vmlinux.h
+		-go-package ebpf -output-dir pkg/ebpf \
+		audit pkg/ebpf/prog/audit.bpf.c; \
+	rm -f pkg/ebpf/prog/vmlinux.h
 	@echo "regenerated pkg/ebpf/audit_bpf_$(ARCH).{go,o}"
 
 .PHONY: test-integration
