@@ -58,6 +58,10 @@ jobs:
       - name: Run execd-ebpf variant tests
         working-directory: components/execd
         run: |
+          # Regenerate the per-arch bytecode first: the generated files are
+          # build artifacts (not committed), so local tests need them too.
+          sudo apt-get update -qq && sudo apt-get install -y -qq clang >/dev/null
+          make generate-ebpf ARCH=$(go env GOARCH)
           CGO_ENABLED=1 go test -tags ebpf -count=1 ./pkg/ebpf/
 
       - name: Upload per-arch vmlinux.h (for bytecode regeneration)
