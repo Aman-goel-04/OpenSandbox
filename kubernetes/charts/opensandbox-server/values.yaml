@@ -115,7 +115,7 @@ server:
       #   active-key: the active signing key id, one character in [0-9a-z]
       # The chart wires it into both containers as environment variables
       # (server: OPENSANDBOX_SECURE_ACCESS_*; gateway: $(...) expansion in the
-      # --secure-access-keys arg), so key material never appears in values,
+      # `--secure-access-keys` arg), so key material never appears in values,
       # the server ConfigMap, or pod args.
       # Env-sourced Secrets are read once at container start: after updating
       # the Secret in place, `kubectl rollout restart` the server and gateway

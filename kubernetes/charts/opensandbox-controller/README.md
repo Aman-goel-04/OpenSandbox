@@ -68,9 +68,10 @@ The following table lists the configurable parameters of the chart and their def
 | controller.leaderElection | object | `{"enabled":true}` | Enable leader election for controller manager |
 | controller.livenessProbe | object | `{"enabled":true,"failureThreshold":3,"httpGet":{"path":"/healthz","port":8081},"initialDelaySeconds":15,"periodSeconds":20,"successThreshold":1,"timeoutSeconds":1}` | Liveness probe configuration |
 | controller.logLevel | string | `"info"` | Log level for zap logger (debug, info, error) |
-| controller.metrics | object | `{"enabled":false,"port":8080,"secure":false}` | controller-runtime metrics endpoint (Prometheus). Disabled by default to preserve the current behavior (the binary defaults to --metrics-bind-address=0). |
+| controller.metrics | object | `{"enabled":false,"port":8080,"secure":false}` | controller-runtime metrics endpoint (Prometheus). Disabled by default to preserve the current behavior (the binary defaults to `--metrics-bind-address=0`). |
+| controller.metrics.enabled | bool | `false` | Expose the controller-runtime /metrics endpoint (sets `--metrics-bind-address`) |
 | controller.metrics.port | int | `8080` | Port for the metrics endpoint |
-| controller.metrics.secure | bool | `false` | Serve metrics over HTTPS with authn/authz (--metrics-secure). Set to false to serve plain HTTP for scraping without TLS/RBAC (e.g. PodMonitoring). |
+| controller.metrics.secure | bool | `false` | Serve metrics over HTTPS with authn/authz (`--metrics-secure`). Set to false to serve plain HTTP for scraping without TLS/RBAC (e.g. PodMonitoring). |
 | controller.nodeSelector | object | `{}` | Node labels for controller pod assignment |
 | controller.podAnnotations | object | `{}` | Additional annotations for controller pods |
 | controller.podLabels | object | `{}` | Additional labels for controller pods |
@@ -81,6 +82,7 @@ The following table lists the configurable parameters of the chart and their def
 | controller.resources | object | `{"limits":{"cpu":"500m","memory":"128Mi"},"requests":{"cpu":"10m","memory":"64Mi"}}` | Resource requests and limits for the controller |
 | controller.snapshot | object | `{"commitJobTimeout":"10m","containerdSocketPath":"","imageCommitterImage":"sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/image-committer:v0.1.1","imageCommitterPodTemplate":{},"imageCommitterPullSecret":"","registry":"","registryInsecure":false,"resumePullSecret":"","snapshotPushSecret":""}` | Pause/Resume snapshot configuration |
 | controller.snapshot.commitJobTimeout | string | `"10m"` | Timeout duration for commit jobs |
+| controller.snapshot.containerdSocketPath | string | `""` | Containerd socket path of host. Defaults to empty so the controller uses its built-in default (/var/run/containerd/containerd.sock) without passing the `--containerd-socket-path` flag. |
 | controller.snapshot.imageCommitterImage | string | `"sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/image-committer:v0.1.1"` | Image used for commit operations. DockerHub: opensandbox/image-committer:v0.1.1 |
 | controller.snapshot.imageCommitterPodTemplate | object | `{}` | PodTemplateSpec overlay for image-committer commit Job Pods. |
 | controller.snapshot.imageCommitterPullSecret | string | `""` | Secret name for pulling the image-committer image in commit Jobs. Required when imageCommitterImage is stored in a private registry. |

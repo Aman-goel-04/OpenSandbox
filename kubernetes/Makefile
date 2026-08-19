@@ -601,7 +601,7 @@ helm-docs-check: ## Verify Helm chart documentation is up to date (requires helm
 	@if command -v helm-docs >/dev/null 2>&1; then \
 		echo "Checking Helm chart documentation is up to date..."; \
 		helm-docs --chart-search-root charts/; \
-		if [ -n "$$(git status --porcelain -- charts/ | grep -v '^??' | head -n 1)" ]; then \
+		if [ -n "$$(git status --porcelain -- charts/ | head -n 1)" ]; then \
 			echo "ERROR: Helm chart documentation is out of date. Run 'make helm-docs' and commit the changes."; \
 			exit 1; \
 		fi; \
