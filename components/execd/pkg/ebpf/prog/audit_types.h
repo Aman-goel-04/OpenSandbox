@@ -36,8 +36,15 @@ typedef __u32 __be32;
 typedef __u16 __be16;
 typedef __u32 __wsum;
 
+typedef __u32 uint32_t;
+typedef __u64 uint64_t;
+typedef __u16 uint16_t;
+
 /* Forward declarations used by bpf_helper_defs.h helper prototypes. */
 struct __sk_buff;
+
+/* Map type used by the events ring buffer (bpf_helpers.h). */
+#define BPF_MAP_TYPE_RINGBUF 27
 
 struct task_struct {
 	void *real_parent;
@@ -111,11 +118,11 @@ struct pt_regs {
 	struct user_pt_regs user_regs;
 };
 #else
-/* x86-64: PT_REGS_PARM1(x) = (x)->di — pt_regs is the flat register file */
+/* x86-64: PT_REGS_PARM1(x) = (x)->rdi (bpf_tracing.h, non-__VMLINUX_H__ path) */
 struct pt_regs {
 	__u64 r15, r14, r13, r12, bp, bx, r11, r10;
-	__u64 r9, r8, ax, cx, dx, si, di, orig_ax, ip;
-	__u64 cs, flags, sp, ss;
+	__u64 r9, r8, rax, rcx, rdx, rsi, rdi, orig_rax, rip;
+	__u64 cs, eflags, rsp, ss;
 };
 #endif
 
