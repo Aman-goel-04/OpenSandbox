@@ -608,12 +608,26 @@ done
 jq -e '.status == "healthy"' "${artifacts_dir}/health.json" >/dev/null || \
   die "Server /health did not return the expected healthy response"
 
-curl --fail --silent --show-error --max-time 10 \
-  --header "OPEN-SANDBOX-API-KEY: ${api_key}" \
-  "${server_base_url}/version" >"${artifacts_dir}/version.json"
-jq -e --arg expected "$server_app_version" '.version == $expected' \
-  "${artifacts_dir}/version.json" >/dev/null || \
-  die "Server /version does not match embedded server appVersion ${server_app_version}"
+version_status="$(
+  curl --silent --show-error --max-time 10 \
+    --header "OPEN-SANDBOX-API-KEY: ${api_key}" \
+    --output "${artifacts_dir}/version.json" \
+    --write-out '%{http_code}' \
+    "${server_base_url}/version"
+)"
+case "$version_status" in
+  200)
+    jq -e --arg expected "$server_app_version" '.version == $expected' \
+      "${artifacts_dir}/version.json" >/dev/null || \
+      die "Server /version does not match embedded server appVersion ${server_app_version}"
+    ;;
+  404)
+    warn "Server image ${server_app_version} does not expose the optional /version endpoint"
+    ;;
+  *)
+    die "Server /version returned HTTP ${version_status}; expected 200 or compatibility 404"
+    ;;
+esac
 
 no_key_status="$(
   curl --silent --show-error --max-time 10 \
