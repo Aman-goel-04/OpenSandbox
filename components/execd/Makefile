@@ -149,7 +149,7 @@ build: vet build-session-gate build-launcher ## Build execd and the Linux native
 	go build $(GO_BUILD_FLAGS) -ldflags "$(GO_LDFLAGS)" -o bin/execd main.go
 
 .PHONY: build-ebpf
-build-ebpf: ## Build the execd-ebpf observation variant (CGO + cilium/ebpf).
+build-ebpf: generate-ebpf ## Build the execd-ebpf observation variant (CGO + cilium/ebpf).
 	@if [ "$$(uname -s 2>/dev/null || echo non-linux)" != "Linux" ]; then \
 		echo "execd-ebpf requires Linux (BPF attachable host)" >&2; \
 		exit 1; \
@@ -182,7 +182,9 @@ generate-ebpf: ## Regenerate pkg/ebpf/audit_bpf*.o from prog/audit.bpf.c (Linux 
 	@command -v clang >/dev/null || { echo "clang not found" >&2; exit 1; }
 	@command -v bpftool >/dev/null || { echo "bpftool not found (install linux-tools-generic)" >&2; exit 1; }
 	@mkdir -p pkg/ebpf/prog
+	@if [ -n "$(VMLINUX_KEEP)" ]; then mkdir -p "$(VMLINUX_KEEP)"; fi
 	bpftool btf dump file /sys/kernel/btf/vmlinux format c > pkg/ebpf/prog/vmlinux.h
+	@if [ -n "$(VMLINUX_KEEP)" ]; then cp pkg/ebpf/prog/vmlinux.h "$(VMLINUX_KEEP)/vmlinux.h"; fi
 	@cd pkg/ebpf && go run github.com/cilium/ebpf/cmd/bpf2go@v0.16.0 \
 		-cc clang -no-strip \
 		-cflags "-Iprog -I$(shell go env GOMODCACHE)/github.com/cilium/ebpf@v0.16.0/btf/testdata" \
