@@ -22,6 +22,7 @@ so multiple container runtimes (docker, kubernetes, etc.) can reuse them.
 from __future__ import annotations
 
 import logging
+import math
 import re
 from datetime import datetime, timezone
 from typing import Dict, Optional
@@ -92,10 +93,17 @@ def parse_nano_cpus(value: Optional[str]) -> Optional[int]:
     except ValueError:
         logger.warning("Invalid CPU limit format '%s'; ignoring.", value)
         return None
+    if not math.isfinite(cpus):
+        logger.warning("CPU limit must be finite. Got '%s'. Ignoring.", value)
+        return None
     if cpus <= 0:
         logger.warning("CPU limit must be positive. Got '%s'. Ignoring.", value)
         return None
-    return int(cpus * 1_000_000_000)
+    nano_cpus = cpus * 1_000_000_000
+    if not math.isfinite(nano_cpus):
+        logger.warning("CPU limit is too large. Got '%s'. Ignoring.", value)
+        return None
+    return int(nano_cpus)
 
 
 def parse_gpu_request(value: Optional[str]) -> Optional[int]:
