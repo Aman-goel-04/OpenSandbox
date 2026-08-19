@@ -397,7 +397,7 @@ kubectl get nodes -o json | jq -e '
   .items | length > 0 and all(.[]; .status.nodeInfo.architecture == "amd64")
 ' >/dev/null || die "Smoke requires linux/amd64 Kind nodes"
 
-pull_and_load_image() {
+pull_and_maybe_load_image() {
   local image="$1"
   local attempt
   for attempt in 1 2 3; do
@@ -415,14 +415,23 @@ pull_and_load_image() {
     jq -c --arg requested_reference "$image" \
       '. + {requestedReference: $requested_reference}' \
       >>"${artifacts_dir}/docker-image-inspect.jsonl"
+
+  # kind load imports digest-only images under a synthetic import-* reference.
+  # On containerd 2.x this can leave kubelet resolving the image ID through a
+  # reference that no longer exists, so let the node pull immutable digests.
+  if [[ "$image" == *@sha256:* ]]; then
+    log "Using direct cluster pull for digest-qualified image ${image}"
+    return
+  fi
+
   kind load docker-image --name "$cluster_name" "$image"
 }
 
 : >"${artifacts_dir}/docker-image-inspect.jsonl"
 while IFS= read -r image; do
   [[ -n "$image" ]] || continue
-  log "Preloading release image ${image}"
-  pull_and_load_image "$image"
+  log "Preparing release smoke image ${image}"
+  pull_and_maybe_load_image "$image"
 done <"${artifacts_dir}/images.txt"
 
 jq -s -e '

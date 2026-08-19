@@ -441,7 +441,7 @@ notes_path="${work_dir}/release-notes.md"
     printf '%s\n' "$tested_images"
     echo '```'
     echo
-    echo "Each line records the requested image reference, registry RepoDigest set, and local image ID pulled and preloaded for the linux/amd64 Kind gate. The live Pods must also report resolved image IDs and pass the runtime checks. The status describes the publication-time validation profile; the chart still uses its documented version tags."
+    echo "Each line records the requested image reference, registry RepoDigest set, and local image ID pulled for the linux/amd64 Kind gate. Tag-based images are preloaded into Kind; digest-qualified images are pulled directly by the cluster. The live Pods must also report resolved image IDs and pass the runtime checks. The status describes the publication-time validation profile; the chart still uses its documented version tags."
   else
     echo "The chart package and checksum are verified. This release does not claim integrated runtime readiness."
   fi
