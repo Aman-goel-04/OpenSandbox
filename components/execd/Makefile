@@ -149,50 +149,45 @@ build: vet build-session-gate build-launcher ## Build execd and the Linux native
 	go build $(GO_BUILD_FLAGS) -ldflags "$(GO_LDFLAGS)" -o bin/execd main.go
 
 .PHONY: build-ebpf
-build-ebpf: generate-ebpf ## Build the execd-ebpf observation variant (CGO + cilium/ebpf).
+build-ebpf: ## Build the execd-ebpf observation variant (CGO + cilium/ebpf).
 	@if [ "$$(uname -s 2>/dev/null || echo non-linux)" != "Linux" ]; then \
 		echo "execd-ebpf requires Linux (BPF attachable host)" >&2; \
 		exit 1; \
 	fi
 	@mkdir -p bin
+	$(MAKE) generate-ebpf ARCH=$(shell go env GOARCH)
 	CGO_ENABLED=1 go build -tags ebpf $(GO_BUILD_FLAGS) -ldflags "$(GO_LDFLAGS)" -o bin/execd-ebpf main.go
 	@echo "built bin/execd-ebpf"
 
-# Regenerate the CO-RE audit bytecode (pkg/ebpf/audit_bpf*.o) on a Linux host.
+# Regenerate the CO-RE audit bytecode for one architecture from the committed
+# per-arch vmlinux.h (pkg/ebpf/prog/vmlinux-<arch>.h). The vmlinux.h files are
+# committed so the bytecode can be regenerated anywhere (local make, CI, or
+# inside the Dockerfile ebpf-builder stage) without access to a host kernel
+# BTF — a vmlinux.h from the wrong arch (e.g. an arm64 dump shipped to x86_64)
+# poisons the BPF_KPROBE parameter relocations (issue #1563).
 #
-# The BPF source (prog/audit.bpf.c) is compiled per target architecture with
-# bpf2go; each architecture's vmlinux.h is dumped from the BUILD HOST's own
-# /sys/kernel/btf/vmlinux, so the bytecode's pt_regs layout matches the
-# architecture it runs on (a vmlinux.h from the wrong arch — e.g. an arm64
-# dump shipped to x86_64 hosts — poisons the BPF_KPROBE parameter relocations,
-# issue #1563). Run on an x86_64 and an arm64 Linux host and commit the
-# regenerated .o files:
+#   make generate-ebpf ARCH=amd64   # or arm64; defaults to GOARCH
 #
-#   make generate-ebpf ARCHS="amd64 arm64"
-#
-# Requires clang with the bpf target (linux-tools/clang on Ubuntu) and
-# bpftool (linux-tools-generic). The generated Go bindings embed the .o, so
-# the .c and vmlinux.h must be in sync with what is committed.
+# Requires clang with the bpf target. bpf2go writes audit_bpf_<target>.{go,o};
+# the Go build picks the right one via build tags.
 .PHONY: generate-ebpf
-generate-ebpf: ## Regenerate pkg/ebpf/audit_bpf*.o from prog/audit.bpf.c (Linux + clang + bpftool).
-	@if [ "$$(uname -s 2>/dev/null || echo non-linux)" != "Linux" ]; then \
-		echo "generate-ebpf requires Linux (dump /sys/kernel/btf/vmlinux)" >&2; \
-		exit 1; \
-	fi
-	@command -v clang >/dev/null || { echo "clang not found" >&2; exit 1; }
-	@command -v bpftool >/dev/null || { echo "bpftool not found (install linux-tools-generic)" >&2; exit 1; }
-	@mkdir -p pkg/ebpf/prog
-	@if [ -n "$(VMLINUX_KEEP)" ]; then mkdir -p "$(VMLINUX_KEEP)"; fi
-	bpftool btf dump file /sys/kernel/btf/vmlinux format c > pkg/ebpf/prog/vmlinux.h
-	@if [ -n "$(VMLINUX_KEEP)" ]; then cp pkg/ebpf/prog/vmlinux.h "$(VMLINUX_KEEP)/vmlinux.h"; fi
+generate-ebpf:
+	@ARCH ?= $(shell go env GOARCH)
+	@case "$(ARCH)" in \
+		amd64) VMLINUX=pkg/ebpf/prog/vmlinux-x86_64.h ;; \
+		arm64) VMLINUX=pkg/ebpf/prog/vmlinux-arm64.h ;; \
+		*) echo "generate-ebpf: unsupported ARCH=$(ARCH) (amd64|arm64)" >&2; exit 1 ;; \
+	esac
+	@test -f "$(VMLINUX)" || { echo "missing $(VMLINUX) — commit the per-arch vmlinux.h first" >&2; exit 1; }
+	@cp "$(VMLINUX)" pkg/ebpf/prog/vmlinux.h
 	@cd pkg/ebpf && go run github.com/cilium/ebpf/cmd/bpf2go@v0.16.0 \
 		-cc clang -no-strip \
 		-cflags "-Iprog -I$(shell go env GOMODCACHE)/github.com/cilium/ebpf@v0.16.0/btf/testdata" \
-		-target amd64 -target arm64 \
+		-target $(ARCH) \
 		-go-package ebpf -output-dir . \
 		audit prog/audit.bpf.c
 	@rm -f pkg/ebpf/prog/vmlinux.h
-	@echo "regenerated pkg/ebpf/audit_bpf*.o; commit them together with any audit.bpf.c changes"
+	@echo "regenerated pkg/ebpf/audit_bpf_$(ARCH).{go,o}"
 
 .PHONY: test-integration
 test-integration: ## Run integration tests (Linux + bwrap required).

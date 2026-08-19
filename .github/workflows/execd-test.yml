@@ -60,29 +60,25 @@ jobs:
         run: |
           CGO_ENABLED=1 go test -tags ebpf -count=1 ./pkg/ebpf/
 
-      - name: Dump runner vmlinux.h (per-arch source for ebpf bytecode)
+      - name: TEMP fetch x86_64 vmlinux.h (one-shot, remove after committing)
         if: runner.os == 'Linux'
         run: |
-          # One-shot fetch of the runner's kernel BTF as a C header. The
-          # Dockerfile ebpf-builder stage regenerates the CO-RE bytecode per
-          # TARGETARCH from committed prog/vmlinux-<arch>.h; this step is
-          # only used to obtain a fresh copy for committing.
           docker run --rm --privileged \
             -v /sys/kernel/btf:/sys/kernel/btf:ro \
             -v /tmp/ebpf-dump:/out ubuntu:24.04 bash -c '
               apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq linux-tools-generic >/dev/null 2>&1
               BPFT=$(ls /usr/lib/linux-tools/*/bpftool 2>/dev/null | head -1)
-              [ -n "$BPFT" ] || { echo "no bpftool in container" >&2; exit 1; }
-              $BPFT btf dump file /sys/kernel/btf/vmlinux format c > /out/vmlinux.h
+              [ -n "$BPFT" ] || { echo "no bpftool" >&2; exit 1; }
+              $BPFT btf dump file /sys/kernel/btf/vmlinux format c > /out/vmlinux-x86_64.h
             '
-          test -s /tmp/ebpf-dump/vmlinux.h
+          test -s /tmp/ebpf-dump/vmlinux-x86_64.h
 
-      - name: Upload per-arch vmlinux.h (for bytecode regeneration)
+      - name: Upload x86_64 vmlinux.h (one-shot)
         if: runner.os == 'Linux' && always()
         uses: actions/upload-artifact@v7
         with:
-          name: vmlinux-${{ runner.arch }}
-          path: /tmp/ebpf-dump/vmlinux.h
+          name: vmlinux-x86_64
+          path: /tmp/ebpf-dump/vmlinux-x86_64.h
           if-no-files-found: ignore
 
       - name: Upload per-arch vmlinux.h (for bytecode regeneration)
