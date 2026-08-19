@@ -609,6 +609,7 @@ jq -e '.status == "healthy"' "${artifacts_dir}/health.json" >/dev/null || \
   die "Server /health did not return the expected healthy response"
 
 curl --fail --silent --show-error --max-time 10 \
+  --header "OPEN-SANDBOX-API-KEY: ${api_key}" \
   "${server_base_url}/version" >"${artifacts_dir}/version.json"
 jq -e --arg expected "$server_app_version" '.version == $expected' \
   "${artifacts_dir}/version.json" >/dev/null || \

@@ -246,10 +246,12 @@ gh release download "$HELM_TAG" \
 sha256sum -c SHA256SUMS
 gh attestation verify "$HELM_PACKAGE" \
   --repo "$REPOSITORY" \
-  --signer-workflow "${WORKFLOW_REPOSITORY}/.github/workflows/publish-helm-chart.yml"
+  --signer-workflow "${WORKFLOW_REPOSITORY}/.github/workflows/publish-helm-chart.yml" \
+  --source-ref "refs/tags/${HELM_TAG}"
 gh attestation verify SHA256SUMS \
   --repo "$REPOSITORY" \
-  --signer-workflow "${WORKFLOW_REPOSITORY}/.github/workflows/publish-helm-chart.yml"
+  --signer-workflow "${WORKFLOW_REPOSITORY}/.github/workflows/publish-helm-chart.yml" \
+  --source-ref "refs/tags/${HELM_TAG}"
 ```
 
 The checksum binds the downloaded package to the digest recorded by the
