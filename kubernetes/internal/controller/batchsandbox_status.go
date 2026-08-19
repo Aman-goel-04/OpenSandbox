@@ -238,7 +238,23 @@ func applySteadyRuntimePhase(batchSbx *sandboxv1alpha1.BatchSandbox, status *san
 // Pending status — the next reconcile after allocation will write Succeed directly.
 func isInitialUnallocatedSandbox(batchSbx *sandboxv1alpha1.BatchSandbox, view runtimeView) bool {
 	return view.status.Replicas == 0 && batchSbx.Status.Phase == "" &&
-		batchSbx.Spec.Replicas != nil && *batchSbx.Spec.Replicas > 0
+		batchSbx.Spec.Replicas != nil && *batchSbx.Spec.Replicas > 0 &&
+		!hasTrueBatchSandboxCondition(
+			view.status.Conditions,
+			sandboxv1alpha1.BatchSandboxConditionPoolAllocationPending,
+		)
+}
+
+func hasTrueBatchSandboxCondition(
+	conditions []sandboxv1alpha1.BatchSandboxCondition,
+	conditionType sandboxv1alpha1.BatchSandboxConditionType,
+) bool {
+	for _, condition := range conditions {
+		if condition.Type == conditionType && condition.Status == sandboxv1alpha1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *BatchSandboxReconciler) persistRuntimeView(
@@ -320,6 +336,27 @@ func (r *BatchSandboxReconciler) updateStatus(ctx context.Context, batchSandbox 
 	}
 	log.Info("Patching BatchSandbox status", "resourceVersion", batchSandbox.ResourceVersion, "phase", mergedStatus.Phase, "patchData", string(patchData))
 	obj := &sandboxv1alpha1.BatchSandbox{ObjectMeta: metav1.ObjectMeta{Namespace: batchSandbox.Namespace, Name: batchSandbox.Name}}
+	if err := r.Status().Patch(ctx, obj, client.RawPatch(types.MergePatchType, patchData)); err != nil {
+		return err
+	}
+	r.StatusRVExpectation.Expect(obj)
+	return nil
+}
+
+func (r *BatchSandboxReconciler) updateStatusConditions(
+	ctx context.Context,
+	batchSandbox *sandboxv1alpha1.BatchSandbox,
+	conditions []sandboxv1alpha1.BatchSandboxCondition,
+) error {
+	patchData, err := json.Marshal(map[string]any{
+		"status": map[string]any{"conditions": conditions},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to marshal status conditions patch: %w", err)
+	}
+	obj := &sandboxv1alpha1.BatchSandbox{
+		ObjectMeta: metav1.ObjectMeta{Namespace: batchSandbox.Namespace, Name: batchSandbox.Name},
+	}
 	if err := r.Status().Patch(ctx, obj, client.RawPatch(types.MergePatchType, patchData)); err != nil {
 		return err
 	}
