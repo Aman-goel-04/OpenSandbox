@@ -79,6 +79,7 @@ jobs:
                 path === "scripts/python-k8s-execd-init-e2e.sh" ||
                 path === "tests/python/tests/test_execd_init_e2e.py" ||
                 path === "tests/python/tests/test_execd_hardening_e2e.py" ||
+                path === "tests/python/tests/test_execd_k8s_restart_recycle_e2e.py" ||
                 path === "server/opensandbox_server/examples/e2e.batchsandbox-template.yaml" ||
                 path.startsWith("components/execd/") ||
                 path.startsWith("kubernetes/charts/"),
@@ -89,7 +90,8 @@ jobs:
               execd: (path) =>
                 workflowChanged(path, "execd-test.yml") ||
                 path.startsWith("components/execd/") ||
-                path.startsWith("components/internal/"),
+                path.startsWith("components/internal/") ||
+                path === "scripts/execd-ebpf-smoke.sh",
               nodeagent: (path) =>
                 workflowChanged(path, "nodeagent-test.yml") ||
                 path.startsWith("components/nodeagent/") ||
