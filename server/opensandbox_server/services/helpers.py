@@ -103,7 +103,11 @@ def parse_nano_cpus(value: Optional[str]) -> Optional[int]:
     if not math.isfinite(nano_cpus):
         logger.warning("CPU limit is too large. Got '%s'. Ignoring.", value)
         return None
-    return int(nano_cpus)
+    nano_cpus = int(nano_cpus)
+    if nano_cpus > (1 << 63) - 1:
+        logger.warning("CPU limit is too large. Got '%s'. Ignoring.", value)
+        return None
+    return nano_cpus
 
 
 def parse_gpu_request(value: Optional[str]) -> Optional[int]:

@@ -101,8 +101,10 @@ def test_parse_nano_cpus():
     assert parse_nano_cpus("bad") is None
 
 
-@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "1e308", "1e309", "-1e309"])
-def test_parse_nano_cpus_rejects_non_finite_values(value: str):
+@pytest.mark.parametrize(
+    "value", ["nan", "inf", "-inf", "1e10", "1e308", "1e309", "-1e309"]
+)
+def test_parse_nano_cpus_rejects_non_finite_and_overflow_values(value: str):
     assert parse_nano_cpus(value) is None
 
 
