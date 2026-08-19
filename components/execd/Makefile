@@ -182,7 +182,7 @@ generate-ebpf:
 	@cp "$(VMLINUX)" pkg/ebpf/prog/vmlinux.h
 	@cd pkg/ebpf && go run github.com/cilium/ebpf/cmd/bpf2go@v0.16.0 \
 		-cc clang -no-strip \
-		-cflags "-Iprog -I$(shell go env GOMODCACHE)/github.com/cilium/ebpf@v0.16.0/btf/testdata" \
+		-cflags "-Iprog" \
 		-target $(ARCH) \
 		-go-package ebpf -output-dir . \
 		audit prog/audit.bpf.c

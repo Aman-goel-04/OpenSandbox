@@ -133,7 +133,7 @@ RUN case "${TARGETARCH}" in \
     && cp "$VMLINUX" pkg/ebpf/prog/vmlinux.h \
     && go run github.com/cilium/ebpf/cmd/bpf2go@v0.16.0 \
        -cc clang -no-strip \
-       -cflags "-Ipkg/ebpf/prog -I$(go env GOMODCACHE)/github.com/cilium/ebpf@v0.16.0/btf/testdata" \
+       -cflags "-Ipkg/ebpf/prog" \
        -target "${TARGETARCH}" \
        -go-package ebpf -output-dir pkg/ebpf \
        audit pkg/ebpf/prog/audit.bpf.c \
