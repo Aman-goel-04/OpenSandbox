@@ -92,7 +92,8 @@ type Observer struct {
 	sandboxID string
 	kinds     map[string]bool
 	reader    *ringbuf.Reader
-	objs      *auditObjects
+	events    *ebpf.Map
+	progs     []*ebpf.Program
 	links     []link.Link
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -127,31 +128,35 @@ func Init(cfg *isolation.EbpfConfig, sandboxID string) (state, message string) {
 		return "degraded", fmt.Sprintf("eBPF observation cannot scope to the sandbox cgroup: %v", err)
 	}
 
-	observer, err := newObserver(cfg, sandboxID, cgroupID)
+	observer, missing, err := newObserver(cfg, sandboxID, cgroupID)
 	if err != nil {
 		return "degraded", fmt.Sprintf("eBPF observation failed to start: %v", err)
 	}
 	observer.start()
-	return "active", fmt.Sprintf("eBPF observation active (cgroup %d, audit file %s)", cgroupID, observer.logger.Filename)
+	msg := fmt.Sprintf("eBPF observation active (cgroup %d, audit file %s)", cgroupID, observer.logger.Filename)
+	if len(missing) > 0 {
+		// Fail-open per layer: hooks the kernel could not load/attach are
+		// skipped, the remaining ones keep auditing — but report the layer
+		// as degraded (spec: "configured but a prerequisite is missing")
+		// so callers do not mistake partial coverage for fully active
+		// auditing.
+		return "degraded", msg + fmt.Sprintf("; hooks not active: %v", missing)
+	}
+	return "active", msg
 }
 
-func newObserver(cfg *isolation.EbpfConfig, sandboxID string, cgroupID uint64) (*Observer, error) {
+func newObserver(cfg *isolation.EbpfConfig, sandboxID string, cgroupID uint64) (*Observer, []string, error) {
 	_ = rlimit.RemoveMemlock()
 
 	spec, err := loadAudit()
 	if err != nil {
-		return nil, fmt.Errorf("load audit programs: %w", err)
+		return nil, nil, fmt.Errorf("load audit programs: %w", err)
 	}
 	// Pin the cgroup filter; events outside the sandbox are dropped.
 	if err := spec.RewriteConstants(map[string]interface{}{
 		"target_cgroup": cgroupID,
 	}); err != nil {
-		return nil, fmt.Errorf("set audit cgroup filter: %w", err)
-	}
-
-	var objs auditObjects
-	if err := spec.LoadAndAssign(&objs, nil); err != nil {
-		return nil, fmt.Errorf("assign audit programs: %w", err)
+		return nil, nil, fmt.Errorf("set audit cgroup filter: %w", err)
 	}
 
 	auditFile := cfg.AuditFile
@@ -159,8 +164,7 @@ func newObserver(cfg *isolation.EbpfConfig, sandboxID string, cgroupID uint64) (
 		auditFile = defaultAuditFile
 	}
 	if err := os.MkdirAll(dirOf(auditFile), 0o755); err != nil {
-		objs.Close()
-		return nil, fmt.Errorf("create audit dir: %w", err)
+		return nil, nil, fmt.Errorf("create audit dir: %w", err)
 	}
 	logger := &lumberjack.Logger{
 		Filename:   auditFile,
@@ -169,37 +173,64 @@ func newObserver(cfg *isolation.EbpfConfig, sandboxID string, cgroupID uint64) (
 		MaxAge:     7, // days
 	}
 
-	var links []link.Link
-	attached := map[string]bool{}
-	attach := func(kind string, prog *ebpf.Program, attachFn func() (link.Link, error)) {
-		if prog == nil {
-			return
-		}
-		l, err := attachFn()
-		if err != nil {
-			log.Warn("ebpf: attach %s: %v", kind, err)
-			return
-		}
-		links = append(links, l)
-		attached[kind] = true
-	}
-	attach("exec", objs.OnExec, func() (link.Link, error) {
-		return link.Tracepoint("sched", "sched_process_exec", objs.OnExec, nil)
-	})
-	attach("connect", objs.OnConnect, func() (link.Link, error) {
-		return link.Tracepoint("sock", "inet_sock_set_state", objs.OnConnect, nil)
-	})
-	attach("privilege", objs.OnCommitCreds, func() (link.Link, error) {
-		return link.Kprobe("commit_creds", objs.OnCommitCreds, nil)
-	})
-
-	reader, err := ringbuf.NewReader(objs.Events)
+	// Load the shared ringbuf map once; every hook writes into it.
+	eventsMap, err := ebpf.NewMap(spec.Maps["events"])
 	if err != nil {
-		for _, l := range links {
-			_ = l.Close()
+		return nil, nil, fmt.Errorf("create events ringbuf: %w", err)
+	}
+
+	// Each hook is loaded and attached independently (fail-open per layer,
+	// OSEP-0018 §6): a kernel that cannot load one program (e.g. a kprobe
+	// CO-RE relocation on an old kernel) only degrades that hook; the rest
+	// keep auditing.
+	type hookDef struct {
+		kind   string
+		prog   string
+		load   func(*ebpf.CollectionSpec) (*ebpf.Program, error)
+		attach func(*ebpf.Program) (link.Link, error)
+	}
+	withSharedEvents := func(target any) func(*ebpf.CollectionSpec) (*ebpf.Program, error) {
+		return func(sub *ebpf.CollectionSpec) (*ebpf.Program, error) {
+			if err := sub.LoadAndAssign(target, &ebpf.CollectionOptions{
+				MapReplacements: map[string]*ebpf.Map{"events": eventsMap},
+			}); err != nil {
+				return nil, err
+			}
+			prog := programFromTarget(target)
+			return prog, nil
 		}
-		objs.Close()
-		return nil, fmt.Errorf("ringbuf reader: %w", err)
+	}
+	hooks := []hookDef{
+		{
+			kind: "exec",
+			prog: "on_exec",
+			load: withSharedEvents(&struct {
+				OnExec *ebpf.Program `ebpf:"on_exec"`
+			}{}),
+			attach: func(p *ebpf.Program) (link.Link, error) {
+				return link.Tracepoint("sched", "sched_process_exec", p, nil)
+			},
+		},
+		{
+			kind: "connect",
+			prog: "on_connect",
+			load: withSharedEvents(&struct {
+				OnConnect *ebpf.Program `ebpf:"on_connect"`
+			}{}),
+			attach: func(p *ebpf.Program) (link.Link, error) {
+				return link.Tracepoint("sock", "inet_sock_set_state", p, nil)
+			},
+		},
+		{
+			kind: "privilege",
+			prog: "on_commit_creds",
+			load: withSharedEvents(&struct {
+				OnCommitCreds *ebpf.Program `ebpf:"on_commit_creds"`
+			}{}),
+			attach: func(p *ebpf.Program) (link.Link, error) {
+				return link.Kprobe("commit_creds", p, nil)
+			},
+		},
 	}
 
 	kinds := map[string]bool{}
@@ -211,18 +242,55 @@ func newObserver(cfg *isolation.EbpfConfig, sandboxID string, cgroupID uint64) (
 			kinds[kind] = true
 		}
 	}
-	for kind := range kinds {
-		if !attached[kind] {
-			// Release every already-attached hook and the ringbuf reader so
-			// partially attached programs do not stay live after the
-			// degraded report.
-			for _, l := range links {
-				_ = l.Close()
-			}
-			reader.Close()
-			objs.Close()
-			return nil, fmt.Errorf("requested observer hook %q could not be attached", kind)
+
+	var links []link.Link
+	var progs []*ebpf.Program
+	var missing []string
+	for _, h := range hooks {
+		if !kinds[h.kind] {
+			continue
 		}
+		sub := spec.Copy()
+		for name := range sub.Programs {
+			if name != h.prog {
+				delete(sub.Programs, name)
+			}
+		}
+		prog, err := h.load(sub)
+		if err != nil {
+			log.Warn("ebpf: load %s hook: %v", h.kind, err)
+			missing = append(missing, h.kind)
+			continue
+		}
+		progs = append(progs, prog)
+		l, err := h.attach(prog)
+		if err != nil {
+			log.Warn("ebpf: attach %s: %v", h.kind, err)
+			_ = prog.Close()
+			missing = append(missing, h.kind)
+			continue
+		}
+		links = append(links, l)
+	}
+
+	if len(links) == 0 {
+		eventsMap.Close()
+		for _, p := range progs {
+			_ = p.Close()
+		}
+		return nil, nil, fmt.Errorf("no observer hooks could be loaded/attached (missing: %v)", missing)
+	}
+
+	reader, err := ringbuf.NewReader(eventsMap)
+	if err != nil {
+		for _, l := range links {
+			_ = l.Close()
+		}
+		for _, p := range progs {
+			_ = p.Close()
+		}
+		eventsMap.Close()
+		return nil, nil, fmt.Errorf("ringbuf reader: %w", err)
 	}
 
 	return &Observer{
@@ -230,10 +298,32 @@ func newObserver(cfg *isolation.EbpfConfig, sandboxID string, cgroupID uint64) (
 		sandboxID: sandboxID,
 		kinds:     kinds,
 		reader:    reader,
-		objs:      &objs,
+		events:    eventsMap,
+		progs:     progs,
 		links:     links,
 		closed:    make(chan struct{}),
-	}, nil
+	}, missing, nil
+}
+
+// programFromTarget extracts the loaded *ebpf.Program from a single-field
+// load target (the anonymous structs in newObserver).
+func programFromTarget(target any) *ebpf.Program {
+	switch v := target.(type) {
+	case *struct {
+		OnExec *ebpf.Program `ebpf:"on_exec"`
+	}:
+		return v.OnExec
+	case *struct {
+		OnConnect *ebpf.Program `ebpf:"on_connect"`
+	}:
+		return v.OnConnect
+	case *struct {
+		OnCommitCreds *ebpf.Program `ebpf:"on_commit_creds"`
+	}:
+		return v.OnCommitCreds
+	default:
+		panic(fmt.Sprintf("unexpected load target %T", target))
+	}
 }
 
 func (o *Observer) start() {
@@ -261,8 +351,11 @@ func (o *Observer) Close() {
 		for _, l := range o.links {
 			_ = l.Close()
 		}
-		if o.objs != nil {
-			o.objs.Close()
+		for _, p := range o.progs {
+			_ = p.Close()
+		}
+		if o.events != nil {
+			_ = o.events.Close()
 		}
 		_ = o.logger.Close()
 	})

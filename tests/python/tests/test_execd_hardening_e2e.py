@@ -14,7 +14,7 @@
 # limitations under the License.
 #
 """
-E2E tests for the server-path hardening floor (OSEP-0018 R-i).
+E2E tests for the server-path hardening floor (execd-as-init, OSEP-0018).
 
 Requires a server running with ``runtime.execd_run_as_init = true``. Docker
 bridge (scripts/python-execd-hardening-e2e.sh) injects the hardened TOML via
@@ -57,10 +57,24 @@ OPENSANDBOX_HARDENING_DEGRADATION=true):
   NOT trimmed (fail-open: workloads keep the container ceiling's bounding
   set)
 
-A third class covers bwrap isolated sessions under init mode + the floor
-(OSEP-0018 R-o): sessions run with the bwrap namespace + seccomp/NNP floor
-and the credential env strip, and the hardening report stays intact around
+A third class covers bwrap isolated sessions under init mode + the floor:
+sessions run with the bwrap namespace + seccomp/NNP floor and the
+credential env strip, and the hardening report stays intact around
 session create/run/delete.
+
+A fourth class runs a custom-policy TOML variant
+(configs/isolation.custom.toml): a `[seccomp] deny` override (chmod family,
+which REPLACES the built-in denylist) + `keep_capabilities=["CAP_NET_RAW"]`.
+It asserts the denied syscall fails with EACCES in /command while the kept
+capability is raised in the ambient set and survives execve (CapEff=0x2000).
+
+A fifth class pins the EXECD_INIT <-> TOML drift state: the hardened
+TOML with `runtime.execd_run_as_init = false` must report init_mode=none and
+degrade the enabled layers (with EXECD_INIT guidance), while execd-spawned
+/command still runs through the floor.
+
+A sixth class pins the default-off state: with no isolation TOML and no
+EXECD_INIT, every layer reports disabled and the workload is unaffected.
 """
 
 import logging
@@ -108,6 +122,10 @@ COMMAND_ENV_STRIPPED = [
 # ConfigMap, mounted by the e2e batchsandbox template at this path.
 K8S_EXECD_ISOLATION_CONFIG = "/etc/opensandbox/execd-isolation/isolation.hardened.toml"
 
+# Kubernetes: the custom-policy TOML (R-q) is a second key in the same
+# ConfigMap, so it lands next to the hardened one without a template change.
+K8S_EXECD_CUSTOM_CONFIG = "/etc/opensandbox/execd-isolation/isolation.custom.toml"
+
 # Kubernetes: the e2e PVC is backed by a hostPath PV on the kind node. The PV
 # used to live under the node's /tmp, which is a noexec tmpfs, so every mount
 # of the PVC was not executable (writes/reads fine, exec EACCES regardless of
@@ -142,22 +160,36 @@ def _hardened_sandbox_options() -> dict:
         ],
     }
 
-_HARDENING_REPORT: HardeningStatus | None = None
+
+def _custom_policy_sandbox_options() -> dict:
+    """Sandbox create kwargs that point execd at the custom-policy TOML
+    (R-q). Docker: the phase-3 server config binds it at the default path, so
+    no request args are needed. Kubernetes: point the request env at the
+    second ConfigMap key (no workspace mount needed — no Landlock here).
+    """
+    if not is_kubernetes_runtime():
+        return {}
+    return {
+        "env": {"EXECD_ISOLATION_CONFIG": K8S_EXECD_CUSTOM_CONFIG},
+    }
+
+_HARDENING_REPORT: dict[str, HardeningStatus] = {}
 
 
 def _hardening_report(sandbox: SandboxSync, refresh: bool = False) -> HardeningStatus:
-    """Probe execd's capabilities endpoint via the SDK model and cache.
+    """Probe execd's capabilities endpoint via the SDK model and cache per
+    sandbox (multiple sandbox classes share one pytest invocation on k8s, so
+    a process-global cache would leak one sandbox's report into another).
     ``refresh=True`` forces a live probe (used where the assertion must
     observe the endpoint AFTER a state change, e.g. session teardown).
     Consuming ``IsolatedCapabilities.hardening`` also pins the spec -> SDK
-    -> implementation alignment of the hardening object (OSEP-0018 R-r)."""
-    global _HARDENING_REPORT
-    if _HARDENING_REPORT is None or refresh:
+    -> implementation alignment of the hardening object."""
+    if refresh or sandbox.id not in _HARDENING_REPORT:
         caps = sandbox.isolation.capabilities()
         if caps.hardening is None:
             pytest.fail("capabilities endpoint returned no hardening object")
-        _HARDENING_REPORT = caps.hardening
-    return _HARDENING_REPORT
+        _HARDENING_REPORT[sandbox.id] = caps.hardening
+    return _HARDENING_REPORT[sandbox.id]
 
 
 def _landlock_state(sandbox: SandboxSync) -> str:
@@ -171,7 +203,7 @@ def _status_fields(sandbox: SandboxSync, fields: list[str]) -> dict:
 
     Two constraints: (1) the read happens with the shell's own read loop,
     NOT with forked helpers — under Landlock the ruleset only grants the
-    launcher's own /proc/<pid> (documented OSEP-0018 limitation), so a
+    launcher's own /proc/<pid> (a documented limitation), so a
     forked grep/cat would get EACCES on its own /proc/self; (2) execd's
     /command SSE output strips newlines, so the values must come out as a
     single line (space-separated key=value pairs).
@@ -240,7 +272,7 @@ class TestHardeningE2E:
         # reflects exactly the launcher-applied floor. The status is read
         # with the shell's own loop, NOT `cat`: under Landlock a forked
         # descendant resolves its own /proc/<pid>, which the inherited
-        # ruleset does not grant (documented OSEP-0018 limitation), so a
+        # ruleset does not grant (a documented limitation), so a
         # forked helper would get EACCES.
         sbx = _create_sandbox(
             entrypoint=[
@@ -338,7 +370,7 @@ class TestHardeningE2E:
             # k8s regression probe: confirm the PVC mount is really present
             # and executable. /proc must be read with the shell's own loop:
             # the Landlock /proc/self rule pins the launcher's pid, so forked
-            # helpers get EACCES on their own procfs (documented OSEP-0018
+            # helpers get EACCES on their own procfs (a documented
             # limitation).
             diag = _run_command(
                 sandbox,
@@ -402,9 +434,188 @@ class TestHardeningDegradationE2E:
         assert status["CapBnd"] != "0000000000000000", status
 
 
+class TestHardeningCustomPolicyE2E:
+    """Custom `[seccomp] deny` override + `keep_capabilities`.
+
+    The sandbox runs with configs/isolation.custom.toml: hardening enabled,
+    a `[seccomp] deny` override (chmod/fchmodat/fchmodat2 — REPLACES the
+    built-in denylist) and keep_capabilities=["CAP_NET_RAW"]. Proves:
+
+    - the custom deny list reaches the workload: the denied syscall fails
+      with EACCES in /command
+    - keep_capabilities are raised in the ambient set and survive execve:
+      /command shows CapEff=0000000000002000 (CAP_NET_RAW = bit 13) with the
+      bounding set trimmed to the kept caps
+    - the capabilities endpoint reports the overrides as active
+    """
+
+    @pytest.fixture(scope="module", autouse=True)
+    def sandbox(self):
+        # Keep the entrypoint trivial: it also runs through the launcher with
+        # the same policy, and the deny list (chmod family) must not break it.
+        sbx = _create_sandbox(
+            entrypoint=["sh", "-c", "while :; do sleep 1; done"],
+            tag="execd-hardening-custom-policy-e2e",
+            **_custom_policy_sandbox_options(),
+        )
+        logger.info("✓ custom-policy sandbox created: %s", sbx.id)
+        yield sbx
+        _destroy(sbx)
+
+    def test_capabilities_endpoint_reports_custom_policy(self, sandbox) -> None:
+        report = _hardening_report(sandbox)
+        assert report.init_mode == "pid1", f"init_mode = {report.init_mode}"
+        assert report.cap_drop is not None and report.cap_drop.state == "active", (
+            report.cap_drop
+        )
+        assert report.seccomp is not None and report.seccomp.state == "active", (
+            report.seccomp
+        )
+        # The custom TOML has no [landlock] section: it must stay disabled,
+        # not be dragged into the active state.
+        assert report.landlock is not None and report.landlock.state == "disabled", (
+            report.landlock
+        )
+
+    def test_denied_syscall_fails_in_command(self, sandbox) -> None:
+        # The custom deny list replaces the built-in one; chmod family must
+        # fail with EACCES while the shell itself keeps running.
+        result = sandbox.commands.run(
+            "echo x > /tmp/rq-probe && chmod 755 /tmp/rq-probe"
+        )
+        assert result.error is not None, "chmod must be denied by the custom deny list"
+        stderr = "".join(msg.text for msg in result.logs.stderr)
+        assert "Permission denied" in stderr or "Operation not permitted" in stderr, stderr
+
+    def test_kept_capability_survives_execve(self, sandbox) -> None:
+        # CAP_NET_RAW (bit 13) raised in the ambient set: CapEff=0x2000 in
+        # /command, and the bounding set is trimmed to exactly the kept caps.
+        status = _status_fields(sandbox, ["CapEff", "CapBnd", "Seccomp", "NoNewPrivs"])
+        assert status["CapEff"] == "0000000000002000", status
+        assert status["CapBnd"] == "0000000000002000", status
+        assert status["Seccomp"] == "2", status
+        assert status["NoNewPrivs"] == "1", status
+
+    def test_other_syscalls_still_work(self, sandbox) -> None:
+        # The custom deny list is a deny-override, not a lockdown: non-denied
+        # syscalls keep working in the same session.
+        out = _run_command(sandbox, "echo custom-deny-ok")
+        assert "custom-deny-ok" in out, out
+
+
+@pytest.mark.skipif(
+    os.environ.get("OPENSANDBOX_HARDENING_DRIFT") != "true",
+    reason="requires the drift server (hardened TOML with execd_run_as_init = "
+    "false); run via scripts/python-execd-hardening-e2e.sh phase 4",
+)
+@pytest.mark.skipif(
+    is_kubernetes_runtime(),
+    reason="drift needs a second server deployment with execd_run_as_init = "
+    "false (the k8s e2e server runs with it on); docker-only",
+)
+class TestHardeningDriftE2E:
+    """EXECD_INIT <-> TOML drift pin.
+
+    `[hardening] enabled` with `runtime.execd_run_as_init = false`: the
+    hardening endpoint must report init_mode=none and degrade the enabled
+    layers with EXECD_INIT guidance (the image entrypoint is not wrapped),
+    while execd-spawned /command still runs through the floor.
+    """
+
+    @pytest.fixture(scope="module", autouse=True)
+    def sandbox(self):
+        sbx = _create_sandbox(
+            entrypoint=["sh", "-c", "while :; do sleep 1; done"],
+            tag="execd-hardening-drift-e2e",
+        )
+        logger.info("✓ drift sandbox created: %s", sbx.id)
+        yield sbx
+        _destroy(sbx)
+
+    def test_init_mode_none_and_layers_degraded(self, sandbox) -> None:
+        report = _hardening_report(sandbox)
+        assert report.init_mode == "none", f"init_mode = {report.init_mode}"
+        assert report.signal_shield is False
+        for layer, name in (
+            (report.cap_drop, "cap_drop"),
+            (report.seccomp, "seccomp"),
+            (report.landlock, "landlock"),
+        ):
+            assert layer is not None, name
+            assert layer.state == "degraded", f"{name} state = {layer.state}"
+            assert layer.message is not None and "EXECD_INIT" in layer.message, (
+                layer.message
+            )
+        assert report.ebpf is not None and report.ebpf.state == "disabled", (
+            report.ebpf
+        )
+
+    def test_command_still_runs_through_floor(self, sandbox) -> None:
+        # Fail-open but honest: without init mode the image entrypoint is not
+        # wrapped, but execd-spawned /command still goes through the launcher
+        # — the endpoint says degraded rather than pretending full coverage.
+        status = _status_fields(sandbox, ["CapEff", "Seccomp", "NoNewPrivs"])
+        assert status["CapEff"] == "0000000000000000", status
+        assert status["Seccomp"] == "2", status
+        assert status["NoNewPrivs"] == "1", status
+
+
+@pytest.mark.skipif(
+    os.environ.get("OPENSANDBOX_HARDENING_DEFAULT_OFF") != "true",
+    reason="requires the plain server (no isolation TOML, execd_run_as_init = "
+    "false); run via scripts/python-execd-hardening-e2e.sh phase 5",
+)
+@pytest.mark.skipif(
+    is_kubernetes_runtime(),
+    reason="default-off needs a plain server (the k8s e2e server runs with "
+    "execd_run_as_init = true and the hardened TOML); docker-only",
+)
+class TestHardeningDefaultOffE2E:
+    """Default-off pin.
+
+    With no isolation TOML and no EXECD_INIT, execd must be exactly the
+    pre-OSEP binary: the capabilities endpoint reports init_mode=none with
+    every layer disabled (no drift, no fabricated states), and the workload
+    is unaffected — /command runs with the container ceiling caps and no
+    seccomp floor.
+    """
+
+    @pytest.fixture(scope="module", autouse=True)
+    def sandbox(self):
+        sbx = _create_sandbox(
+            entrypoint=["sh", "-c", "while :; do sleep 1; done"],
+            tag="execd-hardening-default-off-e2e",
+        )
+        logger.info("✓ default-off sandbox created: %s", sbx.id)
+        yield sbx
+        _destroy(sbx)
+
+    def test_all_layers_disabled_without_config(self, sandbox) -> None:
+        report = _hardening_report(sandbox)
+        assert report.init_mode == "none", f"init_mode = {report.init_mode}"
+        assert report.signal_shield is False
+        for layer, name in (
+            (report.cap_drop, "cap_drop"),
+            (report.seccomp, "seccomp"),
+            (report.landlock, "landlock"),
+            (report.ebpf, "ebpf"),
+        ):
+            assert layer is not None, name
+            assert layer.state == "disabled", f"{name} state = {layer.state}"
+            assert layer.message is not None, f"{name} message missing"
+
+    def test_workload_unaffected_without_hardening(self, sandbox) -> None:
+        # No floor: the workload keeps the container ceiling (cap_drop list
+        # still removes the dangerous caps from the ceiling, but nothing the
+        # launcher would subtract on top of that) and no seccomp filter.
+        status = _status_fields(sandbox, ["CapEff", "Seccomp", "NoNewPrivs"])
+        assert status["CapEff"] != "0000000000000000", status
+        assert status["Seccomp"] == "0", status
+        assert status["NoNewPrivs"] == "0", status
+
+
 class TestIsolatedSessionHardeningE2E:
-    """bwrap isolated sessions under init mode + the hardening floor
-    (OSEP-0018 R-o).
+    """bwrap isolated sessions under init mode + the hardening floor.
 
     The sandbox runs with ``[hardening]``/``[landlock]`` enabled and execd as
     PID 1, so the whole server -> sandbox -> execd -> launcher -> bwrap chain
