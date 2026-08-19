@@ -158,6 +158,40 @@ build-ebpf: ## Build the execd-ebpf observation variant (CGO + cilium/ebpf).
 	CGO_ENABLED=1 go build -tags ebpf $(GO_BUILD_FLAGS) -ldflags "$(GO_LDFLAGS)" -o bin/execd-ebpf main.go
 	@echo "built bin/execd-ebpf"
 
+# Regenerate the CO-RE audit bytecode (pkg/ebpf/audit_bpf*.o) on a Linux host.
+#
+# The BPF source (prog/audit.bpf.c) is compiled per target architecture with
+# bpf2go; each architecture's vmlinux.h is dumped from the BUILD HOST's own
+# /sys/kernel/btf/vmlinux, so the bytecode's pt_regs layout matches the
+# architecture it runs on (a vmlinux.h from the wrong arch — e.g. an arm64
+# dump shipped to x86_64 hosts — poisons the BPF_KPROBE parameter relocations,
+# issue #1563). Run on an x86_64 and an arm64 Linux host and commit the
+# regenerated .o files:
+#
+#   make generate-ebpf ARCHS="amd64 arm64"
+#
+# Requires clang with the bpf target (linux-tools/clang on Ubuntu) and
+# bpftool (linux-tools-generic). The generated Go bindings embed the .o, so
+# the .c and vmlinux.h must be in sync with what is committed.
+.PHONY: generate-ebpf
+generate-ebpf: ## Regenerate pkg/ebpf/audit_bpf*.o from prog/audit.bpf.c (Linux + clang + bpftool).
+	@if [ "$$(uname -s 2>/dev/null || echo non-linux)" != "Linux" ]; then \
+		echo "generate-ebpf requires Linux (dump /sys/kernel/btf/vmlinux)" >&2; \
+		exit 1; \
+	fi
+	@command -v clang >/dev/null || { echo "clang not found" >&2; exit 1; }
+	@command -v bpftool >/dev/null || { echo "bpftool not found (install linux-tools-generic)" >&2; exit 1; }
+	@mkdir -p pkg/ebpf/prog
+	bpftool btf dump file /sys/kernel/btf/vmlinux format c > pkg/ebpf/prog/vmlinux.h
+	@cd pkg/ebpf && go run github.com/cilium/ebpf/cmd/bpf2go@v0.16.0 \
+		-cc clang -no-strip \
+		-cflags "-Iprog -I$(shell go env GOMODCACHE)/github.com/cilium/ebpf@v0.16.0/btf/testdata" \
+		-target amd64 -target arm64 \
+		-go-package ebpf -output-dir . \
+		audit prog/audit.bpf.c
+	@rm -f pkg/ebpf/prog/vmlinux.h
+	@echo "regenerated pkg/ebpf/audit_bpf*.o; commit them together with any audit.bpf.c changes"
+
 .PHONY: test-integration
 test-integration: ## Run integration tests (Linux + bwrap required).
 	go test -v -tags="linux,bwrap" -run Integration ./pkg/runtime/bwrap_test/
