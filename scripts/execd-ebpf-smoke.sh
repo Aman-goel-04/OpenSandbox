@@ -136,18 +136,20 @@ message = ebpf.get("message", "")
 print(f"ebpf state: {state}")
 if message:
     print(f"ebpf message: {message}")
-# Fail-open: "degraded/unsupported" still boots execd, but no hooks attached
-# — nothing will be written. The smoke must see active. A per-hook degrade
-# (e.g. the commit_creds kprobe failing on a given kernel) keeps the state
-# active and reports the missing hooks in the message; the audit assertions
-# below then still require exec+connect events.
-if state != "active":
-    print(f"FAIL: ebpf state = {state}, want active (hooks did not attach)", file=sys.stderr)
+# "unsupported" (no BTF/caps) still boots execd, but no hooks attach —
+# nothing will be written. "degraded" means some hooks are down but the
+# rest keep auditing; "active" means full exec/connect/privilege coverage.
+if state == "unsupported":
+    print("FAIL: ebpf state = unsupported (hooks did not attach)", file=sys.stderr)
     sys.exit(1)
-if "hooks not active" in message:
-    # Partial hook degrade: keep the smoke running (exec+connect must still
-    # flow), but flag the container-log dump below.
+if state == "degraded" and "hooks not active" in message:
+    # Partial hook degrade (e.g. commit_creds kprobe failing on a given
+    # kernel): keep the smoke running — exec+connect must still flow and
+    # be asserted below — but flag the container-log dump.
     sys.exit(2)
+if state != "active":
+    print(f"FAIL: unexpected ebpf state = {state}", file=sys.stderr)
+    sys.exit(1)
 PY
 report_rc=$?
 set -e
@@ -189,12 +191,12 @@ for want in ("exec", "connect"):
         print(f"FAIL: no {want} events", file=sys.stderr)
         ok = False
 if kinds["privilege"] == 0:
-    # The hook attach is validated by state=active (or the per-hook degrade
-    # reported in the message); the event itself needs a setuid transition,
-    # which is harder to provoke reliably in a bare busybox container —
-    # warn, do not fail.
-    print("WARN: no privilege events (setuid transition not provoked)")
+    # `su` (or any setuid transition) reliably fires commit_creds; a zero
+    # count means the privilege hook attached but events are broken, which
+    # the smoke exists to catch — fail, not warn.
+    print("FAIL: no privilege events (commit_creds hook not producing)", file=sys.stderr)
+    ok = False
 sys.exit(0 if ok else 1)
 PY
 
-echo "PASS: execd-ebpf smoke (state=active, exec+connect events decoded)"
+echo "PASS: execd-ebpf smoke (state=active, exec+connect+privilege events decoded)"

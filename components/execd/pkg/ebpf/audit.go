@@ -136,8 +136,11 @@ func Init(cfg *isolation.EbpfConfig, sandboxID string) (state, message string) {
 	msg := fmt.Sprintf("eBPF observation active (cgroup %d, audit file %s)", cgroupID, observer.logger.Filename)
 	if len(missing) > 0 {
 		// Fail-open per layer: hooks the kernel could not load/attach are
-		// skipped, the remaining ones keep auditing.
-		msg += fmt.Sprintf("; hooks not active: %v", missing)
+		// skipped, the remaining ones keep auditing — but report the layer
+		// as degraded (spec: "configured but a prerequisite is missing")
+		// so callers do not mistake partial coverage for fully active
+		// auditing.
+		return "degraded", msg + fmt.Sprintf("; hooks not active: %v", missing)
 	}
 	return "active", msg
 }
