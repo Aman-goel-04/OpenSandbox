@@ -16,19 +16,19 @@ import asyncio
 import os
 from datetime import timedelta
 
-from opensandbox import Sandbox
-from opensandbox.config import ConnectionConfig
-from opensandbox.models.execd import RunCommandOpts
-
 from novnc_url import (
     browser_proxy_auth_warning,
     build_novnc_url,
     normalize_domain,
     parse_bool,
+    resolve_api_key,
     resolve_novnc_protocol,
     resolve_protocol,
     validate_connection_mode,
 )
+from opensandbox import Sandbox
+from opensandbox.config import ConnectionConfig
+from opensandbox.models.execd import RunCommandOpts
 
 
 def _required_env(name: str) -> str:
@@ -59,7 +59,10 @@ async def main() -> None:
     protocol = resolve_protocol(domain, os.getenv("SANDBOX_PROTOCOL"))
     use_server_proxy = _bool_env("SANDBOX_USE_SERVER_PROXY")
     validate_connection_mode(protocol, use_server_proxy)
-    api_key = os.getenv("SANDBOX_API_KEY")
+    api_key = resolve_api_key(
+        os.getenv("SANDBOX_API_KEY"),
+        os.getenv("OPEN_SANDBOX_API_KEY"),
+    )
     image = os.getenv(
         "SANDBOX_IMAGE",
         "opensandbox/desktop:latest",
