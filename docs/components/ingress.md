@@ -7,9 +7,10 @@ description: HTTP/WebSocket reverse proxy that routes traffic to OpenSandbox ins
 
 ## Overview
 - HTTP/WebSocket reverse proxy that routes to sandbox instances.
-- Watches sandbox CRs (BatchSandbox or AgentSandbox, chosen by `--provider-type`) across all namespaces:
+- Resolves sandbox routes using the provider selected by `--provider-type`:
   - BatchSandbox: reads endpoints from `sandbox.opensandbox.io/endpoints` annotation.
   - AgentSandbox: reads `status.serviceFQDN`.
+  - Fleets: lazily calls FastPath v2 `ResolveEndpoint` when traffic arrives.
 - Exposes `/status.ok` health check; prints build metadata (version, commit, time, Go/platform) at startup.
 
 ## Quick Start
@@ -18,7 +19,7 @@ cd components/ingress
 
 go run main.go \
   --namespace <any-value-kept-for-compatibility> \
-  --provider-type <batchsandbox|agent-sandbox> \
+  --provider-type <batchsandbox|agent-sandbox|fleets> \
   --mode <header|uri> \
   --port 28888 \
   --log-level info
@@ -95,6 +96,40 @@ The server must have `renew_intent` (and Redis consumer for ingress mode) enable
 | `--renew-intent-queue-max-len` | `0` | Max list length (0 = no cap); LTRIM applied when > 0 |
 | `--renew-intent-min-interval` | `60` | Min seconds between intents per sandbox (client-side throttle) |
 
+Fleets intents additionally carry the authenticated namespace. Their publisher
+throttle key is `(namespace, sandbox_id)` so equal IDs in different tenant
+namespaces remain independent.
+
+## Fleets Provider
+
+The Phase 1a fleets provider accepts only an authenticated
+[fleets route scope](https://github.com/opensandbox-group/OpenSandbox/blob/main/specs/ingress-route-scope.md). It resolves port
+`44772` as the named `execd` component and resolves other user ports as raw
+ports. Endpoint handles can be issued while a sandbox is pending; actual
+traffic receives `503` with `Retry-After` until FastPath publishes the route.
+Port `18080` handles are reserved for SDK compatibility and traffic returns
+`501` until the Phase 1b policy-manager route is available.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--provider-type` | `batchsandbox` | Set to `fleets` for FastPath-backed routing |
+| `--fastpath-endpoint` | `fast-sandbox-fastpath.fast-sandbox-system.svc:9090` | FastPath v2 gRPC endpoint |
+| `--fastpath-access-mode` | `direct-fastlet-proxy` | Use `central-proxy` when ingress cannot reach Fastlet Pod IPs |
+| `--fastpath-wait-timeout-millis` | `2000` | Bounded readiness wait for one request |
+| `--secure-access-keys` | empty | Shared signing key ring; required for fleets route-scope verification |
+
+Direct Fastlet mode bypasses fast-sandbox's central Sandbox Proxy. Restrict
+Fastlet port `5780` so only trusted ingress Pods can reach it. A matching
+NetworkPolicy can select an ingress Pod labeled
+`fast-sandbox.io/control-plane-client=true` and
+`fast-sandbox.io/direct-data-plane-client=true`, and label its namespace
+`sandbox.fast.io/scope=system`. The FastPath policy must admit that trusted
+namespace when the two systems are deployed in different namespaces.
+
+Fleets supports Header and URI route scopes in Phase 1a. Wildcard-host scopes
+are not supported because the authenticated namespace, sandbox ID, and MAC do
+not fit safely in one DNS label.
+
 **Example (with Redis):**
 ```bash
 go run main.go \
@@ -133,6 +168,8 @@ TAG=local VERSION=1.2.3 GIT_COMMIT=abc BUILD_TIME=2025-01-01T00:00:00Z bash buil
 - Access to Kubernetes API (in-cluster or via KUBECONFIG).
 - If `--provider-type=batchsandbox`: BatchSandbox CRs in any namespace with `sandbox.opensandbox.io/endpoints` annotation containing Pod IPs.
 - If `--provider-type=agent-sandbox`: AgentSandbox CRs in any namespace with `status.serviceFQDN` populated.
+- If `--provider-type=fleets`: network access to FastPath v2 and a matching
+  `--secure-access-keys` key ring shared with the OpenSandbox server.
 
 ## Implementation Notes
 

@@ -1,0 +1,8 @@
+{
+  "key_id": "k",
+  "secret_base64": "c2hhcmVkLXNlY3JldA==",
+  "namespace": "tenant-a",
+  "sandbox_id": "sandbox-123",
+  "port": 44772,
+  "token": "f1.dGVuYW50LWE.c2FuZGJveC0xMjM.44772.k.uo11HjECmnSuCCRF3v-1AQ"
+}

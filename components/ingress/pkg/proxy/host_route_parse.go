@@ -24,11 +24,13 @@ import (
 )
 
 type parsedRoute struct {
+	namespace       string
 	sandboxID       string
 	port            int
 	expiresB36      string
 	signature       string
 	requestURI      string
+	requestRawPath  string
 	uriParsedAsOSEP bool
 }
 

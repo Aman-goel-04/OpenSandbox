@@ -18,8 +18,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
+	"github.com/alibaba/opensandbox/ingress/pkg/routescope"
 	"github.com/alibaba/opensandbox/ingress/pkg/sandbox"
 	"github.com/alibaba/opensandbox/ingress/pkg/signature"
 	"github.com/alibaba/opensandbox/ingress/pkg/telemetry"
@@ -65,21 +67,56 @@ func (p *Proxy) doGetSandboxHostDefinition(r *http.Request) (*sandboxHost, int, 
 		if targetHost == "" {
 			return nil, http.StatusBadRequest, fmt.Errorf("missing header '%s' or 'Host'", SandboxIngress)
 		}
-		pr, err = parseHostRoute(targetHost)
+		if routescope.IsToken(targetHost) {
+			pr, err = p.parseFleetsScope(targetHost, "")
+		} else {
+			pr, err = parseHostRoute(targetHost)
+		}
 	case ModeURI:
 		if r.URL == nil || r.URL.Path == "" {
 			return nil, http.StatusBadRequest, errors.New("missing URI path")
 		}
-		pr, err = parseURIRoute(r.URL.Path)
+		trimmed := strings.TrimPrefix(r.URL.Path, "/")
+		first, rest, found := strings.Cut(trimmed, "/")
+		if routescope.IsToken(first) {
+			requestURI := "/"
+			if found && rest != "" {
+				requestURI += rest
+			}
+			pr, err = p.parseFleetsScope(first, requestURI)
+			if err == nil {
+				pr.requestRawPath = escapedPathSuffix(r.URL.EscapedPath(), 1)
+			}
+		} else {
+			pr, err = parseURIRoute(r.URL.Path)
+			if err != nil {
+				break
+			} else if pr.uriParsedAsOSEP {
+				pr.requestRawPath = escapedPathSuffix(r.URL.EscapedPath(), 4)
+			} else {
+				pr.requestRawPath = escapedPathSuffix(r.URL.EscapedPath(), 2)
+			}
+		}
 	default:
 		return nil, http.StatusBadRequest, fmt.Errorf("unknown ingress mode: %s", p.mode)
 	}
 
 	if err != nil || pr.sandboxID == "" || pr.port == 0 {
-		return nil, http.StatusBadRequest, fmt.Errorf("invalid ingress route: %w", err)
+		if err == nil {
+			err = errors.New("missing sandbox ID or port")
+		}
+		return nil, ingressRouteErrHTTPStatus(err), fmt.Errorf("invalid ingress route: %w", err)
+	}
+	if _, required := p.sandboxProvider.(sandbox.AuthenticatedRouteProvider); required && pr.namespace == "" {
+		err = fmt.Errorf("%w: fleets provider requires an authenticated route scope", routescope.ErrUnauthorized)
+		return nil, ingressRouteErrHTTPStatus(err), err
 	}
 
-	endpoint, err := p.sandboxProvider.GetEndpoint(pr.sandboxID)
+	endpoint, err := p.sandboxProvider.ResolveEndpoint(r.Context(), sandbox.EndpointTarget{
+		Namespace: pr.namespace,
+		SandboxID: pr.sandboxID,
+		Port:      pr.port,
+	})
 	if err != nil {
 		return nil, providerErrHTTPStatus(err), err
 	}
@@ -91,6 +128,7 @@ func (p *Proxy) doGetSandboxHostDefinition(r *http.Request) (*sandboxHost, int, 
 		if err != nil {
 			return nil, ingressRouteErrHTTPStatus(err), err
 		}
+		pr.requestRawPath = escapedPathSuffix(r.URL.EscapedPath(), 2)
 	}
 
 	present, accessTok := signature.SecureAccessHeaderInfo(r)
@@ -109,11 +147,45 @@ func (p *Proxy) doGetSandboxHostDefinition(r *http.Request) (*sandboxHost, int, 
 	}
 
 	return &sandboxHost{
-		ingressKey: pr.sandboxID,
-		port:       pr.port,
-		endpoint:   endpoint.Endpoint,
-		requestURI: pr.requestURI,
+		namespace:      pr.namespace,
+		ingressKey:     pr.sandboxID,
+		port:           pr.port,
+		endpoint:       endpoint.Endpoint,
+		info:           endpoint,
+		requestURI:     pr.requestURI,
+		requestRawPath: pr.requestRawPath,
 	}, 0, nil
+}
+
+func escapedPathSuffix(path string, prefixSegments int) string {
+	trimmed := strings.TrimPrefix(path, "/")
+	for range prefixSegments {
+		_, rest, found := strings.Cut(trimmed, "/")
+		if !found {
+			return "/"
+		}
+		trimmed = rest
+	}
+	if trimmed == "" {
+		return "/"
+	}
+	return "/" + trimmed
+}
+
+func (p *Proxy) parseFleetsScope(token, requestURI string) (parsedRoute, error) {
+	if p.scope == nil {
+		return parsedRoute{}, fmt.Errorf("%w: verifier is not configured", routescope.ErrUnauthorized)
+	}
+	scope, err := p.scope.Verify(token)
+	if err != nil {
+		return parsedRoute{}, err
+	}
+	return parsedRoute{
+		namespace:  scope.Namespace,
+		sandboxID:  scope.SandboxID,
+		port:       scope.Port,
+		requestURI: requestURI,
+	}, nil
 }
 
 func (p *Proxy) parseTargetHostByHeader(r *http.Request) string {
@@ -130,8 +202,11 @@ func (p *Proxy) parseTargetHostByHeader(r *http.Request) string {
 }
 
 type sandboxHost struct {
-	ingressKey string
-	port       int
-	endpoint   string
-	requestURI string
+	namespace      string
+	ingressKey     string
+	port           int
+	endpoint       string
+	info           *sandbox.EndpointInfo
+	requestURI     string
+	requestRawPath string
 }

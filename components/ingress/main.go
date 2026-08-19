@@ -29,6 +29,7 @@ import (
 	"github.com/alibaba/opensandbox/ingress/pkg/flag"
 	"github.com/alibaba/opensandbox/ingress/pkg/proxy"
 	"github.com/alibaba/opensandbox/ingress/pkg/renewintent"
+	"github.com/alibaba/opensandbox/ingress/pkg/routescope"
 	"github.com/alibaba/opensandbox/ingress/pkg/sandbox"
 	"github.com/alibaba/opensandbox/ingress/pkg/signature"
 	"github.com/alibaba/opensandbox/ingress/pkg/telemetry"
@@ -41,12 +42,9 @@ func main() {
 
 	flag.InitFlags()
 
-	cfg := injection.ParseAndGetRESTConfigOrDie()
-	cfg.ContentType = runtime.ContentTypeProtobuf
-	cfg.UserAgent = "opensandbox-ingress/" + version.GitCommit
-
 	ctx := signals.NewContext()
 	ctx = withLogger(ctx, flag.LogLevel)
+	providerType := sandbox.ProviderType(flag.ProviderType)
 
 	otelShutdown, err := telemetry.Init(ctx)
 	if err != nil {
@@ -61,14 +59,36 @@ func main() {
 		}()
 	}
 
-	// Create sandbox provider factory
-	providerFactory := sandbox.NewProviderFactory(
-		cfg,
-		time.Second*30, // resync period
-	)
+	var secure *signature.Verifier
+	var scopeVerifier *routescope.Verifier
+	if keyStr := strings.TrimSpace(flag.SecureAccessKeys); keyStr != "" {
+		keys, parseErr := signature.ParseKeys(keyStr)
+		if parseErr != nil {
+			log.Panicf("parse secure-access-keys: %v", parseErr)
+		}
+		secure = &signature.Verifier{Keys: keys}
+		if providerType == sandbox.ProviderTypeFleets {
+			scopeVerifier = &routescope.Verifier{Keys: keys}
+		}
+	}
 
-	// Create sandbox provider based on provider type
-	sandboxProvider, err := providerFactory.CreateProvider(sandbox.ProviderType(flag.ProviderType))
+	var sandboxProvider sandbox.Provider
+	if providerType == sandbox.ProviderTypeFleets {
+		if scopeVerifier == nil {
+			log.Panic("fleets provider requires --secure-access-keys for authenticated route scopes")
+		}
+		sandboxProvider, err = sandbox.NewFleetsProvider(
+			flag.FastPathEndpoint,
+			time.Duration(flag.FastPathWaitTimeoutMillis)*time.Millisecond,
+			flag.FastPathAccessMode,
+		)
+	} else {
+		cfg := injection.ParseAndGetRESTConfigOrDie()
+		cfg.ContentType = runtime.ContentTypeProtobuf
+		cfg.UserAgent = "opensandbox-ingress/" + version.GitCommit
+		providerFactory := sandbox.NewProviderFactory(cfg, time.Second*30)
+		sandboxProvider, err = providerFactory.CreateProvider(providerType)
+	}
 	if err != nil {
 		log.Panicf("Failed to create sandbox provider: %v", err)
 	}
@@ -92,17 +112,8 @@ func main() {
 		})
 	}
 
-	var secure *signature.Verifier
-	if keyStr := strings.TrimSpace(flag.SecureAccessKeys); keyStr != "" {
-		keys, err := signature.ParseKeys(flag.SecureAccessKeys)
-		if err != nil {
-			log.Panicf("parse secure-access-keys: %v", err)
-		}
-		secure = &signature.Verifier{Keys: keys}
-	}
-
 	// Create reverse proxy with sandbox provider
-	reverseProxy := proxy.NewProxy(ctx, sandboxProvider, proxy.Mode(flag.Mode), renewPublisher, secure)
+	reverseProxy := proxy.NewProxy(ctx, sandboxProvider, proxy.Mode(flag.Mode), renewPublisher, secure, scopeVerifier)
 	mux := http.NewServeMux()
 	mux.Handle("/", reverseProxy)
 	mux.HandleFunc("/status.ok", proxy.Healthz)
