@@ -159,12 +159,11 @@ build-ebpf: ## Build the execd-ebpf observation variant (CGO + cilium/ebpf).
 	CGO_ENABLED=1 go build -tags ebpf $(GO_BUILD_FLAGS) -ldflags "$(GO_LDFLAGS)" -o bin/execd-ebpf main.go
 	@echo "built bin/execd-ebpf"
 
-# Regenerate the CO-RE audit bytecode for one architecture from the committed
-# per-arch vmlinux.h (pkg/ebpf/prog/vmlinux-<arch>.h). The vmlinux.h files are
-# committed so the bytecode can be regenerated anywhere (local make, CI, or
-# inside the Dockerfile ebpf-builder stage) without access to a host kernel
-# BTF — a vmlinux.h from the wrong arch (e.g. an arm64 dump shipped to x86_64)
-# poisons the BPF_KPROBE parameter relocations (issue #1563).
+# Regenerate the CO-RE audit bytecode for one architecture from
+# prog/audit.bpf.c + prog/audit_types.h. The types header declares only the
+# kernel members the programs touch (resolved by name against the target
+# kernel BTF at load time), so no vmlinux.h is needed and the bytecode is
+# hermetic across architectures (issue #1563).
 #
 #   make generate-ebpf ARCH=amd64   # or arm64; defaults to GOARCH
 #
@@ -174,19 +173,15 @@ build-ebpf: ## Build the execd-ebpf observation variant (CGO + cilium/ebpf).
 ARCH ?= $(shell go env GOARCH)
 generate-ebpf:
 	@case "$(ARCH)" in \
-		amd64) VMLINUX=pkg/ebpf/prog/vmlinux-x86_64.h ;; \
-		arm64) VMLINUX=pkg/ebpf/prog/vmlinux-arm64.h ;; \
+		amd64|arm64) ;; \
 		*) echo "generate-ebpf: unsupported ARCH=$(ARCH) (amd64|arm64)" >&2; exit 1 ;; \
-	esac; \
-	test -f "$$VMLINUX" || { echo "missing $$VMLINUX — commit the per-arch vmlinux.h first" >&2; exit 1; }; \
-	cp "$$VMLINUX" pkg/ebpf/prog/vmlinux.h; \
+	esac
 	go run github.com/cilium/ebpf/cmd/bpf2go@v0.16.0 \
 		-cc clang -no-strip \
 		-cflags "-Ipkg/ebpf/prog" \
 		-target $(ARCH) \
 		-go-package ebpf -output-dir pkg/ebpf \
-		audit pkg/ebpf/prog/audit.bpf.c; \
-	rm -f pkg/ebpf/prog/vmlinux.h
+		audit pkg/ebpf/prog/audit.bpf.c
 	@echo "regenerated pkg/ebpf/audit_bpf_$(ARCH).{go,o}"
 
 .PHONY: test-integration

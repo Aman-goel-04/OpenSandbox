@@ -103,16 +103,15 @@ RUN rm /usr/lib/libcap.so /usr/lib/libcap.so.2 && \
 # exec/connect/privilege audit hooks and needs CAP_BPF + CAP_PERFMON in the
 # container ceiling.
 #
-# The CO-RE audit bytecode is REGENERATED here per TARGETARCH from the
-# committed per-arch vmlinux.h (prog/vmlinux-<arch>.h). The BPF_KPROBE
-# parameter relocations are architecture-specific (issue #1563): a vmlinux.h
-# from the wrong arch poisons them, so each platform's bytecode is compiled
-# against its own header at image build time.
+# The CO-RE audit bytecode is REGENERATED here at image build time with
+# bpf2go. prog/audit_types.h declares only the kernel members the programs
+# touch (resolved by name against the target kernel BTF at load time), so
+# no per-arch vmlinux.h or host kernel BTF is needed — this stage is fully
+# hermetic and cross-compiles for every TARGETARCH.
 FROM golang:1.25.9 AS ebpf-builder
 ARG VERSION=dev
 ARG GIT_COMMIT=unknown
 ARG BUILD_TIME=unknown
-ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends clang
 WORKDIR /build
 COPY components/internal/go.mod components/internal/go.sum ./components/internal/
@@ -122,22 +121,15 @@ RUN cd components/execd && go mod download
 COPY components/internal ./components/internal
 COPY components/execd ./components/execd
 WORKDIR /build/components/execd
-# Select the per-arch vmlinux.h and generate the CO-RE bytecode for this
-# TARGETARCH (bpf2go embeds it into audit_bpf_<arch>.go, picked up by the
-# Go build tags). Requires clang's bpf target only — no host kernel BTF.
-RUN case "${TARGETARCH}" in \
-      amd64) VMLINUX=pkg/ebpf/prog/vmlinux-x86_64.h ;; \
-      arm64) VMLINUX=pkg/ebpf/prog/vmlinux-arm64.h ;; \
-      *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
-    esac \
-    && cp "$VMLINUX" pkg/ebpf/prog/vmlinux.h \
-    && go run github.com/cilium/ebpf/cmd/bpf2go@v0.16.0 \
+# Generate the CO-RE bytecode for this TARGETARCH (bpf2go embeds it into
+# audit_bpf_<arch>.go, picked up by the Go build tags). clang's bpf target
+# only — no host kernel BTF.
+RUN go run github.com/cilium/ebpf/cmd/bpf2go@v0.16.0 \
        -cc clang -no-strip \
        -cflags "-Ipkg/ebpf/prog" \
        -target "${TARGETARCH}" \
        -go-package ebpf -output-dir pkg/ebpf \
-       audit pkg/ebpf/prog/audit.bpf.c \
-    && rm -f pkg/ebpf/prog/vmlinux.h
+       audit pkg/ebpf/prog/audit.bpf.c
 # cilium/ebpf is pure Go, so the variant builds fully static.
 RUN CGO_ENABLED=0 go build -tags ebpf -trimpath -buildvcs=false \
     -ldflags "-buildid= -B none \
