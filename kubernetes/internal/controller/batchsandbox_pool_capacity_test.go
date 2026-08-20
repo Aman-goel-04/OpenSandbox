@@ -313,6 +313,31 @@ func TestApplyFixedPoolCapacityCondition(t *testing.T) {
 		assert.False(t, pending)
 		assert.Empty(t, status.Conditions)
 	})
+
+	t.Run("missing fixed pool stays non-capacity pending", func(t *testing.T) {
+		scheme := runtime.NewScheme()
+		require.NoError(t, sandboxv1alpha1.AddToScheme(scheme))
+		reconciler := &BatchSandboxReconciler{
+			Client: fake.NewClientBuilder().WithScheme(scheme).Build(),
+		}
+		status := &sandboxv1alpha1.BatchSandboxStatus{
+			Conditions: []sandboxv1alpha1.BatchSandboxCondition{
+				{
+					Type:   sandboxv1alpha1.BatchSandboxConditionPoolAllocationPending,
+					Status: sandboxv1alpha1.ConditionTrue,
+					Reason: poolCapacityExhaustedReason,
+				},
+			},
+		}
+
+		pending, err := reconciler.applyFixedPoolCapacityCondition(
+			context.Background(), newSandbox(), status,
+		)
+
+		require.NoError(t, err)
+		assert.False(t, pending)
+		assert.Empty(t, status.Conditions)
+	})
 }
 
 func TestInitialUnallocatedSandboxPersistsPoolCapacityCondition(t *testing.T) {

@@ -341,6 +341,16 @@ func (r *BatchSandboxReconciler) applyFixedPoolCapacityCondition(
 
 	pool := &sandboxv1alpha1.Pool{}
 	if err := r.Get(ctx, client.ObjectKey{Namespace: batchSbx.Namespace, Name: batchSbx.Spec.PoolRef}, pool); err != nil {
+		if errors.IsNotFound(err) {
+			setConditionInStatus(
+				status,
+				sandboxv1alpha1.BatchSandboxConditionPoolAllocationPending,
+				sandboxv1alpha1.ConditionFalse,
+				"",
+				"",
+			)
+			return false, nil
+		}
 		return false, fmt.Errorf("failed to inspect pool %s/%s capacity: %w", batchSbx.Namespace, batchSbx.Spec.PoolRef, err)
 	}
 
