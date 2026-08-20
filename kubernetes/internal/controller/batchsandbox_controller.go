@@ -156,6 +156,12 @@ func (r *BatchSandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request
 				}
 				return ctrl.Result{RequeueAfter: poolAllocationRetryTime}, nil
 			}
+			if statusErr := r.setPoolAllocationPending(ctx, batchSbx, false, ""); statusErr != nil {
+				return ctrl.Result{}, gerrors.Join(
+					fmt.Errorf("failed to auto-assign pool: %w", err),
+					fmt.Errorf("failed to clear pool capacity status: %w", statusErr),
+				)
+			}
 			return ctrl.Result{}, fmt.Errorf("failed to auto-assign pool: %w", err)
 		}
 		if updated {

@@ -100,6 +100,52 @@ func TestReconcilePublishesAutoPoolCapacityCondition(t *testing.T) {
 	assert.Empty(t, updated.Status.Conditions)
 }
 
+func TestReconcileClearsAutoPoolCapacityConditionOnNonCapacityFailure(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, sandboxv1alpha1.AddToScheme(scheme))
+	sandbox := &sandboxv1alpha1.BatchSandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "sbx", Namespace: "ns"},
+		Spec: sandboxv1alpha1.BatchSandboxSpec{
+			PoolRef:  poolAutoAssignRef,
+			Replicas: ptr.To(int32(1)),
+			Template: &corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Image: "nginx"}}},
+			},
+		},
+		Status: sandboxv1alpha1.BatchSandboxStatus{
+			Conditions: []sandboxv1alpha1.BatchSandboxCondition{
+				{
+					Type:   sandboxv1alpha1.BatchSandboxConditionPoolAllocationPending,
+					Status: sandboxv1alpha1.ConditionTrue,
+					Reason: poolCapacityExhaustedReason,
+				},
+			},
+		},
+	}
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&sandboxv1alpha1.BatchSandbox{}).
+		WithObjects(sandbox).
+		Build()
+	reconciler := &BatchSandboxReconciler{
+		Client:              client,
+		Scheme:              scheme,
+		Recorder:            record.NewFakeRecorder(10),
+		ProfileStore:        poolassign.NewProfileStore(),
+		StatusRVExpectation: expectations.NewResourceVersionExpectation(),
+	}
+
+	_, err := reconciler.Reconcile(
+		context.Background(),
+		ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "sbx"}},
+	)
+
+	require.Error(t, err)
+	updated := &sandboxv1alpha1.BatchSandbox{}
+	require.NoError(t, client.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: "sbx"}, updated))
+	assert.Empty(t, updated.Status.Conditions)
+}
+
 func TestReconcileRequeuesOnlyForFixedPoolCapacityWait(t *testing.T) {
 	tests := []struct {
 		name        string
