@@ -155,8 +155,34 @@ build-ebpf: ## Build the execd-ebpf observation variant (CGO + cilium/ebpf).
 		exit 1; \
 	fi
 	@mkdir -p bin
+	$(MAKE) generate-ebpf ARCH=$(shell go env GOARCH)
 	CGO_ENABLED=1 go build -tags ebpf $(GO_BUILD_FLAGS) -ldflags "$(GO_LDFLAGS)" -o bin/execd-ebpf main.go
 	@echo "built bin/execd-ebpf"
+
+# Regenerate the CO-RE audit bytecode for one architecture from
+# prog/audit.bpf.c + prog/audit_types.h. The types header declares only the
+# kernel members the programs touch (resolved by name against the target
+# kernel BTF at load time), so no vmlinux.h is needed and the bytecode is
+# hermetic across architectures (issue #1563).
+#
+#   make generate-ebpf ARCH=amd64   # or arm64; defaults to GOARCH
+#
+# Requires clang with the bpf target. bpf2go writes audit_bpf_<target>.{go,o};
+# the Go build picks the right one via build tags.
+.PHONY: generate-ebpf
+ARCH ?= $(shell go env GOARCH)
+generate-ebpf:
+	@case "$(ARCH)" in \
+		amd64|arm64) ;; \
+		*) echo "generate-ebpf: unsupported ARCH=$(ARCH) (amd64|arm64)" >&2; exit 1 ;; \
+	esac
+	go run github.com/cilium/ebpf/cmd/bpf2go@v0.16.0 \
+		-cc clang -no-strip \
+		-cflags "-Ipkg/ebpf/prog" \
+		-target $(ARCH) \
+		-go-package ebpf -output-dir pkg/ebpf \
+		audit pkg/ebpf/prog/audit.bpf.c
+	@echo "regenerated pkg/ebpf/audit_bpf_$(ARCH).{go,o}"
 
 .PHONY: test-integration
 test-integration: ## Run integration tests (Linux + bwrap required).

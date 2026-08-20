@@ -27,11 +27,10 @@ container-level init contract through the SDK:
 - application signals (HUP/USR1/USR2/WINCH) are forwarded to the entrypoint
 - the entrypoint's exit code propagates to the container/runtime (docker
   bridge; on Kubernetes the test skips — BatchSandbox does not surface the
-  container exit code or a terminal lifecycle state, OSEP-0018 R-l)
-- an in-namespace ``kill 1`` (SIGTERM) still stops the sandbox — interim
-  behavior pin for OSEP-0018 §3 (R-a: trusted out-of-band stop channel);
-  on Kubernetes the pin asserts execd becomes unreachable instead of a
-  lifecycle state transition
+  container exit code or a terminal lifecycle state)
+- an in-namespace ``kill 1`` (SIGTERM) still stops the sandbox — behavior
+  pin for the trusted out-of-band stop channel; on Kubernetes the pin
+  asserts execd becomes unreachable instead of a lifecycle state transition
 - the workload cannot read execd's environment (``/proc/1/environ`` denied by
   non-dumpable, independent of Landlock)
 - ``GET /v1/isolated/capabilities`` reports ``hardening.init_mode = pid1``
@@ -40,6 +39,9 @@ container-level init contract through the SDK:
 
 import json
 import logging
+import os
+import subprocess
+import tempfile
 import time
 from datetime import timedelta
 
@@ -191,16 +193,15 @@ class TestExecdInitE2E:
 
     def test_entrypoint_exit_code_propagates(self) -> None:
         # When the user entrypoint exits, execd exits with the same status so
-        # Docker/kubelet observe it (OSEP-0018 §2 "entrypoint owns the
-        # container lifecycle"). The sleep gives the sandbox time to become
-        # ready before the entrypoint exits.
+        # Docker/kubelet observe it ("entrypoint owns the container
+        # lifecycle"). The sleep gives the sandbox time to become ready
+        # before the entrypoint exits.
         if is_kubernetes_runtime():
             # BatchSandbox stays Pending after the pod completes and does not
-            # surface the container exit code (OSEP-0018 R-l): the lifecycle
-            # state-transition assertion below is docker-runtime-specific.
+            # surface the container exit code: the lifecycle state-transition
+            # assertion below is docker-runtime-specific.
             pytest.skip(
-                "BatchSandbox does not surface the container exit code "
-                "(OSEP-0018 R-l)"
+                "BatchSandbox does not surface the container exit code"
             )
         sbx = _create_sandbox(
             entrypoint=["sh", "-c", "sleep 20; exit 42"],
@@ -225,11 +226,11 @@ class TestExecdInitE2E:
             _destroy(sbx)
 
     def test_in_namespace_sigterm_kill1_stops_sandbox(self, kill1_sandbox) -> None:
-        # Interim-behavior pin (OSEP-0018 §3, R-a): today an in-namespace
-        # `kill 1` SIGTERM reaches execd's forwarding loop and stops the
-        # sandbox, matching the pre-OSEP bootstrap behavior. Once the trusted
-        # out-of-band stop channel lands, execd must ignore in-namespace
-        # SIGTERM and this test flips to asserting the sandbox stays Running.
+        # Behavior pin: an in-namespace `kill 1` SIGTERM reaches execd's
+        # forwarding loop and stops the sandbox, matching the pre-OSEP
+        # bootstrap behavior. The trusted out-of-band stop channel was
+        # declined: this SIGTERM contract is kept as-is, and `kill -9 1`
+        # stays inert via the PID 1 signal shield.
         try:
             kill1_sandbox.commands.run(
                 "kill 1; sleep 5; echo alive", opts=RunCommandOpts()
@@ -251,8 +252,8 @@ class TestExecdInitE2E:
     def _assert_execd_unreachable(self, kill1_sandbox) -> None:
         """k8s leg of the kill-1 pin: the pod exits after ``kill 1`` but
         BatchSandbox stays Pending (it never transitions to a terminal
-        lifecycle state — OSEP-0018 R-l), so assert the observable effect
-        instead: execd is gone and the sandbox is unusable.
+        lifecycle state), so assert the observable effect instead: execd is
+        gone and the sandbox is unusable.
         """
         deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
@@ -271,19 +272,34 @@ class TestExecdInitE2E:
             time.sleep(2)
         pytest.fail("execd still reachable after in-namespace kill 1")
 
-    def test_fork_heavy_keeps_process_table_bounded(self, sandbox) -> None:
-        # Sustained fork churn: short-lived background children (reparented
-        # orphans) plus a few long sleepers. The reaper must keep the process
-        # table bounded and zombie-free over many cycles.
+    def test_sustained_fork_heavy_mix_keeps_process_table_bounded(self, sandbox) -> None:
+        # Long-running mix of /command churn interleaved with background
+        # sleepers, sustained over ~30s, must keep the process table bounded
+        # and zombie-free throughout (the sustained form of
+        # test_orphans_are_reaped).
         baseline = _process_count(sandbox)
-        for _ in range(20):
-            _run_command(sandbox, "for i in $(seq 1 5); do ( sleep 0.1 ) & done; sleep 0.3")
-        _run_command(sandbox, "sleep 15 & sleep 15 & sleep 15 &")
-        time.sleep(2)
+        deadline = time.monotonic() + 30
+        round_n = 0
+        while time.monotonic() < deadline:
+            round_n += 1
+            # /command churn: short-lived orphans in a tight loop.
+            _run_command(sandbox, "for i in $(seq 1 8); do ( sleep 0.05 ) & done")
+            # Every few rounds spawn a long background sleeper that stays
+            # alive across rounds (reparented to PID 1, must not zombie).
+            if round_n % 3 == 0:
+                _run_command(sandbox, "sleep 10 &")
+            time.sleep(0.2)
+            zombies = _zombie_count(sandbox)
+            assert zombies == 0, (
+                f"zombies under pid 1 after round {round_n}: {zombies}"
+            )
+        time.sleep(1)
         zombies = _zombie_count(sandbox)
-        assert zombies == 0, f"zombies under pid 1: {zombies}"
+        assert zombies == 0, f"zombies under pid 1 at end: {zombies}"
         total = _process_count(sandbox)
-        assert total <= baseline + 10, f"process table grew: {baseline} -> {total}"
+        assert total <= baseline + 12, (
+            f"process table grew over sustained churn: {baseline} -> {total}"
+        )
 
     def test_hardening_reports_pid1(self, sandbox) -> None:
         # execd's /command SSE output strips newlines, so the probe emits a
@@ -298,3 +314,83 @@ class TestExecdInitE2E:
         assert report["signal_shield"] is True, (
             f"hardening.signal_shield = {report['signal_shield']}"
         )
+
+    @pytest.mark.skipif(
+        is_kubernetes_runtime(),
+        reason="runtime-initiated container stop (docker stop) is a docker-bridge "
+        "scenario; the k8s path does not surface the container exit code",
+    )
+    def test_runtime_stop_forwards_sigterm_and_propagates_exit_code(self) -> None:
+        # When the RUNTIME stops the container (docker stop), execd must
+        # forward SIGTERM to the entrypoint and the sandbox must end with
+        # the entrypoint's status. The entrypoint traps TERM, writes a
+        # marker, and exits 7 — the sandbox must report "exited with code 7"
+        # and the marker must be present, proving the workload saw the signal.
+        # Fixed path (not $OPENSANDBOX_ID): docker cp runs on the host where
+        # the variable is not expanded — a literal $... path would not match
+        # the file the container-side shell created. Each container has its
+        # own layer, so a fixed path cannot collide.
+        marker = "/tmp/runtime-stop-marker.txt"
+        sbx = _create_sandbox(
+            entrypoint=[
+                "sh",
+                "-c",
+                f"trap 'echo sigterm-received > {marker}; exit 7' TERM; "
+                f"while :; do sleep 1; done",
+            ],
+            tag="execd-init-e2e-runtime-stop",
+        )
+        try:
+            # Locate the sandbox container by its opensandbox label.
+            out = subprocess.run(
+                [
+                    "docker", "ps", "-aq",
+                    "--filter", f"label=opensandbox.io/id={sbx.id}",
+                ],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            container_id = out.splitlines()[-1] if out else ""
+            assert container_id, f"no docker container for sandbox {sbx.id}"
+
+            # Runtime stop: docker stop sends SIGTERM to PID 1 (execd), which
+            # forwards it to the entrypoint; execd then exits with the
+            # entrypoint's status so the container exits 7.
+            subprocess.run(
+                ["docker", "stop", "-t", "10", container_id],
+                check=True, capture_output=True, text=True,
+            )
+            subprocess.run(
+                ["docker", "wait", container_id],
+                check=True, capture_output=True, text=True,
+            )
+
+            # Sandbox must end in the failed/terminated state with code 7.
+            deadline = time.monotonic() + 45
+            state = None
+            while time.monotonic() < deadline:
+                state = sbx.get_info().status.state
+                if state in {"Failed", "Terminated"}:
+                    break
+                time.sleep(2)
+            if state not in {"Failed", "Terminated"}:
+                pytest.fail(f"runtime-stop sandbox stuck in state {state}")
+            info = sbx.get_info()
+            assert info.status.state == "Failed", info.status
+            assert info.status.message and "exited with code 7" in info.status.message, (
+                info.status.message
+            )
+
+            # The entrypoint must have actually received SIGTERM (marker).
+            # The container is stopped, so `docker cp` the marker out of its
+            # filesystem (docker exec cannot run in a stopped container).
+            with tempfile.TemporaryDirectory() as tmpdir:
+                marker_path = os.path.join(tmpdir, "runtime-stop-marker")
+                subprocess.run(
+                    ["docker", "cp", f"{container_id}:{marker}", marker_path],
+                    check=True, capture_output=True, text=True,
+                )
+                with open(marker_path, encoding="utf-8") as f:
+                    marker_content = f.read()
+            assert "sigterm-received" in marker_content, marker_content
+        finally:
+            _destroy(sbx)
