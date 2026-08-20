@@ -1220,6 +1220,10 @@ export interface components {
              *     `preStart` and `periodic`. The server transports this configuration to
              *     execd; callers must not depend on the internal transport mechanism.
              *     The configuration is not included in Sandbox responses.
+             *
+             *     Not supported together with `extensions.poolRef`, because pooled
+             *     sandboxes have already started execd before allocation. Runtimes that
+             *     do not implement lifecycle hook transport reject this field.
              */
             lifecycle?: components["schemas"]["SandboxLifecycle"];
             /**

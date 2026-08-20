@@ -159,6 +159,52 @@ class CredentialProxyConfig(BaseModel):
     )
 
 
+class LifecycleHook(BaseModel):
+    """Command executed by execd before the user entrypoint starts."""
+
+    command: list[str] = Field(min_length=1)
+    timeout_seconds: int | None = Field(
+        default=None,
+        alias="timeoutSeconds",
+        ge=1,
+        description="Maximum execution time in seconds. The server defaults to 60.",
+    )
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+
+class PeriodicLifecycleHook(BaseModel):
+    """Named command scheduled by execd while the sandbox is running."""
+
+    name: str = Field(min_length=1)
+    schedule: str = Field(min_length=1)
+    command: list[str] = Field(min_length=1)
+    timeout_seconds: int | None = Field(
+        default=None,
+        alias="timeoutSeconds",
+        ge=1,
+        description="Maximum execution time in seconds. The server defaults to 60.",
+    )
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+
+class SandboxLifecycle(BaseModel):
+    """Optional lifecycle hooks applied when a sandbox is created."""
+
+    pre_start: LifecycleHook | None = Field(default=None, alias="preStart")
+    periodic: list[PeriodicLifecycleHook] | None = None
+
+    @model_validator(mode="after")
+    def periodic_names_must_be_unique(self) -> "SandboxLifecycle":
+        names = [hook.name for hook in self.periodic or []]
+        if len(names) != len(set(names)):
+            raise ValueError("Periodic lifecycle hook names must be unique")
+        return self
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+
 class InlineCredentialSource(BaseModel):
     """
     Write-only inline credential material for Credential Vault.

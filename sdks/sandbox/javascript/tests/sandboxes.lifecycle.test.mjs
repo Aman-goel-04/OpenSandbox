@@ -5,9 +5,11 @@ import { SandboxesAdapter } from "../dist/internal.js";
 
 function createAdapter() {
   const requests = [];
+  const rawRequests = [];
   const client = {
     async POST(path, options) {
       assert.equal(path, "/sandboxes");
+      rawRequests.push(options.body);
       requests.push(JSON.parse(JSON.stringify(options.body)));
       return {
         data: {
@@ -21,7 +23,7 @@ function createAdapter() {
       };
     },
   };
-  return { adapter: new SandboxesAdapter(client), requests };
+  return { adapter: new SandboxesAdapter(client), rawRequests, requests };
 }
 
 test("createSandbox forwards lifecycle hooks in the standard request body", async () => {
@@ -49,4 +51,44 @@ test("createSandbox omits lifecycle when it is not configured", async () => {
   await adapter.createSandbox({ lifecycle: undefined });
 
   assert.equal(Object.hasOwn(requests[0], "lifecycle"), false);
+});
+
+test("createSandbox normalizes an empty lifecycle to absent", async () => {
+  for (const lifecycle of [
+    {},
+    { periodic: [] },
+    { preStart: undefined, periodic: [] },
+    { preStart: null, periodic: null },
+  ]) {
+    const { adapter, rawRequests, requests } = createAdapter();
+    const request = { lifecycle };
+    const lifecycleSnapshot = structuredClone(lifecycle);
+
+    await adapter.createSandbox(request);
+
+    assert.equal(Object.hasOwn(requests[0], "lifecycle"), false);
+    assert.equal(Object.hasOwn(rawRequests[0], "lifecycle"), false);
+    assert.equal(Object.hasOwn(request, "lifecycle"), true);
+    assert.deepEqual(request.lifecycle, lifecycleSnapshot);
+  }
+});
+
+test("createSandbox omits empty periodic when preStart is configured", async () => {
+  const { adapter, rawRequests, requests } = createAdapter();
+
+  await adapter.createSandbox({
+    lifecycle: { preStart: { command: ["true"] }, periodic: [] },
+  });
+
+  assert.deepEqual(requests[0].lifecycle, { preStart: { command: ["true"] } });
+  assert.equal(Object.hasOwn(rawRequests[0].lifecycle, "periodic"), false);
+});
+
+test("createSandbox preserves future lifecycle hooks", async () => {
+  const { adapter, requests } = createAdapter();
+  const lifecycle = { preTerminate: { command: ["/opt/hooks/flush.sh"] } };
+
+  await adapter.createSandbox({ lifecycle });
+
+  assert.deepEqual(requests[0].lifecycle, lifecycle);
 });
