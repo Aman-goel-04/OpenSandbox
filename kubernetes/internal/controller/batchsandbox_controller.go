@@ -222,15 +222,8 @@ func (r *BatchSandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if err != nil {
 		aggErrors = append(aggErrors, err)
 	}
-	poolAllocationActive := runtimeView.status.Phase == "" ||
-		runtimeView.status.Phase == sandboxv1alpha1.BatchSandboxPhasePending
-	if poolAllocationActive &&
-		poolStrategy.IsPooledMode() &&
-		batchSbx.Spec.Replicas != nil &&
-		runtimeView.status.Allocated < *batchSbx.Spec.Replicas {
-		DurationStore.Push(req.String(), poolAllocationRetryTime)
-	}
 	if poolAllocationPending {
+		DurationStore.Push(req.String(), poolAllocationRetryTime)
 		log.Info("Sandbox is waiting for Pool capacity", "pool", batchSbx.Spec.PoolRef)
 	}
 	// Ensure PauseObservedGeneration is up-to-date so the status patch ACKs the

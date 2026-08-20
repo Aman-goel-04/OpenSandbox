@@ -17,6 +17,7 @@ package controller
 import (
 	"context"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -97,6 +98,69 @@ func TestReconcilePublishesAutoPoolCapacityCondition(t *testing.T) {
 	require.NoError(t, client.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: "sbx"}, updated))
 	assert.Equal(t, "pool-a", updated.Spec.PoolRef)
 	assert.Empty(t, updated.Status.Conditions)
+}
+
+func TestReconcileRequeuesOnlyForFixedPoolCapacityWait(t *testing.T) {
+	tests := []struct {
+		name        string
+		allocated   int32
+		wantRequeue time.Duration
+	}{
+		{
+			name:        "pool has headroom",
+			allocated:   1,
+			wantRequeue: 0,
+		},
+		{
+			name:        "pool is capacity blocked",
+			allocated:   2,
+			wantRequeue: poolAllocationRetryTime,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			require.NoError(t, corev1.AddToScheme(scheme))
+			require.NoError(t, sandboxv1alpha1.AddToScheme(scheme))
+			sandbox := &sandboxv1alpha1.BatchSandbox{
+				ObjectMeta: metav1.ObjectMeta{Name: "sbx", Namespace: "ns"},
+				Spec: sandboxv1alpha1.BatchSandboxSpec{
+					PoolRef:  "pool-a",
+					Replicas: ptr.To(int32(1)),
+				},
+				Status: sandboxv1alpha1.BatchSandboxStatus{
+					Phase: sandboxv1alpha1.BatchSandboxPhasePending,
+				},
+			}
+			pool := &sandboxv1alpha1.Pool{
+				ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "ns"},
+				Spec: sandboxv1alpha1.PoolSpec{
+					CapacitySpec: sandboxv1alpha1.CapacitySpec{PoolMax: 2},
+				},
+				Status: sandboxv1alpha1.PoolStatus{Allocated: tt.allocated},
+			}
+			client := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithStatusSubresource(&sandboxv1alpha1.BatchSandbox{}, &sandboxv1alpha1.Pool{}).
+				WithObjects(sandbox, pool).
+				Build()
+			reconciler := &BatchSandboxReconciler{
+				Client:              client,
+				Scheme:              scheme,
+				Recorder:            record.NewFakeRecorder(10),
+				StatusRVExpectation: expectations.NewResourceVersionExpectation(),
+			}
+
+			result, err := reconciler.Reconcile(
+				context.Background(),
+				ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "sbx"}},
+			)
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantRequeue, result.RequeueAfter)
+		})
+	}
 }
 
 func TestApplyFixedPoolCapacityCondition(t *testing.T) {
