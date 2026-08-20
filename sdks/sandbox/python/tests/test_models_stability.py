@@ -21,11 +21,19 @@ from typing import cast
 import pytest
 
 from opensandbox.api.lifecycle.models.allocation_summary import AllocationSummary
+from opensandbox.api.lifecycle.models.create_sandbox_request import (
+    CreateSandboxRequest as ApiCreateSandboxRequest,
+)
 from opensandbox.api.lifecycle.models.create_sandbox_response import (
     CreateSandboxResponse as ApiCreateSandboxResponse,
 )
 from opensandbox.api.lifecycle.models.image_spec import ImageSpec as ApiImageSpec
+from opensandbox.api.lifecycle.models.lifecycle_hook import LifecycleHook
+from opensandbox.api.lifecycle.models.periodic_lifecycle_hook import (
+    PeriodicLifecycleHook,
+)
 from opensandbox.api.lifecycle.models.sandbox import Sandbox as ApiSandbox
+from opensandbox.api.lifecycle.models.sandbox_lifecycle import SandboxLifecycle
 from opensandbox.api.lifecycle.types import UNSET
 from opensandbox.models import CredentialSubstitution
 from opensandbox.models.execd import (
@@ -93,6 +101,34 @@ def test_api_create_sandbox_response_tolerates_omitted_optional_fields() -> None
     assert response.metadata is UNSET
     assert response.expires_at is UNSET
     assert response.status.last_transition_at is UNSET
+
+
+def test_api_create_sandbox_request_serializes_lifecycle_hooks() -> None:
+    request = ApiCreateSandboxRequest(
+        lifecycle=SandboxLifecycle(
+            pre_start=LifecycleHook(command=["/opt/hooks/restore.sh"]),
+            periodic=[
+                PeriodicLifecycleHook(
+                    name="checkpoint",
+                    schedule="*/5 * * * *",
+                    command=["/opt/hooks/checkpoint.sh"],
+                )
+            ],
+        )
+    )
+
+    assert request.to_dict()["lifecycle"] == {
+        "preStart": {
+            "command": ["/opt/hooks/restore.sh"],
+        },
+        "periodic": [
+            {
+                "name": "checkpoint",
+                "schedule": "*/5 * * * *",
+                "command": ["/opt/hooks/checkpoint.sh"],
+            }
+        ],
+    }
 
 
 def test_api_sandbox_tolerates_omitted_optional_fields() -> None:
