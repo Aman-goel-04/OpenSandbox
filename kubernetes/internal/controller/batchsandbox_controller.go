@@ -35,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -277,24 +278,43 @@ func (r *BatchSandboxReconciler) setPoolAllocationPending(
 	pending bool,
 	message string,
 ) error {
-	newStatus := batchSbx.Status.DeepCopy()
-	conditionStatus := sandboxv1alpha1.ConditionFalse
-	reason := ""
-	if pending {
-		conditionStatus = sandboxv1alpha1.ConditionTrue
-		reason = poolCapacityExhaustedReason
-	}
-	setConditionInStatus(
-		newStatus,
-		sandboxv1alpha1.BatchSandboxConditionPoolAllocationPending,
-		conditionStatus,
-		reason,
-		message,
-	)
-	if equality.Semantic.DeepEqual(*newStatus, batchSbx.Status) {
+	var updated *sandboxv1alpha1.BatchSandbox
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		latest := &sandboxv1alpha1.BatchSandbox{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(batchSbx), latest); err != nil {
+			return err
+		}
+		newStatus := latest.Status.DeepCopy()
+		conditionStatus := sandboxv1alpha1.ConditionFalse
+		reason := ""
+		if pending {
+			conditionStatus = sandboxv1alpha1.ConditionTrue
+			reason = poolCapacityExhaustedReason
+		}
+		setConditionInStatus(
+			newStatus,
+			sandboxv1alpha1.BatchSandboxConditionPoolAllocationPending,
+			conditionStatus,
+			reason,
+			message,
+		)
+		if equality.Semantic.DeepEqual(*newStatus, latest.Status) {
+			return nil
+		}
+		latest.Status = *newStatus
+		if err := r.Status().Update(ctx, latest); err != nil {
+			return err
+		}
+		updated = latest
 		return nil
+	})
+	if err != nil {
+		return err
 	}
-	return r.updateStatusConditions(ctx, batchSbx, newStatus.Conditions)
+	if updated != nil {
+		r.StatusRVExpectation.Expect(updated)
+	}
+	return nil
 }
 
 func (r *BatchSandboxReconciler) applyFixedPoolCapacityCondition(

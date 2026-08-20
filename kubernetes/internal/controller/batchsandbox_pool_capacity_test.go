@@ -355,3 +355,50 @@ func TestInitialUnallocatedSandboxPersistsPoolCapacityCondition(t *testing.T) {
 
 	assert.False(t, isInitialUnallocatedSandbox(sandbox, view))
 }
+
+func TestSetPoolAllocationPendingPreservesConcurrentLifecycleConditions(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, sandboxv1alpha1.AddToScheme(scheme))
+	latest := &sandboxv1alpha1.BatchSandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "sbx", Namespace: "ns"},
+		Status: sandboxv1alpha1.BatchSandboxStatus{
+			Conditions: []sandboxv1alpha1.BatchSandboxCondition{
+				{
+					Type:    sandboxv1alpha1.BatchSandboxConditionResumeFailed,
+					Status:  sandboxv1alpha1.ConditionTrue,
+					Reason:  "PodStartFailed",
+					Message: "image pull failed",
+				},
+			},
+		},
+	}
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&sandboxv1alpha1.BatchSandbox{}).
+		WithObjects(latest).
+		Build()
+	reconciler := &BatchSandboxReconciler{
+		Client:              client,
+		StatusRVExpectation: expectations.NewResourceVersionExpectation(),
+	}
+	stale := &sandboxv1alpha1.BatchSandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "sbx", Namespace: "ns"},
+	}
+
+	err := reconciler.setPoolAllocationPending(
+		context.Background(), stale, true, "Pool pool-a is at capacity",
+	)
+
+	require.NoError(t, err)
+	updated := &sandboxv1alpha1.BatchSandbox{}
+	require.NoError(t, client.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: "sbx"}, updated))
+	require.Len(t, updated.Status.Conditions, 2)
+	conditions := make(map[sandboxv1alpha1.BatchSandboxConditionType]sandboxv1alpha1.BatchSandboxCondition)
+	for _, condition := range updated.Status.Conditions {
+		conditions[condition.Type] = condition
+	}
+	assert.Equal(t, sandboxv1alpha1.ConditionTrue, conditions[sandboxv1alpha1.BatchSandboxConditionResumeFailed].Status)
+	assert.Equal(t, "PodStartFailed", conditions[sandboxv1alpha1.BatchSandboxConditionResumeFailed].Reason)
+	assert.Equal(t, sandboxv1alpha1.ConditionTrue, conditions[sandboxv1alpha1.BatchSandboxConditionPoolAllocationPending].Status)
+	assert.Equal(t, poolCapacityExhaustedReason, conditions[sandboxv1alpha1.BatchSandboxConditionPoolAllocationPending].Reason)
+}

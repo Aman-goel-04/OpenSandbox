@@ -343,27 +343,6 @@ func (r *BatchSandboxReconciler) updateStatus(ctx context.Context, batchSandbox 
 	return nil
 }
 
-func (r *BatchSandboxReconciler) updateStatusConditions(
-	ctx context.Context,
-	batchSandbox *sandboxv1alpha1.BatchSandbox,
-	conditions []sandboxv1alpha1.BatchSandboxCondition,
-) error {
-	patchData, err := json.Marshal(map[string]any{
-		"status": map[string]any{"conditions": conditions},
-	})
-	if err != nil {
-		return fmt.Errorf("failed to marshal status conditions patch: %w", err)
-	}
-	obj := &sandboxv1alpha1.BatchSandbox{
-		ObjectMeta: metav1.ObjectMeta{Namespace: batchSandbox.Namespace, Name: batchSandbox.Name},
-	}
-	if err := r.Status().Patch(ctx, obj, client.RawPatch(types.MergePatchType, patchData)); err != nil {
-		return err
-	}
-	r.StatusRVExpectation.Expect(obj)
-	return nil
-}
-
 func mergeLifecycleConditions(
 	desired []sandboxv1alpha1.BatchSandboxCondition,
 	latest []sandboxv1alpha1.BatchSandboxCondition,
