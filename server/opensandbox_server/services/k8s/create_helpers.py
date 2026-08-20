@@ -19,7 +19,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Dict, Optional
 
-from opensandbox_server.api.schema import CreateSandboxRequest
+from opensandbox_server.api.schema import (
+    OPEN_SANDBOX_LIFECYCLE_ENV,
+    CreateSandboxRequest,
+)
 from opensandbox_server.config import AppConfig, EGRESS_MODE_DNS
 from opensandbox_server.services.constants import (
     OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE,
@@ -97,6 +100,11 @@ def _build_create_workload_context(
         resource_requests = request.resource_requests.root
 
     sandbox_env, egress_env = split_egress_env(request.env)
+    if request.lifecycle is not None:
+        sandbox_env[OPEN_SANDBOX_LIFECYCLE_ENV] = request.lifecycle.model_dump_json(
+            by_alias=True,
+            exclude_none=True,
+        )
 
     if credential_proxy_enabled and egress_env.get(OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE):
         raise ValueError(

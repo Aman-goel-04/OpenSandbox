@@ -16,24 +16,86 @@ import pytest
 from pydantic import ValidationError
 
 from opensandbox_server.api.schema import (
+    OPEN_SANDBOX_LIFECYCLE_ENV,
     CreateSandboxRequest,
     CreateSnapshotRequest,
     CredentialProxyConfig,
     Host,
     ImageSpec,
     ListSnapshotsRequest,
+    LifecycleHook,
     OSSFS,
     PaginationInfo,
     PaginationRequest,
     PlatformSpec,
     PVC,
     ResourceLimits,
+    SandboxLifecycle,
     Snapshot,
     SnapshotFilter,
     SnapshotStatus,
     Volume,
 )
 
+
+class TestSandboxLifecycle:
+
+    def test_create_request_parses_lifecycle_aliases(self):
+        request = CreateSandboxRequest.model_validate(
+            {
+                "image": {"uri": "python:3.11"},
+                "entrypoint": ["python"],
+                "resourceLimits": {},
+                "lifecycle": {
+                    "preStart": {
+                        "command": ["/opt/hooks/restore.sh"],
+                        "timeoutSeconds": 30,
+                    },
+                    "periodic": [
+                        {
+                            "name": "checkpoint",
+                            "schedule": "*/5 * * * *",
+                            "command": ["/opt/hooks/checkpoint.sh"],
+                        }
+                    ],
+                },
+            }
+        )
+
+        assert request.lifecycle is not None
+        assert request.lifecycle.pre_start is not None
+        assert request.lifecycle.pre_start.timeout_seconds == 30
+        assert request.lifecycle.periodic is not None
+        assert request.lifecycle.periodic[0].name == "checkpoint"
+
+    def test_create_request_rejects_reserved_lifecycle_env(self):
+        with pytest.raises(ValidationError, match="is reserved"):
+            CreateSandboxRequest(
+                image=ImageSpec(uri="python:3.11"),
+                entrypoint=["python"],
+                resourceLimits=ResourceLimits(root={}),
+                env={OPEN_SANDBOX_LIFECYCLE_ENV: "{}"},
+            )
+
+    def test_create_request_rejects_lifecycle_with_pool_ref(self):
+        with pytest.raises(ValidationError, match="lifecycle cannot be used together with poolRef"):
+            CreateSandboxRequest(
+                extensions={"poolRef": "default/pool"},
+                lifecycle=SandboxLifecycle(
+                    preStart=LifecycleHook(command=["true"]),
+                ),
+            )
+
+    def test_lifecycle_rejects_duplicate_periodic_names(self):
+        with pytest.raises(ValidationError, match="names must be unique"):
+            SandboxLifecycle.model_validate(
+                {
+                    "periodic": [
+                        {"name": "sync", "schedule": "@hourly", "command": ["true"]},
+                        {"name": "sync", "schedule": "@daily", "command": ["true"]},
+                    ]
+                }
+            )
 
 
 class TestHost:
