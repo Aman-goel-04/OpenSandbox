@@ -96,7 +96,17 @@ def test_parse_memory_limit_handles_units():
 def test_parse_nano_cpus():
     assert parse_nano_cpus("500m") == 500_000_000
     assert parse_nano_cpus("2") == 2_000_000_000
+    assert parse_nano_cpus("1.5") == 1_500_000_000
+    assert parse_nano_cpus("250.5m") == 250_500_000
     assert parse_nano_cpus("bad") is None
+
+
+@pytest.mark.parametrize(
+    "value", ["nan", "inf", "-inf", "1e10", "1e308", "1e309", "-1e309"]
+)
+def test_parse_nano_cpus_rejects_non_finite_and_overflow_values(value: str):
+    assert parse_nano_cpus(value) is None
+
 
 def test_parse_gpu_request():
     assert parse_gpu_request("1") == 1
@@ -1571,6 +1581,37 @@ def test_build_labels_marks_manual_cleanup_without_expiration():
     assert labels[SANDBOX_ID_LABEL] == "sandbox-manual"
     assert labels[SANDBOX_MANUAL_CLEANUP_LABEL] == "true"
     assert "opensandbox.io/expires-at" not in labels
+
+
+def test_build_env_omits_execd_run_as_init_by_default():
+    service = DockerSandboxService(config=_app_config())
+    request = CreateSandboxRequest(
+        image=ImageSpec(uri="python:3.11"),
+        resourceLimits=ResourceLimits(root={}),
+        env={"FOO": "bar"},
+        entrypoint=["python"],
+    )
+
+    _, environment = service._build_labels_and_env("sandbox-manual", request, None)
+
+    assert "FOO=bar" in environment
+    assert not any(e.startswith("EXECD_INIT=") for e in environment)
+
+
+def test_build_env_injects_execd_run_as_init_when_enabled():
+    config = _app_config()
+    config.runtime.execd_run_as_init = True
+    service = DockerSandboxService(config=config)
+    request = CreateSandboxRequest(
+        image=ImageSpec(uri="python:3.11"),
+        resourceLimits=ResourceLimits(root={}),
+        env={},
+        entrypoint=["python"],
+    )
+
+    _, environment = service._build_labels_and_env("sandbox-manual", request, None)
+
+    assert "EXECD_INIT=1" in environment
 
 def test_build_labels_stores_extensions_json():
     service = DockerSandboxService(config=_app_config())

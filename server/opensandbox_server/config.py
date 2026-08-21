@@ -147,12 +147,12 @@ class RenewIntentRedisConfig(BaseModel):
 
 
 class OtelConfig(BaseModel):
-    """Optional OpenTelemetry export for ingested SDK metrics."""
+    """Optional OpenTelemetry export for Server and ingested SDK metrics."""
 
     enabled: bool = Field(
         default=False,
         description=(
-            "Enable OTLP metrics export. When false, SDK events are accepted but recorded as noop."
+            "Enable OTLP metrics export. When false, Server and SDK metrics are noops."
         ),
     )
     endpoint: Optional[str] = Field(
@@ -772,6 +772,17 @@ class RuntimeConfig(BaseModel):
         ...,
         description="Container image that contains the execd binary for sandbox initialization.",
         min_length=1,
+    )
+    execd_run_as_init: bool = Field(
+        default=False,
+        description=(
+            "Run execd as the sandbox init (OSEP-0018): sets EXECD_INIT in the "
+            "sandbox environment so bootstrap.sh execs into execd (--init) and "
+            "execd becomes PID 1, reaping children and owning the container "
+            "lifecycle. Defaults to false (classic background-and-wait "
+            "topology); intended to be flipped on after a few releases once "
+            "the init mode is validated in production."
+        ),
     )
 
 

@@ -54,7 +54,7 @@ Example files in this repository:
 | `[store]` | No | Server-managed persistent metadata backend |
 | `[secure_runtime]` | No | gVisor / Kata / Firecracker |
 | `[renew_intent]` | No | Auto-renew on access |
-| `[otel]` | No | OTLP export for ingested SDK metrics |
+| `[otel]` | No | OTLP export for Server HTTP and ingested SDK metrics |
 
 ---
 
@@ -96,6 +96,7 @@ Example files in this repository:
 |-----|------|---------|-------------|
 | `type` | string | — | **`docker`** or **`kubernetes`**. Selects which runtime implementation loads. |
 | `execd_image` | string | — | OCI image containing the **execd** binary used to bootstrap command/file access inside the sandbox. |
+| `execd_run_as_init` | boolean | `false` | Run **execd as the sandbox init** (OSEP-0018): sets `EXECD_INIT` in the sandbox environment so `bootstrap.sh` `exec`s into `execd --init` and execd becomes PID 1 — reaping children, owning the container lifecycle, and exposing the hardening floor. Defaults to `false` (classic background-and-wait topology); intended to be flipped on after validation in production. |
 
 ---
 
@@ -304,7 +305,7 @@ Per-sandbox enablement uses create request extensions (see OSEP-0009 and `exampl
 
 ## `[otel]`
 
-Optional OpenTelemetry metrics export for SDK-reported sandbox creation latency (`POST /v1/metrics/events`). Off by default; the ingestion endpoint still accepts events and records them as noop.
+Optional OpenTelemetry metrics export for Server HTTP requests and SDK-reported sandbox creation latency (`POST /v1/metrics/events`). Off by default; the HTTP middleware and ingestion endpoint remain active but record as noops.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -312,6 +313,15 @@ Optional OpenTelemetry metrics export for SDK-reported sandbox creation latency 
 | `endpoint` | string \| omitted | `null` | OTLP HTTP metrics endpoint. When omitted, uses `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`. |
 | `service_name` | string | `"opensandbox-server"` | `service.name` resource attribute. |
 | `export_interval_millis` | integer | `60000` | Periodic export interval (≥ 1000). |
+
+Exported metrics:
+
+| Metric | Type | Unit | Attributes | Description |
+|-----|------|------|------------|-------------|
+| `server.http.request.duration` | Histogram | `ms` | `http_method`, `http_route`, `http_status_code` | Server HTTP request latency. Histogram count provides request volume. |
+| `opensandbox.sandbox.create.duration` | Histogram | `ms` | `sdk.language`, `sdk.version`, `success` | SDK-reported creation latency from create start until ready or failure. |
+
+The HTTP metric uses the matched route template rather than the raw request path. Requests that do not reach a matched route, including early authentication failures and unmatched URLs, use `http_route=unknown`. Standard HTTP methods are recorded in uppercase, while extension methods use `http_method=OTHER` to keep attribute cardinality bounded. The metric never includes sandbox IDs, tenant IDs, API keys, request or response bodies, query strings, or other unbounded request data.
 
 ---
 
