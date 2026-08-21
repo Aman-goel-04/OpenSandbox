@@ -90,7 +90,7 @@ Related: [#1458](https://github.com/opensandbox-group/OpenSandbox/issues/1458) (
 | R5 | Abort: hook failure/timeout, lifecycle startup failure, or required execd lifecycle status being unreachable aborts the transition, leaving the pre-transition state with a machine-readable reason |
 | R6 | Hooks never block **termination**: `preTerminate` runs only while `Running`; `Paused`/`Failed` sandboxes skip hooks (no SIGTERM handler / no pod) |
 | R7 | `periodic` runs on cron inside execd without server liveness dependency; in-flight run of the same `name` skips the tick (no queueing) |
-| R8 | Provider-held config survives server restarts (Docker: file-backed store; K8s: BatchSandbox/AgentSandbox annotation). When the selected in-sandbox path is writable and covered by the provider persistence/snapshot contract, execd persists TOML there across execd restarts and pause/resume; failure to persist the default HOME path degrades to the validated in-memory config with a warning |
+| R8 | Provider-held config survives server restarts (Docker: file-backed store; K8s: BatchSandbox/AgentSandbox annotation). Execd atomically persists TOML at the selected in-sandbox path across execd restarts and pause/resume; inability to resolve or write that path fails lifecycle startup |
 | R9 | PATCH affects future transitions only (start-time snapshot); rejected with 409 when not `Running`; rejected for sandboxes whose execd lacks the lifecycle API (capability gate) |
 | R10 | Termination grace covers `preTerminate` (K8s `terminationGracePeriodSeconds` / Docker `stop` timeout ≥ hook timeout + buffer); PATCH cannot raise the timeout beyond the provisioned grace |
 | R11 | Pool-mode: per-sandbox injection via the existing task/alloc path (`spec.taskTemplate`), never the shared Pool template |
@@ -116,7 +116,7 @@ Related: [#1458](https://github.com/opensandbox-group/OpenSandbox/issues/1458) (
 IN-SANDBOX channels (self-contained)          ORCHESTRATED channel (server-driven)
 ────────────────────────────────────          ────────────────────────────────────────
 startup: bootstrap starts execd               transition: server POSTs an event-only
-  → execd loads config; persists if possible  trigger to execd → execd runs the hook
+  → execd loads and persists config           trigger to execd → execd runs the hook
   → execd starts HTTP → runs preStart         resolved from effective config → result
   → normal: bootstrap starts entrypoint       decides advance/abort (prePause, postResume)
   → init: execd starts entrypoint
@@ -201,7 +201,7 @@ config rides the existing per-provider state:
 |---|---|---|
 | Docker | file-backed store (same mechanism as `services/docker/metadata.py`) | labels on running containers are **immutable** |
 | K8s | `sandbox.opensandbox.io/lifecycle` annotation on BatchSandbox **or AgentSandbox** — whichever workload CR the configured provider manages (`provider_factory.py` registers both) | schemaless, no CRD change; controller ignores the key (server-only contract; add to `kubernetes/AGENTS.md` annotation list) |
-| Both | env `OPEN_SANDBOX_LIFECYCLE` (JSON content) at create | **transport only** — execd validates it and, when the selected path is writable, atomically persists the effective config; provider-held config remains the recovery source |
+| Both | env `OPEN_SANDBOX_LIFECYCLE` (JSON content) at create | **transport only** — execd validates it and atomically persists the effective config; failure to persist aborts lifecycle startup, while provider-held config remains the recovery source |
 
 **Pod-creation source stays current.** On PATCH, the server also updates the
 pod-creation source — BatchSandbox `spec.template` / `taskTemplate` env, or
@@ -247,17 +247,17 @@ command = ["/opt/hooks/checkpoint.sh"]
 timeout_seconds = 60
 ```
 
-- **Location**: resolving from `HOME` makes the default writable for both root
-  and non-root images. Platform deployments must ensure the default HOME
+- **Location**: resolving from `HOME` makes the default writable for root and
+  normal non-root images. Platform deployments must ensure the default HOME
   participates in the sandbox persistence/snapshot contract. An operator that
   selects an explicit path owns the same durability requirement. Do not use the
   K8s `opensandbox-bin` emptyDir (`/opt/opensandbox`).
 - **Current startup load order** (`preStart` + `periodic`, no PATCH): a nonblank
   injected env is authoritative, is validated, and atomically refreshes the
-  persisted file; when the env is absent, execd loads the file. If the default
-  HOME path cannot be written, execd warns and uses the validated transport
-  config in memory for that process. An explicit path write failure is fatal.
-  Runtime PATCH persistence/reconciliation is deferred with the PATCH phase.
+  persisted file; when the env is absent, execd loads the file. Failure to
+  resolve or persist either the default or an explicit path is fatal when a
+  transport config is present. Runtime PATCH persistence/reconciliation is
+  deferred with the PATCH phase.
 - **Trust boundary**: hooks run as execd's OS user in the sandbox's existing
   container namespaces and do not use isolated-session confinement. The same
   identity (and any root workload) can modify or remove the persisted file.
@@ -268,8 +268,7 @@ timeout_seconds = 60
   state are separated (hook run results/counters stay in memory —
   `GET /v1/lifecycle/status` reflects the current process only); one concern =
   one file/dir, events use append-only JSONL. Invalid transport or persisted
-  config fails closed; only failure to persist an already validated transport
-  config at the default HOME path falls back to in-memory execution.
+  config and transport persistence failures fail closed.
 
 ### 4. execd Lifecycle API
 
@@ -299,8 +298,8 @@ Design notes:
   (not `/command`'s background+poll shape — hooks need a hard deadline) and
   serves only `prePause`/`postResume`. **The request carries only the event,
   never the command** — execd's effective lifecycle config is the in-sandbox
-  source of truth for every hook (persisted file when available, otherwise the
-  validated in-memory startup config); the server stores config only for
+  source of truth for every hook (the persisted file and the current process's
+  matching validated startup config); the server stores config only for
   validation/display/re-provisioning.
 - `executed: false` is explicit and differentiated: a hook the server believes
   is configured reporting `not_configured`/`config_unavailable` is treated as
@@ -342,7 +341,7 @@ controller or CRD change needed.
 Client visibility is unchanged: transitions surface as
 `Pausing`/`Resuming`/`Stopping`, hook results in `reason`/`message`.
 
-**preStart**: execd loads and, when possible, persists the lifecycle config,
+**preStart**: execd loads and persists the lifecycle config,
 starts its HTTP server, then runs `[preStart]` with the configured timeout. In
 normal mode, bootstrap starts execd first and waits on a private,
 watchdog-bounded startup status channel; only a successful result releases the
@@ -395,7 +394,7 @@ Properties:
 
 ## Test Plan
 
-- **Unit**: schema validation (shapes, `periodic.name` uniqueness, cron parse, PATCH merge, `preStart` rejection); execd `run` (timeout kill, output, exit code, `executed:false` differentiation); lifecycle startup status (`pending`/`running`/`succeeded`/`failed`, including no-hook success); SIGTERM handler (effective-config-resolved `[preTerminate]`, grace-bounded deadline, exit-after, absent-hook no-op); periodic (scheduling, in-flight skip, hot replacement, failure counter); config file (TOML parse, unsupported `version`, atomic write, load order, invalid-config failure, default-path memory fallback); failure-policy resolution.
+- **Unit**: schema validation (shapes, `periodic.name` uniqueness, cron parse, PATCH merge, `preStart` rejection); execd `run` (timeout kill, output, exit code, `executed:false` differentiation); lifecycle startup status (`pending`/`running`/`succeeded`/`failed`, including no-hook success); SIGTERM handler (effective-config-resolved `[preTerminate]`, grace-bounded deadline, exit-after, absent-hook no-op); periodic (scheduling, in-flight skip, hot replacement, failure counter); config file (TOML parse, unsupported `version`, atomic write, load order, invalid-config or persistence failure); failure-policy resolution.
 - **Integration**: bootstrap starts execd before the user entrypoint; execd serves `/ping` while `preStart` is still non-ready, then reports lifecycle startup success before the entrypoint starts. Cover hook failure, execd failing before status, and watchdog termination when execd never reports status. Server orchestration uses a fake execd to verify resume waits for lifecycle startup success before `postResume`, plus hook ordering, abort paths, and lifecycle-status unreachability per R5.
 - **E2E (Kind / Docker)**: Docker — `prePause` marker before `docker pause`, `postResume` after `unpause`, periodic checkpoints (ticker frozen while paused), `preTerminate` marker on `docker stop` **and on TTL expiry** (grace-bounded stop path). K8s — during resume, `/ping` succeeds while a long `preStart` still keeps lifecycle startup non-ready; `postResume` and public `Running` occur only after startup succeeds, while startup failure or lifecycle-status unreachability rolls back to `Paused`. Also cover TTL/delete/eviction producing the `preTerminate` marker and paused sandbox deletion producing none. Pool TTL/delete tests must cover `execd_run_as_init`; non-init Pool create/PATCH requests containing `preTerminate` must be rejected. PATCH mid-flight snapshot; server restart restore (file-backed store/annotation); config persistence across execd restart and both pause/resume models; replacement pod after eviction materializes the PATCHed config from the updated pod-creation source.
 
