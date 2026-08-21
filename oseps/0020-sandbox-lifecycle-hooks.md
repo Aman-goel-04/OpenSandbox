@@ -1,10 +1,11 @@
 ---
 title: Sandbox Lifecycle Hooks
 authors:
-  - "@pjp"
+  - "@Pangjiping"
+  - "@peijianping"
 creation-date: 2026-08-17
 last-updated: 2026-08-21
-status: draft
+status: implementing
 ---
 
 # OSEP-0020: Sandbox Lifecycle Hooks
