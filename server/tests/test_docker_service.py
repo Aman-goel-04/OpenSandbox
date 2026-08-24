@@ -448,6 +448,7 @@ async def test_create_sandbox_rejects_lifecycle_hooks_on_docker(mock_docker):
     assert exc.value.detail["code"] == SandboxErrorCodes.INVALID_PARAMETER
     mock_client.containers.create.assert_not_called()
 
+
 @pytest.mark.asyncio
 @patch("opensandbox_server.services.docker.docker_service.docker")
 async def test_create_sandbox_rejects_timeout_above_configured_maximum(mock_docker):
