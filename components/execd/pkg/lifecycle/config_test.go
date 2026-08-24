@@ -159,12 +159,25 @@ func TestDecodeConfigRejectsTimezoneWithoutSchedule(t *testing.T) {
 	require.ErrorContains(t, err, `periodic hook "sync" has invalid schedule`)
 }
 
-func TestDecodeConfigRejectsOverflowingTimeout(t *testing.T) {
-	_, err := decodeConfig([]byte(`{
-  "preStart": {"command": ["true"], "timeoutSeconds": 9223372037}
-}`))
+func TestDecodeConfigEnforcesMaximumHookTimeout(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		raw  string
+	}{
+		{name: "preStart", raw: `{"preStart":{"command":["true"],"timeoutSeconds":301}}`},
+		{name: "periodic", raw: `{"periodic":[{"name":"sync","schedule":"@hourly","command":["true"],"timeoutSeconds":301}]}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := decodeConfig([]byte(test.raw))
+			require.ErrorContains(t, err, "timeoutSeconds must not exceed 300")
+		})
+	}
 
-	require.ErrorContains(t, err, "timeoutSeconds is too large")
+	_, err := decodeConfig([]byte(`{
+  "preStart": {"command": ["true"], "timeoutSeconds": 300},
+  "periodic": [{"name": "sync", "schedule": "@hourly", "command": ["true"], "timeoutSeconds": 300}]
+}`))
+	require.NoError(t, err)
 }
 
 func TestLoadConfigRejectsInvalidPersistedConfig(t *testing.T) {

@@ -34,7 +34,8 @@ class LifecycleHook:
 
         Attributes:
             command (list[str]): Command and arguments to execute.
-            timeout_seconds (int | Unset): Maximum execution time in seconds. The server defaults to 60 when omitted.
+            timeout_seconds (int | Unset): Maximum execution time in seconds, up to 300. The server defaults to 60 when
+                omitted.
     """
 
     command: list[str]

@@ -34,7 +34,8 @@ class PeriodicLifecycleHook:
         name (str): Name unique among periodic hooks in this sandbox.
         schedule (str): Five-field cron expression or descriptor such as `@hourly` or `@every 30s`.
         command (list[str]): Command and arguments to execute without implicit shell expansion.
-        timeout_seconds (int | Unset): Maximum execution time in seconds. The server defaults to 60 when omitted.
+        timeout_seconds (int | Unset): Maximum execution time in seconds, up to 300. The server defaults to 60 when
+            omitted.
     """
 
     name: str

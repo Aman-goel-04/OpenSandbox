@@ -33,8 +33,9 @@ const (
 	ConfigEnv     = "OPEN_SANDBOX_LIFECYCLE"
 	ConfigPathEnv = "EXECD_LIFECYCLE_CONFIG"
 
-	defaultTimeout = 60 * time.Second
-	configVersion  = 1
+	defaultTimeout        = 60 * time.Second
+	maxHookTimeoutSeconds = 300
+	configVersion         = 1
 )
 
 // Config is the creation-time sandbox lifecycle configuration consumed by
@@ -197,9 +198,8 @@ func validateHook(name string, hook Hook) error {
 	if hook.TimeoutSeconds < 0 {
 		return fmt.Errorf("%s timeoutSeconds must not be negative", name)
 	}
-	const maxTimeoutSeconds = int64((time.Duration(1<<63 - 1)) / time.Second)
-	if int64(hook.TimeoutSeconds) > maxTimeoutSeconds {
-		return fmt.Errorf("%s timeoutSeconds is too large", name)
+	if hook.TimeoutSeconds > maxHookTimeoutSeconds {
+		return fmt.Errorf("%s timeoutSeconds must not exceed %d", name, maxHookTimeoutSeconds)
 	}
 	return nil
 }

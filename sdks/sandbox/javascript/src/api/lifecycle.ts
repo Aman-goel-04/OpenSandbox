@@ -1075,7 +1075,7 @@ export interface components {
         LifecycleHook: {
             /** @description Command and arguments to execute. */
             command: string[];
-            /** @description Maximum execution time in seconds. The server defaults to 60 when omitted. */
+            /** @description Maximum execution time in seconds, up to 300. The server defaults to 60 when omitted. */
             timeoutSeconds?: number;
         };
         /** @description A named lifecycle command scheduled inside the sandbox by execd. */
@@ -1086,7 +1086,7 @@ export interface components {
             schedule: string;
             /** @description Command and arguments to execute without implicit shell expansion. */
             command: string[];
-            /** @description Maximum execution time in seconds. The server defaults to 60 when omitted. */
+            /** @description Maximum execution time in seconds, up to 300. The server defaults to 60 when omitted. */
             timeoutSeconds?: number;
         };
         /**

@@ -61,6 +61,25 @@ from opensandbox.models.sandboxes import (
     SandboxStatus,
     Volume,
 )
+from opensandbox.models.sandboxes import (
+    LifecycleHook as DomainLifecycleHook,
+)
+from opensandbox.models.sandboxes import (
+    PeriodicLifecycleHook as DomainPeriodicLifecycleHook,
+)
+
+
+@pytest.mark.parametrize("hook_type", [DomainLifecycleHook, DomainPeriodicLifecycleHook])
+def test_lifecycle_hooks_reject_timeout_above_maximum(hook_type: type) -> None:
+    kwargs: dict[str, object] = {"command": ["true"], "timeoutSeconds": 300}
+    if hook_type is DomainPeriodicLifecycleHook:
+        kwargs.update(name="sync", schedule="@hourly")
+
+    assert hook_type.model_validate(kwargs).timeout_seconds == 300
+
+    kwargs["timeoutSeconds"] = 301
+    with pytest.raises(ValueError, match="less than or equal to 300"):
+        hook_type.model_validate(kwargs)
 
 
 def test_sandbox_image_spec_supports_positional_image() -> None:

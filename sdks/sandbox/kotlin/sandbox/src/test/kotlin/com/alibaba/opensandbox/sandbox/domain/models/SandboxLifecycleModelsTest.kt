@@ -25,12 +25,29 @@ import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.Sandbox
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Test
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.LifecycleHook as DomainLifecycleHook
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.PeriodicLifecycleHook as DomainPeriodicLifecycleHook
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxLifecycle as DomainSandboxLifecycle
 
 class SandboxLifecycleModelsTest {
+    @Test
+    fun `stable lifecycle builders reject timeout above maximum`() {
+        assertEquals(300, DomainLifecycleHook.builder().command("true").timeoutSeconds(300).build().timeoutSeconds)
+
+        assertThrows(IllegalArgumentException::class.java) {
+            DomainLifecycleHook.builder().command("true").timeoutSeconds(301)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            DomainPeriodicLifecycleHook.builder()
+                .name("sync")
+                .schedule("@hourly")
+                .command("true")
+                .timeoutSeconds(301)
+        }
+    }
+
     @Test
     fun `stable lifecycle builders snapshot mutable command and periodic lists`() {
         val command = mutableListOf("true")
