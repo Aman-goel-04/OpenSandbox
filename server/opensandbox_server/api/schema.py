@@ -143,7 +143,7 @@ class LifecycleHook(BaseModel):
     """Command executed by execd before the user entrypoint starts."""
 
     command: List[str] = Field(..., min_length=1)
-    timeout_seconds: Optional[int] = Field(None, alias="timeoutSeconds", ge=1)
+    timeout_seconds: Optional[int] = Field(None, alias="timeoutSeconds", ge=1, le=300)
 
     @model_validator(mode="after")
     def validate_command(self) -> "LifecycleHook":
@@ -162,7 +162,7 @@ class PeriodicLifecycleHook(BaseModel):
     name: str = Field(..., min_length=1)
     schedule: str = Field(..., min_length=1)
     command: List[str] = Field(..., min_length=1)
-    timeout_seconds: Optional[int] = Field(None, alias="timeoutSeconds", ge=1)
+    timeout_seconds: Optional[int] = Field(None, alias="timeoutSeconds", ge=1, le=300)
 
     @model_validator(mode="after")
     def normalize_and_validate(self) -> "PeriodicLifecycleHook":
