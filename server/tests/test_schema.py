@@ -53,8 +53,8 @@ class TestSandboxLifecycle:
                     },
                     "periodic": [
                         {
-                            "name": "checkpoint",
-                            "schedule": "*/5 * * * *",
+                            "name": " checkpoint ",
+                            "schedule": " */5 * * * * ",
                             "command": ["/opt/hooks/checkpoint.sh"],
                         }
                     ],
@@ -67,6 +67,7 @@ class TestSandboxLifecycle:
         assert request.lifecycle.pre_start.timeout_seconds == 30
         assert request.lifecycle.periodic is not None
         assert request.lifecycle.periodic[0].name == "checkpoint"
+        assert request.lifecycle.periodic[0].schedule == "*/5 * * * *"
 
     def test_create_request_rejects_reserved_lifecycle_env(self):
         with pytest.raises(ValidationError, match="is reserved"):
@@ -86,16 +87,39 @@ class TestSandboxLifecycle:
                 ),
             )
 
-    def test_lifecycle_rejects_duplicate_periodic_names(self):
+    @pytest.mark.parametrize("duplicate_name", ["sync", " sync "])
+    def test_lifecycle_rejects_duplicate_periodic_names(self, duplicate_name):
         with pytest.raises(ValidationError, match="names must be unique"):
             SandboxLifecycle.model_validate(
                 {
                     "periodic": [
                         {"name": "sync", "schedule": "@hourly", "command": ["true"]},
-                        {"name": "sync", "schedule": "@daily", "command": ["true"]},
+                        {"name": duplicate_name, "schedule": "@daily", "command": ["true"]},
                     ]
                 }
             )
+
+    @pytest.mark.parametrize(
+        ("payload", "message"),
+        [
+            ({"preStart": {"command": [" "]}}, "command must not be empty"),
+            (
+                {"periodic": [{"name": " ", "schedule": "@hourly", "command": ["true"]}]},
+                "name must not be blank",
+            ),
+            (
+                {"periodic": [{"name": "sync", "schedule": "\t", "command": ["true"]}]},
+                "schedule must not be blank",
+            ),
+            (
+                {"periodic": [{"name": "sync", "schedule": "@hourly", "command": [" "]}]},
+                "command must not be empty",
+            ),
+        ],
+    )
+    def test_lifecycle_rejects_blank_required_values(self, payload, message):
+        with pytest.raises(ValidationError, match=message):
+            SandboxLifecycle.model_validate(payload)
 
 
 class TestHost:

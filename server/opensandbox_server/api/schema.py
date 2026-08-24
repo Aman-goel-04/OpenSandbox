@@ -145,6 +145,12 @@ class LifecycleHook(BaseModel):
     command: List[str] = Field(..., min_length=1)
     timeout_seconds: Optional[int] = Field(None, alias="timeoutSeconds", ge=1)
 
+    @model_validator(mode="after")
+    def validate_command(self) -> "LifecycleHook":
+        if not self.command[0].strip():
+            raise ValueError("Lifecycle hook command must not be empty.")
+        return self
+
     class Config:
         populate_by_name = True
         extra = "forbid"
@@ -157,6 +163,18 @@ class PeriodicLifecycleHook(BaseModel):
     schedule: str = Field(..., min_length=1)
     command: List[str] = Field(..., min_length=1)
     timeout_seconds: Optional[int] = Field(None, alias="timeoutSeconds", ge=1)
+
+    @model_validator(mode="after")
+    def normalize_and_validate(self) -> "PeriodicLifecycleHook":
+        self.name = self.name.strip()
+        self.schedule = self.schedule.strip()
+        if not self.name:
+            raise ValueError("Periodic lifecycle hook name must not be blank.")
+        if not self.schedule:
+            raise ValueError("Periodic lifecycle hook schedule must not be blank.")
+        if not self.command[0].strip():
+            raise ValueError("Periodic lifecycle hook command must not be empty.")
+        return self
 
     class Config:
         populate_by_name = True
