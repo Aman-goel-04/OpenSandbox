@@ -16,11 +16,11 @@ import json
 from datetime import datetime, timezone
 
 from opensandbox_server.api.schema import (
-    OPEN_SANDBOX_LIFECYCLE_ENV,
     LifecycleHook,
     PeriodicLifecycleHook,
     SandboxLifecycle,
 )
+from opensandbox_server.services.constants import OPENSANDBOX_LIFECYCLE
 from opensandbox_server.services.k8s.create_helpers import (
     _build_create_workload_context,
 )
@@ -55,7 +55,7 @@ def test_create_context_transports_lifecycle_as_reserved_execd_env(
     )
 
     assert context.sandbox_env["USER_ENV"] == "value"
-    assert json.loads(context.sandbox_env[OPEN_SANDBOX_LIFECYCLE_ENV]) == {
+    assert json.loads(context.sandbox_env[OPENSANDBOX_LIFECYCLE]) == {
         "preStart": {
             "command": ["/opt/hooks/restore.sh"],
             "timeoutSeconds": 30,
