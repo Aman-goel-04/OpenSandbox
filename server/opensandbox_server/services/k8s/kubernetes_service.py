@@ -61,6 +61,7 @@ from opensandbox_server.services.k8s.k8s_diagnostics import K8sDiagnosticsMixin
 from opensandbox_server.services.k8s.endpoint_resolver import _attach_egress_auth_headers, _attach_secure_access_headers
 from opensandbox_server.services.k8s.list_helpers import _build_list_sandboxes_response
 from opensandbox_server.services.k8s.status_helpers import (
+    POOL_CAPACITY_EXHAUSTED_REASON,
     _is_pool_capacity_exhausted_status,
     _is_unschedulable_status,
     _normalize_create_status,
@@ -332,7 +333,7 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
             await asyncio.sleep(poll_interval_seconds)
 
         elapsed = time.time() - start_time
-        if last_reason == "POOL_CAPACITY_EXHAUSTED":
+        if last_reason == POOL_CAPACITY_EXHAUSTED_REASON:
             raise self._pool_capacity_exhausted_error(
                 pool_acquisition_timeout_seconds
             )

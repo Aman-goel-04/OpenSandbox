@@ -45,6 +45,10 @@ from opensandbox_server.services.constants import (
 from opensandbox_server.services.k8s.batchsandbox_provider import BatchSandboxProvider
 from opensandbox_server.services.constants import OPENSANDBOX_EGRESS_TOKEN
 from opensandbox_server.services.k8s.image_pull_secret_helper import IMAGE_AUTH_SECRET_PREFIX
+from opensandbox_server.services.k8s.status_helpers import (
+    POOL_CAPACITY_EXHAUSTED_REASON,
+    _is_pool_capacity_exhausted_status,
+)
 from opensandbox_server.services.k8s.volume_helper import apply_volumes_to_pod_spec
 
 
@@ -1286,7 +1290,8 @@ spec:
         result = provider.get_status(workload)
 
         assert result["state"] == "Pending"
-        assert result["reason"] == "POOL_CAPACITY_EXHAUSTED"
+        assert result["reason"] == POOL_CAPACITY_EXHAUSTED_REASON
+        assert _is_pool_capacity_exhausted_status(result)
         assert result["message"] == "Pool example-pool is at capacity"
 
     def test_get_status_succeed_phase_wins_over_stale_pool_capacity_condition(self):

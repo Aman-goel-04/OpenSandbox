@@ -48,6 +48,9 @@ from opensandbox_server.services.k8s.provider_common import (
     _extract_platform_unschedulable_message_from_pod,
     _workload_platform_constraint_scope,
 )
+from opensandbox_server.services.k8s.status_helpers import (
+    POOL_CAPACITY_EXHAUSTED_REASON,
+)
 from opensandbox_server.services.k8s.windows_profile import (
     apply_windows_profile_arch_selector,
     apply_windows_profile_overrides,
@@ -904,7 +907,7 @@ class BatchSandboxProvider(WorkloadProvider):
             ) or "Pool capacity is currently unavailable"
             return {
                 "state": "Pending",
-                "reason": "POOL_CAPACITY_EXHAUSTED",
+                "reason": POOL_CAPACITY_EXHAUSTED_REASON,
                 "message": pool_capacity_message,
                 "last_transition_at": creation_timestamp,
             }
