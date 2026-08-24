@@ -90,7 +90,7 @@ if [ -n "$status_file" ]; then
         while true; do sleep 1; done
     fi
     lifecycle_config=""
-    lifecycle_transport="$(printf '%s' "${OPEN_SANDBOX_LIFECYCLE:-}" | tr -d '[:space:]')"
+    lifecycle_transport="$(printf '%s' "${OPENSANDBOX_LIFECYCLE:-}" | tr -d '[:space:]')"
     if [ -z "$lifecycle_transport" ]; then
         lifecycle_config="${EXECD_LIFECYCLE_CONFIG:-}"
         if [ -z "$lifecycle_config" ]; then
@@ -167,7 +167,7 @@ if [ "${EXPECT_PRESTART_MARKER:-1}" = "1" ]; then
     test -f "$PRESTART_MARKER"
 fi
 test -f "$EXECD_READY_MARKER"
-test -z "${OPEN_SANDBOX_LIFECYCLE:-}"
+test -z "${OPENSANDBOX_LIFECYCLE:-}"
 test -z "${EXECD_LIFECYCLE_CONFIG:-}"
 test -f "$EXECD_MARKER"
 touch "$USER_MARKER"
@@ -182,7 +182,7 @@ USER_MARKER="$TESTDIR/user-started"
 SEQUENCE_FILE="$TESTDIR/sequence"
 STATUS_DIR="$TESTDIR/status"
 mkdir "$STATUS_DIR"
-OPEN_SANDBOX_LIFECYCLE='{"preStart":{"command":["true"]}}' \
+OPENSANDBOX_LIFECYCLE='{"preStart":{"command":["true"]}}' \
 EXECD="$EXECD_STUB" \
 PRESTART_MARKER="$PRESTART_MARKER" \
 EXECD_MARKER="$EXECD_MARKER" \
@@ -202,7 +202,7 @@ assert_status_dir_empty
 echo "PASS: preStart completed before the user entrypoint"
 
 rm -f "$PRESTART_MARKER" "$EXECD_MARKER" "$EXECD_READY_MARKER" "$USER_MARKER" "$SEQUENCE_FILE"
-OPEN_SANDBOX_LIFECYCLE='{"periodic":[{"name":"sync","schedule":"@hourly","command":["true"]}]}' \
+OPENSANDBOX_LIFECYCLE='{"periodic":[{"name":"sync","schedule":"@hourly","command":["true"]}]}' \
 EXECD="$EXECD_STUB" \
 EXECD_NO_PRESTART=1 \
 EXPECT_PRESTART_MARKER=0 \
@@ -223,7 +223,7 @@ echo "PASS: periodic-only lifecycle starts without a preStart running status"
 
 rm -f "$PRESTART_MARKER" "$EXECD_MARKER" "$EXECD_READY_MARKER" "$USER_MARKER" "$SEQUENCE_FILE"
 # Keep this delay above bootstrap's 10-second initial startup watchdog.
-OPEN_SANDBOX_LIFECYCLE='{"preStart":{"command":["true"]}}' \
+OPENSANDBOX_LIFECYCLE='{"preStart":{"command":["true"]}}' \
 EXECD="$EXECD_STUB" \
 PRESTART_TIMEOUT_SECONDS=30 \
 PRESTART_DELAY_SECONDS=11 \
@@ -246,7 +246,7 @@ echo "PASS: preStart completion may exceed the initial startup watchdog"
 
 rm -f "$PRESTART_MARKER" "$EXECD_MARKER" "$EXECD_READY_MARKER" "$USER_MARKER" "$SEQUENCE_FILE"
 set +e
-OPEN_SANDBOX_LIFECYCLE='{"preStart":{"command":["true"]}}' \
+OPENSANDBOX_LIFECYCLE='{"preStart":{"command":["true"]}}' \
 EXECD="$EXECD_STUB" \
 PRESTART_EXIT_CODE=42 \
 PRESTART_MARKER="$PRESTART_MARKER" \
@@ -269,7 +269,7 @@ echo "PASS: preStart failure stops execd and prevents the user entrypoint from s
 
 rm -f "$PRESTART_MARKER" "$EXECD_MARKER" "$EXECD_READY_MARKER" "$USER_MARKER" "$SEQUENCE_FILE"
 PRESTART_TERMINATED_MARKER="$TESTDIR/prestart-terminated"
-OPEN_SANDBOX_LIFECYCLE='{"preStart":{"command":["true"]}}' \
+OPENSANDBOX_LIFECYCLE='{"preStart":{"command":["true"]}}' \
 EXECD="$EXECD_STUB" \
 PRESTART_BLOCK=1 \
 PRESTART_TIMEOUT_SECONDS=300 \
@@ -303,7 +303,7 @@ echo "PASS: termination during preStart is forwarded to the hook"
 rm -f "$PRESTART_MARKER" "$EXECD_MARKER" "$EXECD_READY_MARKER" "$USER_MARKER" "$SEQUENCE_FILE"
 EXECD_RUNNING_MARKER="$TESTDIR/execd-running"
 EXECD_IGNORED_TERM_MARKER="$TESTDIR/execd-ignored-term"
-OPEN_SANDBOX_LIFECYCLE='{"preStart":{"command":["true"]}}' \
+OPENSANDBOX_LIFECYCLE='{"preStart":{"command":["true"]}}' \
 EXECD="$EXECD_STUB" \
 EXECD_HANG_AFTER_RUNNING=1 \
 EXECD_IGNORE_TERM=1 \
@@ -349,7 +349,7 @@ echo "PASS: termination during preStart kills an unresponsive execd"
 
 rm -f "$PRESTART_MARKER" "$EXECD_MARKER" "$EXECD_READY_MARKER" "$USER_MARKER" "$SEQUENCE_FILE"
 set +e
-OPEN_SANDBOX_LIFECYCLE='{"preStart":{"command":["true"]}}' \
+OPENSANDBOX_LIFECYCLE='{"preStart":{"command":["true"]}}' \
 EXECD="$EXECD_STUB" \
 EXECD_DIE_BEFORE_STATUS=1 \
 PRESTART_MARKER="$PRESTART_MARKER" \
@@ -374,7 +374,7 @@ echo "PASS: execd exit before lifecycle status fails startup without leaking the
 rm -f "$PRESTART_MARKER" "$EXECD_MARKER" "$EXECD_READY_MARKER" "$USER_MARKER" "$SEQUENCE_FILE"
 EXECD_HANG_TERMINATED_MARKER="$TESTDIR/execd-hang-terminated"
 set +e
-OPEN_SANDBOX_LIFECYCLE='{"preStart":{"command":["true"]}}' \
+OPENSANDBOX_LIFECYCLE='{"preStart":{"command":["true"]}}' \
 EXECD="$EXECD_STUB" \
 EXECD_HANG_BEFORE_STATUS=1 \
 EXECD_HANG_TERMINATED_MARKER="$EXECD_HANG_TERMINATED_MARKER" \
@@ -399,7 +399,7 @@ echo "PASS: lifecycle startup watchdog terminates a hung execd"
 rm -f "$PRESTART_MARKER" "$EXECD_MARKER" "$EXECD_READY_MARKER" "$USER_MARKER" "$SEQUENCE_FILE"
 EXECD_RUNNING_HANG_TERMINATED_MARKER="$TESTDIR/execd-running-hang-terminated"
 set +e
-OPEN_SANDBOX_LIFECYCLE='{"preStart":{"command":["true"]}}' \
+OPENSANDBOX_LIFECYCLE='{"preStart":{"command":["true"]}}' \
 EXECD="$EXECD_STUB" \
 EXECD_HANG_AFTER_RUNNING=1 \
 EXECD_HANG_TERMINATED_MARKER="$EXECD_RUNNING_HANG_TERMINATED_MARKER" \
@@ -426,7 +426,7 @@ echo "PASS: lifecycle hook watchdog timeout cannot be overwritten by a late succ
 rm -f "$PRESTART_MARKER" "$EXECD_MARKER" "$EXECD_READY_MARKER" "$USER_MARKER" "$SEQUENCE_FILE"
 EXECD_INVALID_RUNNING_TERMINATED_MARKER="$TESTDIR/execd-invalid-running-terminated"
 set +e
-OPEN_SANDBOX_LIFECYCLE='{"preStart":{"command":["true"]}}' \
+OPENSANDBOX_LIFECYCLE='{"preStart":{"command":["true"]}}' \
 EXECD="$EXECD_STUB" \
 EXECD_HANG_AFTER_RUNNING=1 \
 EXECD_HANG_TERMINATED_MARKER="$EXECD_INVALID_RUNNING_TERMINATED_MARKER" \
@@ -452,7 +452,7 @@ echo "PASS: malformed lifecycle running status fails closed"
 rm -f "$PRESTART_MARKER" "$EXECD_MARKER" "$EXECD_READY_MARKER" "$USER_MARKER" "$SEQUENCE_FILE"
 EXECD_MISSING_STATUS_TERMINATED_MARKER="$TESTDIR/execd-missing-status-terminated"
 set +e
-OPEN_SANDBOX_LIFECYCLE='{"preStart":{"command":["true"]}}' \
+OPENSANDBOX_LIFECYCLE='{"preStart":{"command":["true"]}}' \
 EXECD="$EXECD_STUB" \
 EXECD_HANG_BEFORE_STATUS=1 \
 EXECD_REMOVE_STATUS_FILE=1 \
@@ -479,7 +479,7 @@ STATUS_TERMINATED_MARKER="$TESTDIR/status-terminated"
 for invalid_status in garbled 999 999999999999999999999999; do
     rm -f "$PRESTART_MARKER" "$EXECD_MARKER" "$EXECD_READY_MARKER" "$USER_MARKER" "$SEQUENCE_FILE" "$STATUS_TERMINATED_MARKER"
     set +e
-    OPEN_SANDBOX_LIFECYCLE='{"preStart":{"command":["true"]}}' \
+    OPENSANDBOX_LIFECYCLE='{"preStart":{"command":["true"]}}' \
     EXECD="$EXECD_STUB" \
     PRESTART_STATUS_RAW="$invalid_status" \
     EXECD_STATUS_STAY_ALIVE=1 \
@@ -529,7 +529,7 @@ SANITIZE_USER_SCRIPT="$TESTDIR/sanitize-user.sh"
 cat > "$SANITIZE_USER_SCRIPT" <<'USER'
 #!/bin/sh
 set -e
-test -z "${OPEN_SANDBOX_LIFECYCLE:-}"
+test -z "${OPENSANDBOX_LIFECYCLE:-}"
 test -z "${EXECD_LIFECYCLE_CONFIG:-}"
 i=0
 while [ ! -f "$EXECD_MARKER" ] && [ "$i" -lt 50 ]; do
@@ -541,7 +541,7 @@ touch "$USER_MARKER"
 USER
 chmod +x "$SANITIZE_USER_SCRIPT"
 test -f "$PERSISTED_CONFIG"
-OPEN_SANDBOX_LIFECYCLE='' \
+OPENSANDBOX_LIFECYCLE='' \
 EXECD_LIFECYCLE_CONFIG="$TESTDIR/missing-lifecycle.toml" \
 EXECD="$EXECD_STUB" \
 PRESTART_MARKER="$PRESTART_MARKER" \
@@ -562,7 +562,7 @@ rm -f "$PRESTART_MARKER" "$EXECD_MARKER" "$EXECD_READY_MARKER" "$USER_MARKER" "$
 CONFIG_DIR_PATH="$TESTDIR/config-as-dir"
 mkdir -p "$CONFIG_DIR_PATH"
 set +e
-OPEN_SANDBOX_LIFECYCLE='' \
+OPENSANDBOX_LIFECYCLE='' \
 EXECD_LIFECYCLE_CONFIG="$CONFIG_DIR_PATH" \
 EXECD="$EXECD_STUB" \
 PRESTART_MARKER="$PRESTART_MARKER" \
@@ -587,7 +587,7 @@ for lifecycle_home in "$HOME" ''; do
     [ -z "$lifecycle_home" ] || lifecycle_transport='   '
     rm -f "$PRESTART_MARKER" "$EXECD_MARKER" "$EXECD_READY_MARKER" "$USER_MARKER" "$SEQUENCE_FILE"
     HOME="$lifecycle_home" \
-    OPEN_SANDBOX_LIFECYCLE="$lifecycle_transport" \
+    OPENSANDBOX_LIFECYCLE="$lifecycle_transport" \
     EXECD_LIFECYCLE_CONFIG='' \
     EXECD="$EXECD_STUB" \
     PRESTART_MARKER="$PRESTART_MARKER" \
