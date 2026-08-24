@@ -15,8 +15,8 @@
 import pytest
 from pydantic import ValidationError
 
+from opensandbox_server.constants import OPENSANDBOX_LIFECYCLE
 from opensandbox_server.api.schema import (
-    OPEN_SANDBOX_LIFECYCLE_ENV,
     CreateSandboxRequest,
     CreateSnapshotRequest,
     CredentialProxyConfig,
@@ -74,7 +74,7 @@ class TestSandboxLifecycle:
                 image=ImageSpec(uri="python:3.11"),
                 entrypoint=["python"],
                 resourceLimits=ResourceLimits(root={}),
-                env={OPEN_SANDBOX_LIFECYCLE_ENV: "{}"},
+                env={OPENSANDBOX_LIFECYCLE: "{}"},
             )
 
     def test_create_request_rejects_lifecycle_with_pool_ref(self):

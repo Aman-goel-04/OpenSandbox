@@ -19,13 +19,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Dict, Optional
 
-from opensandbox_server.api.schema import (
-    OPEN_SANDBOX_LIFECYCLE_ENV,
-    CreateSandboxRequest,
-)
+from opensandbox_server.api.schema import CreateSandboxRequest
 from opensandbox_server.config import AppConfig, EGRESS_MODE_DNS
 from opensandbox_server.services.constants import (
     OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE,
+    OPENSANDBOX_LIFECYCLE,
     SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY,
     SANDBOX_SECURE_ACCESS_TOKEN_METADATA_KEY,
     SANDBOX_ID_LABEL,
@@ -101,7 +99,7 @@ def _build_create_workload_context(
 
     sandbox_env, egress_env = split_egress_env(request.env)
     if request.lifecycle is not None:
-        sandbox_env[OPEN_SANDBOX_LIFECYCLE_ENV] = request.lifecycle.model_dump_json(
+        sandbox_env[OPENSANDBOX_LIFECYCLE] = request.lifecycle.model_dump_json(
             by_alias=True,
             exclude_none=True,
         )

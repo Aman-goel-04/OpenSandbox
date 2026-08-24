@@ -24,8 +24,7 @@ from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, RootModel, model_validator
 
-OPEN_SANDBOX_LIFECYCLE_ENV = "OPEN_SANDBOX_LIFECYCLE"
-
+from opensandbox_server.constants import OPENSANDBOX_LIFECYCLE
 
 # ============================================================================
 # Image Specification
@@ -541,9 +540,9 @@ class CreateSandboxRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_source_and_entrypoint(self) -> "CreateSandboxRequest":
-        if self.env and OPEN_SANDBOX_LIFECYCLE_ENV in self.env:
+        if self.env and OPENSANDBOX_LIFECYCLE in self.env:
             raise ValueError(
-                f"Environment variable '{OPEN_SANDBOX_LIFECYCLE_ENV}' is reserved. "
+                f"Environment variable '{OPENSANDBOX_LIFECYCLE}' is reserved. "
                 "Use the lifecycle request field instead."
             )
 
