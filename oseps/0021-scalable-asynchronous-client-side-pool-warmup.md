@@ -521,8 +521,10 @@ Per-sandbox or task IDs belong in traces and structured logs, not metric labels.
 > Reuse the existing lifecycle metrics reporter transport, but preserve
 > `sandbox.create` semantics. This requires a backward-compatible lifecycle
 > metrics contract and server-side ingestion/export support before SDKs start
-> emitting the new event. Until then, this observability gap is an accepted
-> temporary limitation of the implementation.
+> emitting the new event. Staged warmup therefore suppresses the legacy
+> `sandbox.create` event rather than reporting create/connect completion as an
+> end-to-end create success. Until the dedicated event exists, this
+> observability gap is an accepted temporary limitation of the implementation.
 
 ## Test Plan
 
