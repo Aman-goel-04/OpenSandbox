@@ -1018,6 +1018,59 @@ class TestWaitForSandboxReady:
         )
 
     @pytest.mark.asyncio
+    async def test_wait_accumulates_pool_capacity_across_transient_recovery(
+        self, k8s_service, mock_workload
+    ):
+        clock = SimpleNamespace(now=0.0)
+
+        async def advance_clock(seconds: float) -> None:
+            clock.now += seconds
+
+        capacity_status = {
+            "state": "Pending",
+            "reason": "POOL_CAPACITY_EXHAUSTED",
+            "message": "Pool capacity is exhausted",
+            "last_transition_at": datetime.now(timezone.utc),
+        }
+        generic_pending_status = {
+            "state": "Pending",
+            "reason": "BATCHSANDBOX_PENDING",
+            "message": "Sandbox is pending",
+            "last_transition_at": datetime.now(timezone.utc),
+        }
+        k8s_service.workload_provider.get_workload.return_value = mock_workload
+        k8s_service.workload_provider.get_status.side_effect = [
+            capacity_status,
+            generic_pending_status,
+            capacity_status,
+            generic_pending_status,
+        ]
+
+        with (
+            patch(
+                "opensandbox_server.services.k8s.kubernetes_service.time.time",
+                side_effect=lambda: clock.now,
+            ),
+            patch(
+                "opensandbox_server.services.k8s.kubernetes_service.asyncio.sleep",
+                new=advance_clock,
+            ),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            await k8s_service._wait_for_sandbox_ready(
+                "test-sandbox-id",
+                timeout_seconds=4,
+                poll_interval_seconds=1,
+                pool_acquisition_timeout_seconds=2,
+            )
+
+        assert exc_info.value.status_code == 429
+        assert (
+            exc_info.value.detail["code"]
+            == SandboxErrorCodes.K8S_POOL_CAPACITY_EXHAUSTED
+        )
+
+    @pytest.mark.asyncio
     async def test_wait_returns_400_when_scheduler_marks_platform_unschedulable(self, k8s_service, mock_workload):
         k8s_service.workload_provider.get_workload.return_value = mock_workload
         k8s_service.workload_provider.get_status.return_value = {

@@ -643,7 +643,7 @@ class KubernetesRuntimeConfig(BaseModel):
         default=30,
         ge=1,
         description=(
-            "Maximum continuous time in seconds to wait while Pool capacity "
+            "Maximum cumulative time in seconds to wait while Pool capacity "
             "prevents sandbox allocation. The overall sandbox create timeout still applies."
         ),
     )

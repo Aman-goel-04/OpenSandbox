@@ -407,7 +407,9 @@ When a lifecycle request cannot obtain a slot because the selected Pool is at
 extending the overall sandbox creation timeout. If capacity remains unavailable,
 the request returns HTTP `429`, error code
 `KUBERNETES::POOL_CAPACITY_EXHAUSTED`, and a `Retry-After` header. A slot released
-during the acquisition window can still satisfy the request.
+during the acquisition window can still satisfy the request. Capacity-blocked
+time accumulates across polls, so brief status transitions do not make the final
+error depend on the last observed status.
 :::
 
 ::: warning Per-request network policies
