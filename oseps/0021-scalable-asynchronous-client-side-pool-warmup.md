@@ -291,13 +291,13 @@ The create executor is elastic and has no work backlog:
 
 ```text
 corePoolSize = 0
-maximumPoolSize = ceil(warmupCreateQps × 1.2)
+maximumPoolSize = ceil(warmupCreateQps × 1.5)
 keepAliveTime = 30s
 workQueue = SynchronousQueue
 rejection = AbortPolicy
 ```
 
-The 20 percent allowance absorbs create calls that cross the next one-second
+The 50 percent allowance absorbs create calls that cross the next one-second
 tick. It does not authorize more requests in that tick.
 
 The post-create executor is also elastic:
