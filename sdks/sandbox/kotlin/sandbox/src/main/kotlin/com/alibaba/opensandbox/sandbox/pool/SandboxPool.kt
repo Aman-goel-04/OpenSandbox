@@ -2179,7 +2179,7 @@ class SandboxPool internal constructor(
 
     companion object {
         private const val RECONCILE_INTERVAL_MS = 1_000L
-        private const val CREATE_EXECUTOR_HEADROOM = 1.5
+        private const val CREATE_EXECUTOR_HEADROOM = 1.2
         private const val EXECUTOR_KEEP_ALIVE_SECONDS = 30L
         private const val CANCELLATION_CLEANUP_CONCURRENCY = 4
         private const val CANCELLATION_CLEANUP_QUEUE_CAPACITY = 256
