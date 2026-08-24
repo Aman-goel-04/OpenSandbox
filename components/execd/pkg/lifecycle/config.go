@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	ConfigEnv     = "OPEN_SANDBOX_LIFECYCLE"
+	ConfigEnv     = "OPENSANDBOX_LIFECYCLE"
 	ConfigPathEnv = "EXECD_LIFECYCLE_CONFIG"
 
 	defaultTimeout = 60 * time.Second

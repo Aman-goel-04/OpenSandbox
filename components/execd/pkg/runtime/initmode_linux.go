@@ -339,7 +339,7 @@ func bootstrapEnv() launchOption {
 	return func(mp *managedProcess) {
 		mp.stripEnv = []string{
 			"EXECD_ACCESS_TOKEN",
-			"OPEN_SANDBOX_LIFECYCLE",
+			"OPENSANDBOX_LIFECYCLE",
 			"EXECD_LIFECYCLE_CONFIG",
 		}
 	}

@@ -191,7 +191,7 @@ is_truthy() {
 has_lifecycle_config() {
 	# Keep this in sync with pkg/lifecycle/config.go's transport env, explicit
 	# path env, and default persisted path.
-	if [ -n "$(printf '%s' "${OPEN_SANDBOX_LIFECYCLE:-}" | tr -d '[:space:]')" ]; then
+	if [ -n "$(printf '%s' "${OPENSANDBOX_LIFECYCLE:-}" | tr -d '[:space:]')" ]; then
 		return 0
 	fi
 	if [ -n "${EXECD_LIFECYCLE_CONFIG:-}" ]; then
@@ -665,7 +665,7 @@ if [ -n "$LIFECYCLE_STATUS_FILE" ]; then
 	unset _prestart_status _execd_status
 fi
 
-unset OPEN_SANDBOX_LIFECYCLE EXECD_LIFECYCLE_CONFIG
+unset OPENSANDBOX_LIFECYCLE EXECD_LIFECYCLE_CONFIG
 "$@" &
 CMD_PID=$!
 

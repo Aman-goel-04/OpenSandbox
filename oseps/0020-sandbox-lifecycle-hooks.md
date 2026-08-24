@@ -201,7 +201,7 @@ config rides the existing per-provider state:
 |---|---|---|
 | Docker | file-backed store (same mechanism as `services/docker/metadata.py`) | labels on running containers are **immutable** |
 | K8s | `sandbox.opensandbox.io/lifecycle` annotation on BatchSandbox **or AgentSandbox** — whichever workload CR the configured provider manages (`provider_factory.py` registers both) | schemaless, no CRD change; controller ignores the key (server-only contract; add to `kubernetes/AGENTS.md` annotation list) |
-| Both | env `OPEN_SANDBOX_LIFECYCLE` (JSON content) at create | **transport only** — execd validates it and atomically persists the effective config; failure to persist aborts lifecycle startup, while provider-held config remains the recovery source |
+| Both | env `OPENSANDBOX_LIFECYCLE` (JSON content) at create | **transport only** — execd validates it and atomically persists the effective config; failure to persist aborts lifecycle startup, while provider-held config remains the recovery source |
 
 **Pod-creation source stays current.** On PATCH, the server also updates the
 pod-creation source — BatchSandbox `spec.template` / `taskTemplate` env, or
