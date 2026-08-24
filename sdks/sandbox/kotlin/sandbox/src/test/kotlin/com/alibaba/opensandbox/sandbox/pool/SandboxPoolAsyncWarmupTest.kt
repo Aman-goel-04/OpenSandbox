@@ -42,7 +42,7 @@ import java.util.concurrent.atomic.AtomicReference
 
 class SandboxPoolAsyncWarmupTest {
     @Test
-    fun `create executor keeps twenty percent headroom over create qps`() {
+    fun `create executor keeps fifty percent headroom over create qps`() {
         val sandbox = sandbox("create-executor-headroom")
 
         val pool =
@@ -50,7 +50,7 @@ class SandboxPoolAsyncWarmupTest {
                 .warmupCreateQps(100)
                 .build()
 
-        assertEquals(120, pool.createExecutorMaxSizeForTests())
+        assertEquals(150, pool.createExecutorMaxSizeForTests())
     }
 
     @Test
