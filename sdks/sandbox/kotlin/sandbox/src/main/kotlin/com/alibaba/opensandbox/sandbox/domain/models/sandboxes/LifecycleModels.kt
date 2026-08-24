@@ -33,7 +33,9 @@ class LifecycleHook private constructor(
         private var timeoutSeconds: Int? = null
 
         fun command(command: List<String>): Builder {
-            require(command.isNotEmpty()) { "Lifecycle hook command must not be empty" }
+            require(command.isNotEmpty() && command.first().isNotBlank()) {
+                "Lifecycle hook command must not be empty"
+            }
             this.command = command.toList()
             return this
         }
@@ -74,19 +76,21 @@ class PeriodicLifecycleHook private constructor(
         private var timeoutSeconds: Int? = null
 
         fun name(name: String): Builder {
-            require(name.isNotEmpty()) { "Periodic lifecycle hook name must not be empty" }
-            this.name = name
+            require(name.isNotBlank()) { "Periodic lifecycle hook name must not be empty" }
+            this.name = name.trim()
             return this
         }
 
         fun schedule(schedule: String): Builder {
-            require(schedule.isNotEmpty()) { "Periodic lifecycle hook schedule must not be empty" }
-            this.schedule = schedule
+            require(schedule.isNotBlank()) { "Periodic lifecycle hook schedule must not be empty" }
+            this.schedule = schedule.trim()
             return this
         }
 
         fun command(command: List<String>): Builder {
-            require(command.isNotEmpty()) { "Periodic lifecycle hook command must not be empty" }
+            require(command.isNotEmpty() && command.first().isNotBlank()) {
+                "Periodic lifecycle hook command must not be empty"
+            }
             this.command = command.toList()
             return this
         }

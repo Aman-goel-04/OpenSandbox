@@ -1082,7 +1082,11 @@ export interface components {
         PeriodicLifecycleHook: {
             /** @description Name unique among periodic hooks in this sandbox. */
             name: string;
-            /** @description Five-field cron expression or descriptor such as `@hourly` or `@every 30s`. */
+            /**
+             * @description Five-field cron expression or descriptor such as `@hourly` or
+             *     `@every 30s`. An `@every` interval must be a whole number of
+             *     seconds with a minimum of one second.
+             */
             schedule: string;
             /** @description Command and arguments to execute without implicit shell expansion. */
             command: string[];

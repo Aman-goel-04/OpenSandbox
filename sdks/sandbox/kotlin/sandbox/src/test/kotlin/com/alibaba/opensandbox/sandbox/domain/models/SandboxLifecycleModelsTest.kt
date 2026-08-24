@@ -49,6 +49,29 @@ class SandboxLifecycleModelsTest {
     }
 
     @Test
+    fun `stable lifecycle builders reject blank commands and normalize periodic text`() {
+        assertThrows(IllegalArgumentException::class.java) {
+            DomainLifecycleHook.builder().command(" ")
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            DomainPeriodicLifecycleHook.builder().name(" ")
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            DomainPeriodicLifecycleHook.builder().command(" ")
+        }
+
+        val periodic =
+            DomainPeriodicLifecycleHook.builder()
+                .name(" sync ")
+                .schedule(" @hourly ")
+                .command("true")
+                .build()
+
+        assertEquals("sync", periodic.name)
+        assertEquals("@hourly", periodic.schedule)
+    }
+
+    @Test
     fun `stable lifecycle builders snapshot mutable command and periodic lists`() {
         val command = mutableListOf("true")
         val periodic =

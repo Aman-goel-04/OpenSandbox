@@ -82,6 +82,24 @@ def test_lifecycle_hooks_reject_timeout_above_maximum(hook_type: type) -> None:
         hook_type.model_validate(kwargs)
 
 
+def test_lifecycle_hooks_reject_blank_commands_and_normalize_periodic_text() -> None:
+    with pytest.raises(ValueError, match="command must not be empty"):
+        DomainLifecycleHook(command=[" "])
+
+    periodic = DomainPeriodicLifecycleHook(
+        name=" sync ",
+        schedule=" @hourly ",
+        command=["true"],
+    )
+    assert periodic.name == "sync"
+    assert periodic.schedule == "@hourly"
+
+    with pytest.raises(ValueError, match="fields must not be blank"):
+        DomainPeriodicLifecycleHook(name=" ", schedule="@hourly", command=["true"])
+    with pytest.raises(ValueError, match="command must not be empty"):
+        DomainPeriodicLifecycleHook(name="sync", schedule="@hourly", command=[" "])
+
+
 def test_sandbox_image_spec_supports_positional_image() -> None:
     spec = SandboxImageSpec("python:3.11")
     assert spec.image == "python:3.11"

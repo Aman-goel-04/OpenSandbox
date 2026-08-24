@@ -173,6 +173,13 @@ class LifecycleHook(BaseModel):
         description="Maximum execution time in seconds, up to 300. The server defaults to 60.",
     )
 
+    @field_validator("command")
+    @classmethod
+    def command_must_not_be_blank(cls, value: list[str]) -> list[str]:
+        if not value[0].strip():
+            raise ValueError("Lifecycle hook command must not be empty")
+        return value
+
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
 
@@ -189,6 +196,20 @@ class PeriodicLifecycleHook(BaseModel):
         le=_MAX_LIFECYCLE_HOOK_TIMEOUT_SECONDS,
         description="Maximum execution time in seconds, up to 300. The server defaults to 60.",
     )
+
+    @field_validator("name", "schedule")
+    @classmethod
+    def text_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Periodic lifecycle hook fields must not be blank")
+        return value.strip()
+
+    @field_validator("command")
+    @classmethod
+    def command_must_not_be_blank(cls, value: list[str]) -> list[str]:
+        if not value[0].strip():
+            raise ValueError("Periodic lifecycle hook command must not be empty")
+        return value
 
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
 

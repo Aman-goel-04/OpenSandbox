@@ -48,11 +48,12 @@ test("createSandbox forwards lifecycle hooks in the standard request body", asyn
 });
 
 test("createSandbox omits lifecycle when it is not configured", async () => {
-  const { adapter, requests } = createAdapter();
+  const { adapter, rawRequests, requests } = createAdapter();
 
   await adapter.createSandbox({ lifecycle: undefined });
 
   assert.equal(Object.hasOwn(requests[0], "lifecycle"), false);
+  assert.equal(Object.hasOwn(rawRequests[0], "lifecycle"), false);
 });
 
 test("createSandbox normalizes an empty lifecycle to absent", async () => {
@@ -77,13 +78,16 @@ test("createSandbox normalizes an empty lifecycle to absent", async () => {
 
 test("createSandbox omits empty periodic when preStart is configured", async () => {
   const { adapter, rawRequests, requests } = createAdapter();
+  const lifecycle = { preStart: { command: ["true"] }, periodic: [] };
+  const request = { lifecycle };
+  const lifecycleSnapshot = structuredClone(lifecycle);
 
-  await adapter.createSandbox({
-    lifecycle: { preStart: { command: ["true"] }, periodic: [] },
-  });
+  await adapter.createSandbox(request);
 
   assert.deepEqual(requests[0].lifecycle, { preStart: { command: ["true"] } });
   assert.equal(Object.hasOwn(rawRequests[0].lifecycle, "periodic"), false);
+  assert.equal(Object.hasOwn(request, "lifecycle"), true);
+  assert.deepEqual(lifecycle, lifecycleSnapshot);
 });
 
 test("createSandbox preserves invalid periodic values for server validation", async () => {

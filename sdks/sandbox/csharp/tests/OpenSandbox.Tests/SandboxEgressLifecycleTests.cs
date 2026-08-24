@@ -187,7 +187,8 @@ public class SandboxEgressLifecycleTests
         sandboxes.LastCreateRequest.Should().NotBeNull();
         var forwarded = sandboxes.LastCreateRequest!.Lifecycle;
         forwarded.Should().NotBeNull();
-        forwarded!.PreStart!.Command.Should().Equal("/opt/hooks/restore.sh");
+        forwarded!.PreStart.Should().NotBeNull();
+        forwarded.PreStart!.Command.Should().Equal("/opt/hooks/restore.sh");
         forwarded.PreStart.TimeoutSeconds.Should().Be(300);
         forwarded.Periodic.Should().ContainSingle();
         forwarded.Periodic![0].Name.Should().Be("checkpoint");
