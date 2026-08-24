@@ -142,7 +142,9 @@ export class SandboxesAdapter implements Sandboxes {
     const lifecycle = normalizedRequest.lifecycle;
     if (lifecycle) {
       const normalizedLifecycle = { ...lifecycle };
-      if (!normalizedLifecycle.periodic?.length) delete normalizedLifecycle.periodic;
+      if (Array.isArray(normalizedLifecycle.periodic) && normalizedLifecycle.periodic.length === 0) {
+        delete normalizedLifecycle.periodic;
+      }
       for (const [key, value] of Object.entries(normalizedLifecycle)) {
         if (value === null || value === undefined) delete normalizedLifecycle[key];
       }

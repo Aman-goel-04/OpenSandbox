@@ -39,10 +39,12 @@ test("createSandbox forwards lifecycle hooks in the standard request body", asyn
       },
     ],
   };
+  const expectedLifecycle = structuredClone(lifecycle);
 
   await adapter.createSandbox({ lifecycle });
 
-  assert.deepEqual(requests[0].lifecycle, lifecycle);
+  assert.deepEqual(requests[0].lifecycle, expectedLifecycle);
+  assert.deepEqual(lifecycle, expectedLifecycle);
 });
 
 test("createSandbox omits lifecycle when it is not configured", async () => {
@@ -84,11 +86,21 @@ test("createSandbox omits empty periodic when preStart is configured", async () 
   assert.equal(Object.hasOwn(rawRequests[0].lifecycle, "periodic"), false);
 });
 
+test("createSandbox preserves invalid periodic values for server validation", async () => {
+  const { adapter, requests } = createAdapter();
+
+  await adapter.createSandbox({ lifecycle: { periodic: { schedule: "@hourly" } } });
+
+  assert.deepEqual(requests[0].lifecycle, { periodic: { schedule: "@hourly" } });
+});
+
 test("createSandbox preserves future lifecycle hooks", async () => {
   const { adapter, requests } = createAdapter();
   const lifecycle = { preTerminate: { command: ["/opt/hooks/flush.sh"] } };
+  const expectedLifecycle = structuredClone(lifecycle);
 
   await adapter.createSandbox({ lifecycle });
 
-  assert.deepEqual(requests[0].lifecycle, lifecycle);
+  assert.deepEqual(requests[0].lifecycle, expectedLifecycle);
+  assert.deepEqual(lifecycle, expectedLifecycle);
 });
