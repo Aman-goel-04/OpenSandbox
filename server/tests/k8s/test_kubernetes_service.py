@@ -868,6 +868,11 @@ class TestKubernetesSandboxServiceCreate:
 
 class TestWaitForSandboxReady:
     """_wait_for_sandbox_ready method tests"""
+
+    def test_pool_capacity_retry_after_matches_acquisition_window(self, k8s_service):
+        error = k8s_service._pool_capacity_exhausted_error(30)
+
+        assert error.headers == {"Retry-After": "30"}
     
     @pytest.mark.asyncio
     async def test_wait_for_running_pod_succeeds(self, k8s_service, mock_workload):
@@ -955,7 +960,7 @@ class TestWaitForSandboxReady:
             exc_info.value.detail["code"]
             == SandboxErrorCodes.K8S_POOL_CAPACITY_EXHAUSTED
         )
-        assert exc_info.value.headers == {"Retry-After": "5"}
+        assert exc_info.value.headers == {"Retry-After": "1"}
 
     @pytest.mark.asyncio
     async def test_wait_succeeds_when_pool_capacity_is_released(

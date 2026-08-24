@@ -21,6 +21,7 @@ using Kubernetes resources for sandbox lifecycle management.
 
 import asyncio
 import logging
+import math
 import time
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
@@ -102,8 +103,6 @@ from opensandbox_server.tenants.context import get_current_tenant
 from opensandbox_server.tenants.provider import TenantProvider
 
 logger = logging.getLogger(__name__)
-
-POOL_CAPACITY_RETRY_AFTER_SECONDS = 5
 
 
 def _is_namespace_not_found(exc: Exception) -> bool:
@@ -305,7 +304,9 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                     if pool_capacity_started_at is None:
                         pool_capacity_started_at = now
                     if now - pool_capacity_started_at >= pool_acquisition_timeout_seconds:
-                        raise self._pool_capacity_exhausted_error()
+                        raise self._pool_capacity_exhausted_error(
+                            pool_acquisition_timeout_seconds
+                        )
                 else:
                     pool_capacity_started_at = None
                 if _is_unschedulable_status(status_info):
@@ -332,7 +333,9 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
 
         elapsed = time.time() - start_time
         if last_reason == "POOL_CAPACITY_EXHAUSTED":
-            raise self._pool_capacity_exhausted_error()
+            raise self._pool_capacity_exhausted_error(
+                pool_acquisition_timeout_seconds
+            )
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail={
@@ -345,14 +348,17 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         )
 
     @staticmethod
-    def _pool_capacity_exhausted_error() -> HTTPException:
+    def _pool_capacity_exhausted_error(
+        pool_acquisition_timeout_seconds: float,
+    ) -> HTTPException:
+        retry_after_seconds = max(1, math.ceil(pool_acquisition_timeout_seconds))
         return HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail={
                 "code": SandboxErrorCodes.K8S_POOL_CAPACITY_EXHAUSTED,
                 "message": "No Pool capacity became available before the acquisition timeout.",
             },
-            headers={"Retry-After": str(POOL_CAPACITY_RETRY_AFTER_SECONDS)},
+            headers={"Retry-After": str(retry_after_seconds)},
         )
 
     def _ensure_network_policy_support(self, request: CreateSandboxRequest) -> None:
