@@ -15,7 +15,6 @@
 import pytest
 from pydantic import ValidationError
 
-from opensandbox_server.constants import OPENSANDBOX_LIFECYCLE
 from opensandbox_server.api.schema import (
     CreateSandboxRequest,
     CreateSnapshotRequest,
@@ -27,6 +26,7 @@ from opensandbox_server.api.schema import (
     OSSFS,
     PaginationInfo,
     PaginationRequest,
+    PeriodicLifecycleHook,
     PlatformSpec,
     PVC,
     ResourceLimits,
@@ -36,6 +36,7 @@ from opensandbox_server.api.schema import (
     SnapshotStatus,
     Volume,
 )
+from opensandbox_server.constants import OPENSANDBOX_LIFECYCLE
 
 
 class TestSandboxLifecycle:
@@ -86,6 +87,41 @@ class TestSandboxLifecycle:
                     preStart=LifecycleHook(command=["true"]),
                 ),
             )
+
+    @pytest.mark.parametrize(
+        "hook",
+        [
+            LifecycleHook(command=["true"], timeoutSeconds=300),
+            PeriodicLifecycleHook(
+                name="sync",
+                schedule="@hourly",
+                command=["true"],
+                timeoutSeconds=300,
+            ),
+        ],
+    )
+    def test_lifecycle_accepts_maximum_timeout(self, hook):
+        assert hook.timeout_seconds == 300
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"preStart": {"command": ["true"], "timeoutSeconds": 301}},
+            {
+                "periodic": [
+                    {
+                        "name": "sync",
+                        "schedule": "@hourly",
+                        "command": ["true"],
+                        "timeoutSeconds": 301,
+                    }
+                ]
+            },
+        ],
+    )
+    def test_lifecycle_rejects_timeout_above_maximum(self, payload):
+        with pytest.raises(ValidationError, match="less than or equal to 300"):
+            SandboxLifecycle.model_validate(payload)
 
     @pytest.mark.parametrize("duplicate_name", ["sync", " sync "])
     def test_lifecycle_rejects_duplicate_periodic_names(self, duplicate_name):
