@@ -138,8 +138,9 @@ Root span attributes (these are your drill-down dimensions):
 Readiness summary spans additionally expose
 `warmup.health.attempt_count`, `warmup.health.false_count`,
 `warmup.health.exception_count`, and `warmup.scheduler.delay_ms`. Failures are
-recorded with `recordException` and OpenTelemetry error status on the affected
-phase and root spans.
+recorded with `recordException` on the affected phase span. The root span keeps
+the classified terminal stage, result, reason, and OpenTelemetry error status
+without duplicating the phase exception event.
 
 ::: warning Development snapshot attribute migration
 Earlier development snapshots used the unnamespaced `result` and
