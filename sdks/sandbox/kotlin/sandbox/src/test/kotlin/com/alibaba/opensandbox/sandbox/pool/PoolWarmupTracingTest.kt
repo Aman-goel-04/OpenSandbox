@@ -384,14 +384,19 @@ class PoolWarmupTracingTest {
         try {
             awaitCondition {
                 spanExporter.finishedSpanItems.any {
-                    it.name == PoolTracer.WARMUP_READINESS_CHECK_SPAN &&
-                        it.attributes[AttributeKey.stringKey(PoolTracer.ATTR_RESULT)] == "failure"
+                    it.name == PoolTracer.WARMUP_ROOT_SPAN &&
+                        it.attributes[AttributeKey.stringKey(PoolTracer.ATTR_REASON)] == "readiness_timeout"
                 }
             }
+            val root =
+                spanExporter.finishedSpanItems.first {
+                    it.name == PoolTracer.WARMUP_ROOT_SPAN &&
+                        it.attributes[AttributeKey.stringKey(PoolTracer.ATTR_REASON)] == "readiness_timeout"
+                }
             val readiness =
                 spanExporter.finishedSpanItems.first {
                     it.name == PoolTracer.WARMUP_READINESS_CHECK_SPAN &&
-                        it.attributes[AttributeKey.stringKey(PoolTracer.ATTR_RESULT)] == "failure"
+                        it.traceId == root.traceId
                 }
             assertTrue(readiness.attributes[AttributeKey.longKey(PoolTracer.ATTR_HEALTH_FALSE_COUNT)]!! >= 1L)
             assertEquals(1L, readiness.attributes[AttributeKey.longKey(PoolTracer.ATTR_HEALTH_EXCEPTION_COUNT)])
@@ -399,11 +404,6 @@ class PoolWarmupTracingTest {
                 "callback",
                 readiness.attributes[AttributeKey.stringKey(PoolTracer.ATTR_ERROR_CATEGORY)],
             )
-            val root =
-                spanExporter.finishedSpanItems.first {
-                    it.name == PoolTracer.WARMUP_ROOT_SPAN &&
-                        it.attributes[AttributeKey.stringKey(PoolTracer.ATTR_REASON)] == "readiness_timeout"
-                }
             assertEquals(
                 "timeout",
                 root.attributes[AttributeKey.stringKey(PoolTracer.ATTR_ERROR_CATEGORY)],
