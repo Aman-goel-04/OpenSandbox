@@ -511,7 +511,8 @@ setting and uses the application's global OpenTelemetry instance:
 - create, prepare, renew, and commit are child spans;
 - readiness and post-prepare readiness each emit one backdated summary span for
   the complete polling stage, not one span per health attempt;
-- health summary spans record attempt count and accumulated scheduler delay;
+- health summary spans record attempt count, false-result count, exception
+  count, error category, and accumulated scheduler delay;
 - synchronous stage exceptions are recorded on the failed child span. The root
   records the classified terminal stage, result, and reason without duplicating
   exception events;
@@ -524,19 +525,36 @@ reasons distinguish local create rejection, stage failures and health timeouts,
 primary-lock loss, stale/retired runs, shutdown, interruption, and unexpected
 failures.
 
-Every warmup task emits exactly one terminal structured log after winning its
-terminal CAS. Success and expected cancellation use DEBUG; failure and dropped
-outcomes use WARN. Logs include pool, sandbox when known, run generation,
-terminal stage/result/reason, duration, and error details. Trace and span IDs are
-available through MDC while tracing is enabled.
+Every warmup task has exactly one terminal outcome after winning its terminal
+CAS. Success and expected cancellation use DEBUG. Failure and dropped outcomes
+use WARN, rate-limited once per reason per Pool per 30 seconds; exact unsampled
+result and reason counts remain in the periodic summary. Logs include pool,
+sandbox when known, run generation, terminal stage/result/reason, duration, and
+error category/details. Trace and span IDs are available through MDC while
+tracing is enabled. Failures in the application's OpenTelemetry provider or
+logging backend never prevent warmup cleanup or inflight release.
+
+Error categories are transport-oriented and non-overlapping: `rate_limit`,
+`http_4xx`, `http_5xx`, `http_other`, `timeout`, `connection`, `callback`, and
+`state_store`. When the SDK cannot establish one of those causes it reports
+`unclassified` rather than guessing from an exception message.
 
 The current primary also emits a pool-level summary every 30 seconds when the
-pool is active or the interval contains events. This reuses the fixed reconcile
+pool has in-flight warmup work or the interval contains events. An inactive Pool
+does not emit idle heartbeat logs or query the state store solely for a summary.
+This reuses the fixed reconcile
 thread—no scheduler or worker is added. O(1) atomic counters track inflight tasks
 by stage, admissions and terminal-result deltas, create/dispatch rejection,
 executor utilization, queue size, and average health scheduler delay; the
-summary never scans the `DelayQueue`. Per-sandbox IDs remain confined to traces
-and terminal logs.
+summary never scans the `DelayQueue`. Stage and executor-active fields are
+explicitly marked approximate, and the record declares eventual snapshot
+consistency rather than implying a linearizable point-in-time view. Per-sandbox
+IDs remain confined to traces and terminal logs.
+
+The SDK uses the application's global OpenTelemetry sampler and exporter. It
+does not force 100% sampling. Production deployments should choose a bounded
+sampling policy appropriate for their warmup QPS; tracing-disabled and sampled
+resource overhead are validated separately from functional E2E coverage.
 
 ## Test Plan
 

@@ -300,7 +300,9 @@ Pool lifecycle semantics:
   `pool.warmup` trace. Each health stage is summarized by one span with its
   attempt count and scheduler delay. Terminal structured logs classify
   `stage`, `result`, and `reason`; the current primary also emits an active-pool
-  summary every 30 seconds from the existing reconcile thread.
+  summary every 30 seconds from the existing reconcile thread. Production
+  deployments should configure OpenTelemetry sampling explicitly; tracing is
+  opt-in but the SDK does not override the application's sampler.
 - Graceful shutdown stops admitting new warmups, keeps the primary heartbeat and
   delayed-stage dispatcher alive while already-admitted warmups finish, and preserves
   the existing behavior of allowing those warmups to enter idle before shutdown completes.
