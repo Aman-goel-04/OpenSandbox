@@ -66,7 +66,7 @@ func TestDurableFileConsumeAndFinalize(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	sink, err := New(Config{Root: root, ClusterID: "prod-a", MaxFileBytes: 1 << 20, MaxFiles: 4, MaxTotalBytes: 1 << 24}, db)
+	sink, err := newFileSink(fileConfig{Root: root, ClusterID: "prod-a", MaxFileBytes: 1 << 20, MaxFiles: 4, MaxTotalBytes: 1 << 24}, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ func TestDurableFileFinalizeHonorsCanceledContext(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	sink, err := New(Config{Root: root, ClusterID: "prod-a", MaxFileBytes: 1 << 20, MaxFiles: 4, MaxTotalBytes: 1 << 24}, db)
+	sink, err := newFileSink(fileConfig{Root: root, ClusterID: "prod-a", MaxFileBytes: 1 << 20, MaxFiles: 4, MaxTotalBytes: 1 << 24}, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +166,7 @@ func TestDurableFilePermanentCapacityErrorsAreNonRetryable(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer db.Close()
-			sink, err := New(Config{Root: t.TempDir(), ClusterID: "cluster", MaxFileBytes: test.maxFileBytes, MaxFiles: 2, MaxTotalBytes: test.maxTotalBytes}, db)
+			sink, err := newFileSink(fileConfig{Root: t.TempDir(), ClusterID: "cluster", MaxFileBytes: test.maxFileBytes, MaxFiles: 2, MaxTotalBytes: test.maxTotalBytes}, db)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -193,7 +193,7 @@ func TestDurableFileCapacityExhaustionIsRetryable(t *testing.T) {
 	resource := api.Resource{SandboxID: "sb", ClusterName: "cluster", Namespace: "ns", PodUID: "uid", Container: "sandbox"}
 	batch := api.Batch{StreamRef: api.StreamRef{ID: "stream"}, Items: []api.BatchItem{{RecordID: "record", Record: api.Record{Kind: api.RecordKindContainerLog, Timestamp: time.Now().UTC(), Body: []byte("data"), Resource: resource, Attributes: map[string]string{"stream": "stdout"}}}}}
 	encoded := lineBytes(batch)
-	sink, err := New(Config{Root: root, ClusterID: "cluster", MaxFileBytes: 1 << 20, MaxFiles: 2, MaxTotalBytes: 1024 + int64(len(encoded)) - 1}, db)
+	sink, err := newFileSink(fileConfig{Root: root, ClusterID: "cluster", MaxFileBytes: 1 << 20, MaxFiles: 2, MaxTotalBytes: 1024 + int64(len(encoded)) - 1}, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +214,7 @@ func TestDurableFileGenerationLimitPrecedesRetryableCapacityError(t *testing.T) 
 	}
 	defer db.Close()
 	resource := api.Resource{SandboxID: "sb", ClusterName: "cluster", Namespace: "ns", PodUID: "uid", Container: "sandbox"}
-	sink, err := New(Config{Root: root, ClusterID: "cluster", MaxFileBytes: 1 << 20, MaxFiles: 1, MaxTotalBytes: 1024}, db)
+	sink, err := newFileSink(fileConfig{Root: root, ClusterID: "cluster", MaxFileBytes: 1 << 20, MaxFiles: 1, MaxTotalBytes: 1024}, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +232,7 @@ func TestDurableFileRejectsInconsistentBatchResources(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	sink, err := New(Config{Root: t.TempDir(), ClusterID: "cluster", MaxFileBytes: 1 << 20, MaxFiles: 2, MaxTotalBytes: 1 << 20}, db)
+	sink, err := newFileSink(fileConfig{Root: t.TempDir(), ClusterID: "cluster", MaxFileBytes: 1 << 20, MaxFiles: 2, MaxTotalBytes: 1 << 20}, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +255,7 @@ func TestDurableFileRejectsPersistedObjectKeyOutsideStreamLayout(t *testing.T) {
 	}
 	defer db.Close()
 	root := t.TempDir()
-	sink, err := New(Config{Root: root, ClusterID: "cluster", MaxFileBytes: 1 << 20, MaxFiles: 2, MaxTotalBytes: 1 << 20}, db)
+	sink, err := newFileSink(fileConfig{Root: root, ClusterID: "cluster", MaxFileBytes: 1 << 20, MaxFiles: 2, MaxTotalBytes: 1 << 20}, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +278,7 @@ func TestDurableFileRejectsClosedObjectCountMismatchBeforeAppend(t *testing.T) {
 	}
 	defer db.Close()
 	root := t.TempDir()
-	sink, err := New(Config{Root: root, ClusterID: "cluster", MaxFileBytes: 1 << 20, MaxFiles: 2, MaxTotalBytes: 1 << 20}, db)
+	sink, err := newFileSink(fileConfig{Root: root, ClusterID: "cluster", MaxFileBytes: 1 << 20, MaxFiles: 2, MaxTotalBytes: 1 << 20}, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,7 +304,7 @@ func TestDurableFileRejectsResourceChangeAcrossBatches(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	sink, err := New(Config{Root: t.TempDir(), ClusterID: "cluster", MaxFileBytes: 1 << 20, MaxFiles: 2, MaxTotalBytes: 1 << 20}, db)
+	sink, err := newFileSink(fileConfig{Root: t.TempDir(), ClusterID: "cluster", MaxFileBytes: 1 << 20, MaxFiles: 2, MaxTotalBytes: 1 << 20}, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,7 +327,7 @@ func TestDurableFileRejectsResourceChangeAtFinalize(t *testing.T) {
 	}
 	defer db.Close()
 	root := t.TempDir()
-	sink, err := New(Config{Root: root, ClusterID: "cluster", MaxFileBytes: 1 << 20, MaxFiles: 2, MaxTotalBytes: 1 << 20}, db)
+	sink, err := newFileSink(fileConfig{Root: root, ClusterID: "cluster", MaxFileBytes: 1 << 20, MaxFiles: 2, MaxTotalBytes: 1 << 20}, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,8 +355,8 @@ func TestDurableFileRecoversPartialAppendIntent(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	cfg := Config{Root: root, ClusterID: "prod-a", MaxFileBytes: 1 << 20, MaxFiles: 4, MaxTotalBytes: 1 << 24}
-	sink, err := New(cfg, db)
+	cfg := fileConfig{Root: root, ClusterID: "prod-a", MaxFileBytes: 1 << 20, MaxFiles: 4, MaxTotalBytes: 1 << 24}
+	sink, err := newFileSink(cfg, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -402,7 +402,7 @@ func TestDurableFileRecoversPartialAppendIntent(t *testing.T) {
 	// The committed bytes plus this replay exactly fit the total capacity.
 	// Recovery must truncate the uncommitted tail before reserving the replay.
 	cfg.MaxTotalBytes = stream.Position + int64(len(encoded))
-	recovered, err := New(cfg, db)
+	recovered, err := newFileSink(cfg, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -426,11 +426,11 @@ func TestDurableFileFinalizeClosesRestoredGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	cfg := Config{Root: root, ClusterID: "prod-a", MaxFileBytes: 1 << 20, MaxFiles: 4, MaxTotalBytes: 1 << 24}
+	cfg := fileConfig{Root: root, ClusterID: "prod-a", MaxFileBytes: 1 << 20, MaxFiles: 4, MaxTotalBytes: 1 << 24}
 	resource := api.Resource{SandboxID: "sb", ClusterName: "prod-a", Namespace: "ns", PodName: "pod", PodUID: "uid", NodeName: "node", Container: "sandbox"}
 	streamRef := api.StreamRef{ID: "container-logs/uid/sandbox"}
 	batch := api.Batch{StreamRef: streamRef, Items: []api.BatchItem{{RecordID: "r1", Record: api.Record{Kind: api.RecordKindContainerLog, Timestamp: time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC), Body: []byte("before restart"), Resource: resource, Attributes: map[string]string{"stream": "stdout"}}}}}
-	first, err := New(cfg, db)
+	first, err := newFileSink(cfg, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -441,7 +441,7 @@ func TestDurableFileFinalizeClosesRestoredGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	recovered, err := New(cfg, db)
+	recovered, err := newFileSink(cfg, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -479,7 +479,7 @@ func TestDurableFileRetryAfterFinalCheckpointFailureDoesNotDuplicate(t *testing.
 	}
 	defer db.Close()
 	store := &failFinalCheckpointStore{DB: db, fail: true}
-	sink, err := New(Config{Root: root, ClusterID: "prod-a", MaxFileBytes: 1 << 20, MaxFiles: 4, MaxTotalBytes: 1 << 24}, store)
+	sink, err := newFileSink(fileConfig{Root: root, ClusterID: "prod-a", MaxFileBytes: 1 << 20, MaxFiles: 4, MaxTotalBytes: 1 << 24}, store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -523,8 +523,8 @@ func TestDurableFileFinalizeRecoversExistingTemporaryMarkerAtCapacity(t *testing
 				t.Fatal(err)
 			}
 			defer db.Close()
-			cfg := Config{Root: root, ClusterID: "prod-a", MaxFileBytes: 1 << 20, MaxFiles: 4, MaxTotalBytes: 1 << 24}
-			sink, err := New(cfg, db)
+			cfg := fileConfig{Root: root, ClusterID: "prod-a", MaxFileBytes: 1 << 20, MaxFiles: 4, MaxTotalBytes: 1 << 24}
+			sink, err := newFileSink(cfg, db)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -573,7 +573,7 @@ func TestDurableFileFinalizeRecoversExistingTemporaryMarkerAtCapacity(t *testing
 			}
 
 			cfg.MaxTotalBytes = int64(len(lineBytes(batch)) + len(raw))
-			recovered, err := New(cfg, db)
+			recovered, err := newFileSink(cfg, db)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -655,7 +655,7 @@ func TestDurableFileQuarantinesUnknownNonEmptyObject(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	sink, err := New(Config{Root: root, ClusterID: "prod-a", MaxFileBytes: 1 << 20, MaxFiles: 4, MaxTotalBytes: 1 << 24}, db)
+	sink, err := newFileSink(fileConfig{Root: root, ClusterID: "prod-a", MaxFileBytes: 1 << 20, MaxFiles: 4, MaxTotalBytes: 1 << 24}, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -680,7 +680,7 @@ func TestDurableFileCleanupStagesWholeFamily(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	sink, err := New(Config{Root: root, ClusterID: "prod-a", MaxFileBytes: 1 << 20, MaxFiles: 4, MaxTotalBytes: 1 << 24}, db)
+	sink, err := newFileSink(fileConfig{Root: root, ClusterID: "prod-a", MaxFileBytes: 1 << 20, MaxFiles: 4, MaxTotalBytes: 1 << 24}, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -761,7 +761,7 @@ func TestDurableFileCleanupCheckpointConflictsAreNonRetryable(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			sink := &Sink{cfg: Config{Root: root}, state: db, writers: make(map[string]*writer)}
+			sink := &fileSink{cfg: fileConfig{Root: root}, state: db, writers: make(map[string]*writer)}
 			err = sink.CollectExpired(context.Background(), time.Now())
 			if err == nil || api.IsRetryableError(err) {
 				t.Fatalf("CollectExpired() error=%v retryable=%v", err, api.IsRetryableError(err))
@@ -808,7 +808,7 @@ func TestDurableFileCleanupContinuesAfterPoisonedStream(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(cleanFamily, "sandbox.log"), []byte("data"), 0o640); err != nil {
 		t.Fatal(err)
 	}
-	sink := &Sink{cfg: Config{Root: root}, state: db, writers: make(map[string]*writer)}
+	sink := &fileSink{cfg: fileConfig{Root: root}, state: db, writers: make(map[string]*writer)}
 	err = sink.CollectExpired(context.Background(), time.Now())
 	if err == nil || api.IsRetryableError(err) || !strings.Contains(err.Error(), poisonedRef) {
 		t.Fatalf("CollectExpired() error=%v retryable=%v", err, api.IsRetryableError(err))
@@ -828,7 +828,7 @@ func TestDurableFileCleanupContinuesAfterPoisonedStream(t *testing.T) {
 }
 
 func TestStartNextGenerationRejectsOverflowedCheckpoint(t *testing.T) {
-	sink := &Sink{cfg: Config{MaxFiles: 2}}
+	sink := &fileSink{cfg: fileConfig{MaxFiles: 2}}
 	w := &writer{stream: state.SinkStream{Generation: ^uint64(0)}}
 	err := sink.startNextGeneration(w)
 	if err == nil || api.IsRetryableError(err) || !strings.Contains(err.Error(), "generation limit") {
@@ -853,7 +853,7 @@ func TestStartNextGenerationRetriesTransitionCheckpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	w := &writer{stream: state.SinkStream{StreamRef: "stream", ObjectKey: "cluster/ns/sb/uid/sandbox.log", CurrentClosed: true}, resource: resource}
-	sink := &Sink{cfg: Config{Root: root, MaxFiles: 2}, state: store}
+	sink := &fileSink{cfg: fileConfig{Root: root, MaxFiles: 2}, state: store}
 	if err := sink.startNextGeneration(w); err == nil || !strings.Contains(err.Error(), "injected generation transition failure") {
 		t.Fatalf("first startNextGeneration() error=%v", err)
 	}

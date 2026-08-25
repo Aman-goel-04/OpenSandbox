@@ -295,7 +295,7 @@ func TestOSSAppendUnknownResultAndFinalize(t *testing.T) {
 	backend := newFakeBackend()
 	backend.appendResult = "after"
 	sink := newWithBackend(testOSSConfig(db), db, backend)
-	if err := sink.Preflight(context.Background()); err != nil {
+	if err := sink.preflight(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	batch, resource := testOSSBatch()
@@ -631,7 +631,7 @@ func TestOSSPropagatesOperationContextToBackend(t *testing.T) {
 	backend := newFakeBackend()
 	sink := newWithBackend(testOSSConfig(db), db, backend)
 	ctx := context.WithValue(context.Background(), backendContextKey{}, "request")
-	if err := sink.Preflight(ctx); err != nil {
+	if err := sink.preflight(ctx); err != nil {
 		t.Fatal(err)
 	}
 	batch, resource := testOSSBatch()
@@ -1117,8 +1117,8 @@ func TestOSSRejectsUnsafeMetadataValue(t *testing.T) {
 	}
 }
 
-func testOSSConfig(db *state.DB) Config {
-	return Config{Prefix: "logs", ClusterID: "prod-a", WriterID: db.WriterID(), TargetID: db.TargetID(), MaxObjectBytes: 1 << 20, Timeout: time.Second}
+func testOSSConfig(db *state.DB) ossConfig {
+	return ossConfig{Prefix: "logs", ClusterID: "prod-a", WriterID: db.WriterID(), TargetID: db.TargetID(), MaxObjectBytes: 1 << 20, Timeout: time.Second}
 }
 
 func testOSSBatch() (api.Batch, api.Resource) {
@@ -1128,7 +1128,7 @@ func testOSSBatch() (api.Batch, api.Resource) {
 	return batch, resource
 }
 
-func testOSSMetadata(cfg Config, streamRef api.StreamRef, resource api.Resource, generation uint64) map[string]string {
+func testOSSMetadata(cfg ossConfig, streamRef api.StreamRef, resource api.Resource, generation uint64) map[string]string {
 	return map[string]string{
 		"nodeagent-writer-id":  cfg.WriterID,
 		"nodeagent-target-id":  cfg.TargetID,

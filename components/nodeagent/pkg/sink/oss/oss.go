@@ -58,7 +58,7 @@ func init() {
 		return identity.OSSTargetID(cfg.OSSEndpoint, cfg.OSSBucket, cfg.OSSKeyPrefix, cfg.ClusterID)
 	}, func(dependencies registry.Dependencies) (api.Sink, error) {
 		cfg := dependencies.Config
-		return New(Config{Endpoint: cfg.OSSEndpoint, Bucket: cfg.OSSBucket, Prefix: cfg.OSSKeyPrefix, ClusterID: cfg.ClusterID, AccessKeyID: cfg.OSSAccessKeyID, AccessKeySecret: cfg.OSSAccessKeySecret, SessionToken: cfg.OSSSessionToken, WriterID: dependencies.State.WriterID(), TargetID: dependencies.State.TargetID(), MaxObjectBytes: maxObjectBytes, Timeout: cfg.SinkTimeout}, dependencies.State)
+		return newOSSSink(ossConfig{Endpoint: cfg.OSSEndpoint, Bucket: cfg.OSSBucket, Prefix: cfg.OSSKeyPrefix, ClusterID: cfg.ClusterID, AccessKeyID: cfg.OSSAccessKeyID, AccessKeySecret: cfg.OSSAccessKeySecret, SessionToken: cfg.OSSSessionToken, WriterID: dependencies.State.WriterID(), TargetID: dependencies.State.TargetID(), MaxObjectBytes: maxObjectBytes, Timeout: cfg.SinkTimeout}, dependencies.State)
 	})
 }
 
@@ -67,7 +67,7 @@ type stateStore interface {
 	PutSinkStream(sinkName string, stream state.SinkStream) error
 }
 
-type Config struct {
+type ossConfig struct {
 	Endpoint        string
 	Bucket          string
 	Prefix          string
@@ -81,8 +81,8 @@ type Config struct {
 	Timeout         time.Duration
 }
 
-type Sink struct {
-	cfg     Config
+type ossSink struct {
+	cfg     ossConfig
 	backend backend
 	state   stateStore
 
@@ -115,7 +115,7 @@ type realBackend struct {
 	bucketName string
 }
 
-func New(cfg Config, store stateStore) (*Sink, error) {
+func newOSSSink(cfg ossConfig, store stateStore) (*ossSink, error) {
 	if cfg.MaxObjectBytes <= 0 {
 		return nil, errors.New("OSS object limit must be positive")
 	}
@@ -136,22 +136,22 @@ func New(cfg Config, store stateStore) (*Sink, error) {
 		return nil, err
 	}
 	sink := newWithBackend(cfg, store, &realBackend{client: client, bucket: bucket, bucketName: cfg.Bucket})
-	if err := sink.Preflight(context.Background()); err != nil {
+	if err := sink.preflight(context.Background()); err != nil {
 		return nil, err
 	}
 	return sink, nil
 }
 
-func newWithBackend(cfg Config, store stateStore, storage backend) *Sink {
-	return &Sink{cfg: cfg, backend: storage, state: store, streams: make(map[string]state.SinkStream), resources: make(map[string]api.Resource)}
+func newWithBackend(cfg ossConfig, store stateStore, storage backend) *ossSink {
+	return &ossSink{cfg: cfg, backend: storage, state: store, streams: make(map[string]state.SinkStream), resources: make(map[string]api.Resource)}
 }
 
-func (s *Sink) Capabilities() api.Capabilities {
+func (s *ossSink) Capabilities() api.Capabilities {
 	return api.Capabilities{RecordKinds: []api.RecordKind{api.RecordKindContainerLog}}
 }
-func (s *Sink) Guarantee() api.DeliveryGuarantee { return api.GuaranteeDurable }
+func (s *ossSink) Guarantee() api.DeliveryGuarantee { return api.GuaranteeDurable }
 
-func (s *Sink) Preflight(ctx context.Context) error {
+func (s *ossSink) preflight(ctx context.Context) error {
 	managed := strings.Trim(path.Join(s.cfg.Prefix, s.cfg.ClusterID), "/") + "/"
 	return classifyOSSError(s.backend.Preflight(ctx, managed))
 }
@@ -243,7 +243,7 @@ func (b *realBackend) Get(ctx context.Context, key string) ([]byte, error) {
 	return io.ReadAll(reader)
 }
 
-func (s *Sink) Consume(ctx context.Context, batch api.Batch) error {
+func (s *ossSink) Consume(ctx context.Context, batch api.Batch) error {
 	if len(batch.Items) == 0 {
 		return nil
 	}
@@ -336,7 +336,7 @@ func (s *Sink) Consume(ctx context.Context, batch api.Batch) error {
 	return nil
 }
 
-func (s *Sink) recoverAppendResult(ctx context.Context, streamRef string, resource api.Resource, stream state.SinkStream, next, expected int64, appendErr error) (int64, error) {
+func (s *ossSink) recoverAppendResult(ctx context.Context, streamRef string, resource api.Resource, stream state.SinkStream, next, expected int64, appendErr error) (int64, error) {
 	metadata, headErr := s.backend.Head(ctx, stream.ObjectKey)
 	headErr = classifyOSSError(headErr)
 	if headErr == nil {
@@ -377,7 +377,7 @@ func (s *Sink) recoverAppendResult(ctx context.Context, streamRef string, resour
 	return 0, fmt.Errorf("OSS append returned next position %d; HeadObject failed: %w", next, headErr)
 }
 
-func (s *Sink) Finalize(ctx context.Context, request api.FinalizeRequest) error {
+func (s *ossSink) Finalize(ctx context.Context, request api.FinalizeRequest) error {
 	streamLock := s.streamLock(request.StreamRef.ID)
 	streamLock.Lock()
 	defer streamLock.Unlock()
@@ -388,7 +388,7 @@ func (s *Sink) Finalize(ctx context.Context, request api.FinalizeRequest) error 
 	if err := validateOSSObjectKey(key); err != nil {
 		return err
 	}
-	if err := s.Preflight(ctx); err != nil {
+	if err := s.preflight(ctx); err != nil {
 		return err
 	}
 	stream, err := s.getStream(ctx, request.StreamRef, request.Resource)
@@ -435,9 +435,9 @@ func (s *Sink) Finalize(ctx context.Context, request api.FinalizeRequest) error 
 	return nil
 }
 
-func (s *Sink) Close(context.Context) error { return nil }
+func (s *ossSink) Close(context.Context) error { return nil }
 
-func (s *Sink) getStream(ctx context.Context, streamRef api.StreamRef, resource api.Resource) (state.SinkStream, error) {
+func (s *ossSink) getStream(ctx context.Context, streamRef api.StreamRef, resource api.Resource) (state.SinkStream, error) {
 	if current, cachedResource, ok := s.cachedStream(streamRef.ID); ok {
 		if !lineformat.SameResourceIdentity(cachedResource, resource) {
 			return state.SinkStream{}, api.Permanent(errors.New("OSS stream resource identity changed"))
@@ -498,7 +498,7 @@ func (s *Sink) getStream(ctx context.Context, streamRef api.StreamRef, resource 
 	return stream, nil
 }
 
-func (s *Sink) closeGeneration(ctx context.Context, resource api.Resource, stream *state.SinkStream) error {
+func (s *ossSink) closeGeneration(ctx context.Context, resource api.Resource, stream *state.SinkStream) error {
 	metadata, err := s.backend.Head(ctx, stream.ObjectKey)
 	if err != nil {
 		return existingObjectError("close generation", stream.ObjectKey, err)
@@ -526,7 +526,7 @@ func (s *Sink) closeGeneration(ctx context.Context, resource api.Resource, strea
 	return nil
 }
 
-func (s *Sink) verifyMetadata(ctx context.Context, stream state.SinkStream, streamRef api.StreamRef, resource api.Resource) error {
+func (s *ossSink) verifyMetadata(ctx context.Context, stream state.SinkStream, streamRef api.StreamRef, resource api.Resource) error {
 	metadata, err := s.backend.Head(ctx, stream.ObjectKey)
 	if err != nil {
 		if isNotFound(err) && stream.Position == 0 {
@@ -543,7 +543,7 @@ func (s *Sink) verifyMetadata(ctx context.Context, stream state.SinkStream, stre
 	return nil
 }
 
-func (s *Sink) objectSize(ctx context.Context, key string) (int64, error) {
+func (s *ossSink) objectSize(ctx context.Context, key string) (int64, error) {
 	metadata, err := s.backend.Head(ctx, key)
 	if err != nil {
 		return 0, classifyOSSError(err)
@@ -551,7 +551,7 @@ func (s *Sink) objectSize(ctx context.Context, key string) (int64, error) {
 	return metadata.Size, nil
 }
 
-func (s *Sink) verifyClosedObjects(ctx context.Context, streamRef api.StreamRef, resource api.Resource, objects []state.ClosedObject) error {
+func (s *ossSink) verifyClosedObjects(ctx context.Context, streamRef api.StreamRef, resource api.Resource, objects []state.ClosedObject) error {
 	for index, object := range objects {
 		if err := validateOSSObjectKey(object.Key); err != nil {
 			return err
@@ -615,7 +615,7 @@ func isNotFound(err error) bool {
 	return serviceErr.Code == "NoSuchKey" || serviceErr.StatusCode == http.StatusNotFound && serviceErr.Code == ""
 }
 
-func (s *Sink) streamLock(streamRef string) *sync.Mutex {
+func (s *ossSink) streamLock(streamRef string) *sync.Mutex {
 	hash := uint32(2166136261)
 	for i := 0; i < len(streamRef); i++ {
 		hash ^= uint32(streamRef[i])
@@ -624,7 +624,7 @@ func (s *Sink) streamLock(streamRef string) *sync.Mutex {
 	return &s.streamLocks[hash%streamLockCount]
 }
 
-func (s *Sink) validateResource(resource api.Resource) error {
+func (s *ossSink) validateResource(resource api.Resource) error {
 	if resource.ClusterName != s.cfg.ClusterID {
 		return api.Permanent(fmt.Errorf("resource cluster %q does not match configured cluster %q", resource.ClusterName, s.cfg.ClusterID))
 	}
@@ -664,7 +664,7 @@ func (s *Sink) validateResource(resource api.Resource) error {
 	return nil
 }
 
-func (s *Sink) validateStreamLayout(stream state.SinkStream, streamRef api.StreamRef, resource api.Resource) error {
+func (s *ossSink) validateStreamLayout(stream state.SinkStream, streamRef api.StreamRef, resource api.Resource) error {
 	if stream.StreamRef != streamRef.ID {
 		return api.Permanent(fmt.Errorf("OSS checkpoint stream %q does not match requested stream %q", stream.StreamRef, streamRef.ID))
 	}
@@ -724,7 +724,7 @@ func existingObjectError(operation, key string, err error) error {
 	return err
 }
 
-func (s *Sink) validateObjectIdentity(metadata objectMetadata, stream state.SinkStream, streamRef api.StreamRef, resource api.Resource) error {
+func (s *ossSink) validateObjectIdentity(metadata objectMetadata, stream state.SinkStream, streamRef api.StreamRef, resource api.Resource) error {
 	if metadata.ObjectType != appendableObjectType {
 		return api.Permanent(fmt.Errorf("OSS object type %q is not Appendable", metadata.ObjectType))
 	}
@@ -759,21 +759,21 @@ func (s *Sink) validateObjectIdentity(metadata objectMetadata, stream state.Sink
 	return nil
 }
 
-func (s *Sink) cachedStream(streamRef string) (state.SinkStream, api.Resource, bool) {
+func (s *ossSink) cachedStream(streamRef string) (state.SinkStream, api.Resource, bool) {
 	s.cacheMu.Lock()
 	defer s.cacheMu.Unlock()
 	stream, found := s.streams[streamRef]
 	return stream, s.resources[streamRef], found
 }
 
-func (s *Sink) storeCachedStream(streamRef string, stream state.SinkStream, resource api.Resource) {
+func (s *ossSink) storeCachedStream(streamRef string, stream state.SinkStream, resource api.Resource) {
 	s.cacheMu.Lock()
 	s.streams[streamRef] = stream
 	s.resources[streamRef] = resource
 	s.cacheMu.Unlock()
 }
 
-func (s *Sink) deleteCachedStream(streamRef string) {
+func (s *ossSink) deleteCachedStream(streamRef string) {
 	s.cacheMu.Lock()
 	delete(s.streams, streamRef)
 	delete(s.resources, streamRef)

@@ -109,7 +109,7 @@ func run() (exitCode int) {
 		}
 	}()
 
-	sink, err := buildSink(cfg, checkpoint)
+	sink, err := registry.BuildSink(cfg.Sink, registry.Dependencies{Config: cfg, State: checkpoint})
 	if err != nil {
 		readiness.Replace("sink-unavailable")
 		log.Errorf("sink unavailable: %v", err)
@@ -244,18 +244,14 @@ func run() (exitCode int) {
 	if shutdownErr != nil {
 		log.Errorf("shutdown incomplete: %v", shutdownErr)
 		if runtimeFailure {
-			waitForRuntimeFailureSignal(signalCtx)
+			<-signalCtx.Done()
 		}
 		return 1
 	}
 	if runtimeFailure {
-		waitForRuntimeFailureSignal(signalCtx)
+		<-signalCtx.Done()
 	}
 	return 0
-}
-
-func waitForRuntimeFailureSignal(ctx context.Context) {
-	<-ctx.Done()
 }
 
 var errPipelinePanicked = errors.New("pipeline goroutine panicked")
@@ -264,10 +260,6 @@ func runPipeline(done chan<- error, run func() error) {
 	runErr := errPipelinePanicked
 	defer func() { done <- runErr }()
 	runErr = run()
-}
-
-func buildSink(cfg config.Config, checkpoint *state.DB) (api.Sink, error) {
-	return registry.BuildSink(cfg.Sink, registry.Dependencies{Config: cfg, State: checkpoint})
 }
 
 func waitForSignal() {

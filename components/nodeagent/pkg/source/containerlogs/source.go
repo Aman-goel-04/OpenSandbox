@@ -51,7 +51,7 @@ const (
 
 var logNamePattern = regexp.MustCompile(`^(\d+)\.log(?:\.(.+))?$`)
 
-func (s *Source) commitSource(checkpoints []state.FileCheckpoint, stream state.SourceStream) error {
+func (s *containerLogSource) commitSource(checkpoints []state.FileCheckpoint, stream state.SourceStream) error {
 	err := s.state.CommitSource(checkpoints, stream)
 	if errors.Is(err, state.ErrFileCheckpointSuperseded) {
 		return api.Permanent(err)
@@ -62,7 +62,7 @@ func (s *Source) commitSource(checkpoints []state.FileCheckpoint, stream state.S
 func init() {
 	registry.RegisterSource(sourceName, func(dependencies registry.Dependencies) (api.Source, error) {
 		cfg := dependencies.Config
-		return New(Config{MaxLineBytes: cfg.MaxLineBytes, PartialTimeout: cfg.PartialTimeout, ReconcileInterval: config.InternalReconcileInterval, EndedStateRetention: cfg.EndedStateRetention, PruneEndedState: pruneEndedState(cfg)}, dependencies.Store, dependencies.State, dependencies.Logger, dependencies.OnError), nil
+		return newSource(sourceConfig{MaxLineBytes: cfg.MaxLineBytes, PartialTimeout: cfg.PartialTimeout, ReconcileInterval: config.InternalReconcileInterval, EndedStateRetention: cfg.EndedStateRetention, PruneEndedState: pruneEndedState(cfg)}, dependencies.Store, dependencies.State, dependencies.Logger, dependencies.OnError), nil
 	})
 }
 
@@ -80,7 +80,7 @@ type checkpointStore interface {
 	DeleteStream(string) error
 }
 
-type Config struct {
+type sourceConfig struct {
 	MaxLineBytes        int
 	PartialTimeout      time.Duration
 	ReconcileInterval   time.Duration
@@ -88,8 +88,8 @@ type Config struct {
 	PruneEndedState     bool
 }
 
-type Source struct {
-	cfg     Config
+type containerLogSource struct {
+	cfg     sourceConfig
 	store   store.View
 	state   checkpointStore
 	log     logger.Logger
@@ -173,15 +173,15 @@ type pendingSpan struct {
 	dropReasons []string
 }
 
-func New(cfg Config, view store.View, checkpoints checkpointStore, log logger.Logger, onError func(error)) *Source {
-	return &Source{cfg: cfg, store: view, state: checkpoints, log: log.Named(sourceName), onError: onError, streams: make(map[string]*streamRuntime), done: make(chan struct{}), epochID: uuid.NewString(), watches: make(map[string]watchIdentity), pendingRootWatchReplacements: make(map[string]map[string]struct{})}
+func newSource(cfg sourceConfig, view store.View, checkpoints checkpointStore, log logger.Logger, onError func(error)) *containerLogSource {
+	return &containerLogSource{cfg: cfg, store: view, state: checkpoints, log: log.Named(sourceName), onError: onError, streams: make(map[string]*streamRuntime), done: make(chan struct{}), epochID: uuid.NewString(), watches: make(map[string]watchIdentity), pendingRootWatchReplacements: make(map[string]map[string]struct{})}
 }
 
-func (s *Source) Capabilities() api.Capabilities {
+func (s *containerLogSource) Capabilities() api.Capabilities {
 	return api.Capabilities{RecordKinds: []api.RecordKind{api.RecordKindContainerLog}}
 }
 
-func (s *Source) Start(ctx context.Context, out chan<- api.SourceEvent) error {
+func (s *containerLogSource) Start(ctx context.Context, out chan<- api.SourceEvent) error {
 	s.mu.Lock()
 	if s.cancel != nil {
 		s.mu.Unlock()
@@ -195,7 +195,7 @@ func (s *Source) Start(ctx context.Context, out chan<- api.SourceEvent) error {
 	return nil
 }
 
-func (s *Source) Stop(ctx context.Context) error {
+func (s *containerLogSource) Stop(ctx context.Context) error {
 	s.mu.Lock()
 	if s.cancel != nil {
 		s.cancel()
@@ -209,7 +209,7 @@ func (s *Source) Stop(ctx context.Context) error {
 	}
 }
 
-func (s *Source) Acknowledge(_ context.Context, results []api.AckResult) error {
+func (s *containerLogSource) Acknowledge(_ context.Context, results []api.AckResult) error {
 	type decodedAck struct {
 		result api.AckResult
 		value  tokenValue
@@ -316,7 +316,7 @@ func (s *Source) Acknowledge(_ context.Context, results []api.AckResult) error {
 	return nil
 }
 
-func (s *Source) AcknowledgeEnd(_ context.Context, token api.EndToken) error {
+func (s *containerLogSource) AcknowledgeEnd(_ context.Context, token api.EndToken) error {
 	if token.Source != sourceName {
 		return api.Permanent(fmt.Errorf("end token source %q does not match", token.Source))
 	}
@@ -409,7 +409,7 @@ func sameFingerprint(fingerprint fileFingerprint, span sourceSpan) bool {
 	return fingerprint.Device == span.Device && fingerprint.Inode == span.Inode && fingerprint.PrefixHash == span.PrefixHash && fingerprint.HashBytes == span.HashBytes
 }
 
-func (s *Source) commitCompletedLocked(runtime *streamRuntime) error {
+func (s *containerLogSource) commitCompletedLocked(runtime *streamRuntime) error {
 	count := 0
 	for count < len(runtime.pending) && runtime.pending[count].complete {
 		count++
@@ -537,7 +537,7 @@ func (s *Source) commitCompletedLocked(runtime *streamRuntime) error {
 	return nil
 }
 
-func (s *Source) run(ctx context.Context) {
+func (s *containerLogSource) run(ctx context.Context) {
 	defer close(s.done)
 	defer close(s.out)
 	watcher, err := fsnotify.NewWatcher()
@@ -607,7 +607,7 @@ func (s *Source) run(ctx context.Context) {
 	}
 }
 
-func (s *Source) recordUnobservedWatchEvent(event fsnotify.Event) error {
+func (s *containerLogSource) recordUnobservedWatchEvent(event fsnotify.Event) error {
 	if event.Name == "" || event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Remove|fsnotify.Rename) == 0 {
 		return nil
 	}
@@ -662,7 +662,7 @@ func isRecognizedLogArtifact(path string) bool {
 	return logNamePattern.MatchString(name)
 }
 
-func (s *Source) ensureResourceWatches(watcher *fsnotify.Watcher, logDirectory string) (bool, []string, error) {
+func (s *containerLogSource) ensureResourceWatches(watcher *fsnotify.Watcher, logDirectory string) (bool, []string, error) {
 	podDirectory := filepath.Dir(logDirectory)
 	logRoot := filepath.Dir(podDirectory)
 	paths := []string{logRoot, podDirectory, logDirectory}
@@ -697,7 +697,7 @@ func canonicalCoverageBoundary(now time.Time) time.Time {
 	return now.Truncate(time.Second).Add(time.Second)
 }
 
-func (s *Source) ensureWatch(watcher *fsnotify.Watcher, path string) (bool, string, error) {
+func (s *containerLogSource) ensureWatch(watcher *fsnotify.Watcher, path string) (bool, string, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -728,7 +728,7 @@ func (s *Source) ensureWatch(watcher *fsnotify.Watcher, path string) (bool, stri
 	return true, discontinuity, nil
 }
 
-func (s *Source) resumeMonitoring(runtime *streamRuntime, leafWatched bool, discontinuities []string) error {
+func (s *containerLogSource) resumeMonitoring(runtime *streamRuntime, leafWatched bool, discontinuities []string) error {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
 	next := runtime.persisted
@@ -772,7 +772,7 @@ func (s *Source) resumeMonitoring(runtime *streamRuntime, leafWatched bool, disc
 	return nil
 }
 
-func (s *Source) removeResourceWatches(watcher *fsnotify.Watcher, logDirectory string) error {
+func (s *containerLogSource) removeResourceWatches(watcher *fsnotify.Watcher, logDirectory string) error {
 	var removeErr error
 	for _, path := range []string{logDirectory, filepath.Dir(logDirectory)} {
 		if _, tracked := s.watches[path]; tracked {
@@ -785,7 +785,7 @@ func (s *Source) removeResourceWatches(watcher *fsnotify.Watcher, logDirectory s
 	return removeErr
 }
 
-func (s *Source) completeInitialScan(runtime *streamRuntime, leafWatched bool) error {
+func (s *containerLogSource) completeInitialScan(runtime *streamRuntime, leafWatched bool) error {
 	if !leafWatched {
 		return nil
 	}
@@ -803,7 +803,7 @@ func (s *Source) completeInitialScan(runtime *streamRuntime, leafWatched bool) e
 	return nil
 }
 
-func (s *Source) recordWatchDiscontinuityAll(scope string) error {
+func (s *containerLogSource) recordWatchDiscontinuityAll(scope string) error {
 	s.mu.Lock()
 	runtimes := make([]*streamRuntime, 0, len(s.streams))
 	for _, runtime := range s.streams {
@@ -818,7 +818,7 @@ func (s *Source) recordWatchDiscontinuityAll(scope string) error {
 	return nil
 }
 
-func (s *Source) recordSharedRootWatchReplacements(logDirectory string, discontinuities []string) error {
+func (s *containerLogSource) recordSharedRootWatchReplacements(logDirectory string, discontinuities []string) error {
 	logRoot := filepath.Dir(filepath.Dir(logDirectory))
 	replacementPrefix := "watch-replaced:" + logRoot + ":"
 	s.mu.Lock()
@@ -876,7 +876,7 @@ func (s *Source) recordSharedRootWatchReplacements(logDirectory string, disconti
 	return nil
 }
 
-func (s *Source) recordWatchDiscontinuity(runtime *streamRuntime, scope string) error {
+func (s *containerLogSource) recordWatchDiscontinuity(runtime *streamRuntime, scope string) error {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
 	if runtime.persisted.CoverageStartedAt.IsZero() {
@@ -894,7 +894,7 @@ func (s *Source) recordWatchDiscontinuity(runtime *streamRuntime, scope string) 
 	return nil
 }
 
-func (s *Source) drainWatcherSignals(watcher *fsnotify.Watcher, logDirectory string) (bool, error) {
+func (s *containerLogSource) drainWatcherSignals(watcher *fsnotify.Watcher, logDirectory string) (bool, error) {
 	hadRelevantActivity := false
 	for {
 		select {
@@ -941,7 +941,7 @@ func watchEventRelevantToStream(logDirectory, eventName string) bool {
 	return eventName == logRoot || eventName == podDirectory || eventName == logDirectory || strings.HasPrefix(eventName, logDirectory+string(filepath.Separator))
 }
 
-func (s *Source) scanAll(ctx context.Context, watcher *fsnotify.Watcher) error {
+func (s *containerLogSource) scanAll(ctx context.Context, watcher *fsnotify.Watcher) error {
 	resources := s.allResources()
 	if len(resources) > 1 {
 		start := s.scanCursor % len(resources)
@@ -1100,7 +1100,7 @@ func (s *Source) scanAll(ctx context.Context, watcher *fsnotify.Watcher) error {
 	return nil
 }
 
-func (s *Source) pruneEndedRuntime(streamRef api.StreamRef, runtime *streamRuntime, now time.Time) (bool, error) {
+func (s *containerLogSource) pruneEndedRuntime(streamRef api.StreamRef, runtime *streamRuntime, now time.Time) (bool, error) {
 	runtime.mu.Lock()
 	eligible := runtime.ended && runtime.endAcked && runtime.persisted.RepairDeadline != nil && !now.Before(*runtime.persisted.RepairDeadline)
 	logDirectory := runtime.resource.LogDirectory
@@ -1134,7 +1134,7 @@ func (s *Source) pruneEndedRuntime(streamRef api.StreamRef, runtime *streamRunti
 	return true, nil
 }
 
-func (s *Source) scanFile(ctx context.Context, streamRef api.StreamRef, runtime *streamRuntime, path string) (bool, error) {
+func (s *containerLogSource) scanFile(ctx context.Context, streamRef api.StreamRef, runtime *streamRuntime, path string) (bool, error) {
 	runtime.mu.Lock()
 	fileState := runtime.files[path]
 	runtime.mu.Unlock()
@@ -1481,7 +1481,7 @@ func readPhysicalLineForScan(reader *bufio.Reader, retainLimit int) ([]byte, int
 	return raw, consumed, complete, false, nil
 }
 
-func (s *Source) flushExpired(ctx context.Context, now time.Time) {
+func (s *containerLogSource) flushExpired(ctx context.Context, now time.Time) {
 	type expiredRecord struct {
 		streamRef api.StreamRef
 		runtime   *streamRuntime
@@ -1504,7 +1504,7 @@ func (s *Source) flushExpired(ctx context.Context, now time.Time) {
 	}
 }
 
-func (s *Source) emit(ctx context.Context, streamRef api.StreamRef, runtime *streamRuntime, record assembled) error {
+func (s *containerLogSource) emit(ctx context.Context, streamRef api.StreamRef, runtime *streamRuntime, record assembled) error {
 	runtime.mu.Lock()
 	value, err := json.Marshal(tokenValue{Spans: record.spans, DropReasons: record.dropReasons, Revision: runtime.revision})
 	if err != nil {
@@ -1549,7 +1549,7 @@ func (s *Source) emit(ctx context.Context, streamRef api.StreamRef, runtime *str
 	}
 }
 
-func (s *Source) emitEnd(ctx context.Context, streamRef api.StreamRef, runtime *streamRuntime) error {
+func (s *containerLogSource) emitEnd(ctx context.Context, streamRef api.StreamRef, runtime *streamRuntime) error {
 	runtime.mu.Lock()
 	value := []byte(strconv.FormatUint(runtime.revision, 10))
 	hash := sha256.Sum256(append([]byte(streamRef.ID), value...))
@@ -1586,7 +1586,7 @@ func (s *Source) emitEnd(ctx context.Context, streamRef api.StreamRef, runtime *
 	}
 }
 
-func (s *Source) finishStream(ctx context.Context, streamRef api.StreamRef, runtime *streamRuntime) error {
+func (s *containerLogSource) finishStream(ctx context.Context, streamRef api.StreamRef, runtime *streamRuntime) error {
 	runtime.mu.Lock()
 	for _, file := range runtime.files {
 		if file.observedSize > file.readOffset {
@@ -1620,7 +1620,7 @@ func (s *Source) finishStream(ctx context.Context, streamRef api.StreamRef, runt
 	return s.emitEnd(ctx, streamRef, runtime)
 }
 
-func (s *Source) restoreStreams(ctx context.Context, watcher *fsnotify.Watcher) error {
+func (s *containerLogSource) restoreStreams(ctx context.Context, watcher *fsnotify.Watcher) error {
 	streams, err := s.state.ListSourceStreams()
 	if err != nil {
 		return err
@@ -1675,7 +1675,7 @@ func (s *Source) restoreStreams(ctx context.Context, watcher *fsnotify.Watcher) 
 	return nil
 }
 
-func (s *Source) allResources() []store.Resource {
+func (s *containerLogSource) allResources() []store.Resource {
 	byStream := make(map[string]store.Resource)
 	for _, resource := range s.store.List() {
 		byStream[streamRef(resource).ID] = resource
@@ -1697,7 +1697,7 @@ func (s *Source) allResources() []store.Resource {
 	return out
 }
 
-func (s *Source) getOrCreateRuntime(streamRef api.StreamRef, resource store.Resource) (*streamRuntime, error) {
+func (s *containerLogSource) getOrCreateRuntime(streamRef api.StreamRef, resource store.Resource) (*streamRuntime, error) {
 	s.mu.Lock()
 	runtime := s.streams[streamRef.ID]
 	s.mu.Unlock()
@@ -1753,7 +1753,7 @@ func (s *Source) getOrCreateRuntime(streamRef api.StreamRef, resource store.Reso
 	return runtime, nil
 }
 
-func (s *Source) hydrateFiles(runtime *streamRuntime) error {
+func (s *containerLogSource) hydrateFiles(runtime *streamRuntime) error {
 	checkpoints, err := s.state.ListFileCheckpoints(runtime.persisted.StreamRef)
 	if err != nil {
 		return err
@@ -1767,7 +1767,7 @@ func (s *Source) hydrateFiles(runtime *streamRuntime) error {
 	return nil
 }
 
-func runtimeFromState(cfg Config, resource store.Resource, persisted state.SourceStream) *streamRuntime {
+func runtimeFromState(cfg sourceConfig, resource store.Resource, persisted state.SourceStream) *streamRuntime {
 	return &streamRuntime{
 		resource:    resource,
 		files:       make(map[string]*fileRuntime),
@@ -1789,7 +1789,7 @@ func thawResource(resource state.FrozenResource) store.Resource {
 	return store.Resource{Resource: api.Resource{SandboxID: resource.SandboxID, ClusterName: resource.ClusterName, Namespace: resource.Namespace, PodName: resource.PodName, PodUID: resource.PodUID, NodeName: resource.NodeName, Container: resource.Container, LogDirectory: resource.LogDirectory}, Terminated: resource.Terminated}
 }
 
-func (s *Source) runtimeHasNewBytes(runtime *streamRuntime, files []string) (bool, error) {
+func (s *containerLogSource) runtimeHasNewBytes(runtime *streamRuntime, files []string) (bool, error) {
 	for _, path := range files {
 		info, err := os.Stat(path)
 		if err != nil {
@@ -1838,7 +1838,7 @@ func (s *Source) runtimeHasNewBytes(runtime *streamRuntime, files []string) (boo
 	return false, nil
 }
 
-func (s *Source) runtimeHasNewCompressed(runtime *streamRuntime, paths []string) (bool, error) {
+func (s *containerLogSource) runtimeHasNewCompressed(runtime *streamRuntime, paths []string) (bool, error) {
 	for _, path := range paths {
 		id := gapID(runtime.persisted.StreamRef, state.FileCheckpoint{Path: path}, "preexisting-compressed-rotation")
 		known := false
@@ -1869,7 +1869,7 @@ func (s *Source) runtimeHasNewCompressed(runtime *streamRuntime, paths []string)
 	return false, nil
 }
 
-func (s *Source) findCheckpoint(streamRef, path string) (state.FileCheckpoint, bool, error) {
+func (s *containerLogSource) findCheckpoint(streamRef, path string) (state.FileCheckpoint, bool, error) {
 	if checkpoint, found, err := s.state.GetFileCheckpoint(streamRef, path); err != nil || found {
 		return checkpoint, found, err
 	}
@@ -1899,7 +1899,7 @@ func (s *Source) findCheckpoint(streamRef, path string) (state.FileCheckpoint, b
 	return state.FileCheckpoint{}, false, nil
 }
 
-func (s *Source) findRepairCheckpoint(runtime *streamRuntime, path string) (state.FileCheckpoint, string, bool, error) {
+func (s *containerLogSource) findRepairCheckpoint(runtime *streamRuntime, path string) (state.FileCheckpoint, string, bool, error) {
 	runtime.mu.Lock()
 	streamRef := runtime.persisted.StreamRef
 	revision := runtime.revision
@@ -1953,7 +1953,7 @@ func checkpointFor(streamRef string, revision uint64, file *fileRuntime, offset 
 	return state.FileCheckpoint{StreamRef: streamRef, FileID: file.fileID, Path: file.path, Offset: offset, Device: file.fingerprint.Device, Inode: file.fingerprint.Inode, PrefixHash: file.fingerprint.PrefixHash, HashBytes: file.fingerprint.HashBytes, ObservedSize: file.observedSize, ModTimeUnixNano: file.modTimeUnixNano, Revision: revision}
 }
 
-func (s *Source) recordCompressed(runtime *streamRuntime, paths []string) error {
+func (s *containerLogSource) recordCompressed(runtime *streamRuntime, paths []string) error {
 	for _, path := range paths {
 		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 			continue
@@ -2009,7 +2009,7 @@ func (s *Source) recordCompressed(runtime *streamRuntime, paths []string) error 
 	return nil
 }
 
-func (s *Source) reconcileMissingFiles(runtime *streamRuntime, discovered []string) error {
+func (s *containerLogSource) reconcileMissingFiles(runtime *streamRuntime, discovered []string) error {
 	seen := make(map[string]struct{}, len(discovered))
 	for _, path := range discovered {
 		seen[path] = struct{}{}
@@ -2061,7 +2061,7 @@ func (r *streamRuntime) hasPendingFile(fileID string) bool {
 	return false
 }
 
-func (s *Source) markRuntimeFileGap(runtime *streamRuntime, file *fileRuntime, reason string, coverage bool) error {
+func (s *containerLogSource) markRuntimeFileGap(runtime *streamRuntime, file *fileRuntime, reason string, coverage bool) error {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
 	if coverage && file.repairGapID != "" {
@@ -2071,7 +2071,7 @@ func (s *Source) markRuntimeFileGap(runtime *streamRuntime, file *fileRuntime, r
 	return s.addGapLocked(runtime, checkpoint, reason, coverage)
 }
 
-func (s *Source) makeBoundRepairGapCoverageLocked(runtime *streamRuntime, file *fileRuntime) error {
+func (s *containerLogSource) makeBoundRepairGapCoverageLocked(runtime *streamRuntime, file *fileRuntime) error {
 	next := runtime.persisted
 	next.LossReasons = append([]string(nil), runtime.persisted.LossReasons...)
 	next.Gaps = append([]state.GapRecord(nil), runtime.persisted.Gaps...)
@@ -2100,7 +2100,7 @@ func (s *Source) makeBoundRepairGapCoverageLocked(runtime *streamRuntime, file *
 	return nil
 }
 
-func (s *Source) addGapLocked(runtime *streamRuntime, checkpoint state.FileCheckpoint, reason string, coverage bool) error {
+func (s *containerLogSource) addGapLocked(runtime *streamRuntime, checkpoint state.FileCheckpoint, reason string, coverage bool) error {
 	next := runtime.persisted
 	if !appendGapToStream(&next, checkpoint, reason, coverage) {
 		return nil
@@ -2158,7 +2158,7 @@ func appendCoverageGapToStream(stream *state.SourceStream, scope, reason, path s
 	return true
 }
 
-func (s *Source) coverGapLocked(runtime *streamRuntime, file *fileRuntime, from, resumeAt int64, reason string) error {
+func (s *containerLogSource) coverGapLocked(runtime *streamRuntime, file *fileRuntime, from, resumeAt int64, reason string) error {
 	checkpoint := checkpointFor(runtime.persisted.StreamRef, runtime.revision, file, from)
 	id := gapID(runtime.persisted.StreamRef, checkpoint, reason)
 	next := runtime.persisted
@@ -2220,7 +2220,7 @@ func bindRepairGap(stream state.SourceStream, file *fileRuntime) error {
 	return nil
 }
 
-func (s *Source) resolveStableRepairGapsLocked(runtime *streamRuntime) error {
+func (s *containerLogSource) resolveStableRepairGapsLocked(runtime *streamRuntime) error {
 	next := runtime.persisted
 	next.LossReasons = append([]string(nil), runtime.persisted.LossReasons...)
 	next.Gaps = append([]state.GapRecord(nil), runtime.persisted.Gaps...)
@@ -2341,7 +2341,7 @@ func coverageGapID(streamRef, scope, reason string) string {
 	return hex.EncodeToString(digest[:])
 }
 
-func (s *Source) fail(err error) {
+func (s *containerLogSource) fail(err error) {
 	if errors.Is(err, context.Canceled) {
 		return
 	}

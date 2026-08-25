@@ -35,21 +35,21 @@ type Dependencies struct {
 	OnError func(error)
 }
 
-type SourceFactory func(Dependencies) (api.Source, error)
-type SinkFactory func(Dependencies) (api.Sink, error)
-type SinkTargetID func(config.Config) (string, error)
+type sourceFactory func(Dependencies) (api.Source, error)
+type sinkFactory func(Dependencies) (api.Sink, error)
+type sinkTargetID func(config.Config) (string, error)
 
 type sinkRegistration struct {
-	targetID SinkTargetID
-	factory  SinkFactory
+	targetID sinkTargetID
+	factory  sinkFactory
 }
 
 var (
-	sources = make(map[string]SourceFactory)
+	sources = make(map[string]sourceFactory)
 	sinks   = make(map[string]sinkRegistration)
 )
 
-func RegisterSource(name string, factory SourceFactory) {
+func RegisterSource(name string, factory sourceFactory) {
 	if name == "" || factory == nil {
 		panic("nodeagent: invalid Source factory registration")
 	}
@@ -59,7 +59,7 @@ func RegisterSource(name string, factory SourceFactory) {
 	sources[name] = factory
 }
 
-func RegisterSink(name string, targetID SinkTargetID, factory SinkFactory) {
+func RegisterSink(name string, targetID sinkTargetID, factory sinkFactory) {
 	if name == "" || targetID == nil || factory == nil {
 		panic("nodeagent: invalid Sink factory registration")
 	}

@@ -53,7 +53,7 @@ func init() {
 		return identity.FileTargetID(cfg.FilePath, cfg.ClusterID, cfg.NodeName)
 	}, func(dependencies registry.Dependencies) (api.Sink, error) {
 		cfg := dependencies.Config
-		return New(Config{Root: cfg.FilePath, ClusterID: cfg.ClusterID, MaxFileBytes: cfg.FileMaxBytes, MaxFiles: cfg.FileMaxFiles, MaxTotalBytes: cfg.FileMaxTotalBytes, Retention: cfg.FileRetention}, dependencies.State)
+		return newFileSink(fileConfig{Root: cfg.FilePath, ClusterID: cfg.ClusterID, MaxFileBytes: cfg.FileMaxBytes, MaxFiles: cfg.FileMaxFiles, MaxTotalBytes: cfg.FileMaxTotalBytes, Retention: cfg.FileRetention}, dependencies.State)
 	})
 }
 
@@ -64,7 +64,7 @@ type stateStore interface {
 	DeleteStream(streamRef string) error
 }
 
-type Config struct {
+type fileConfig struct {
 	Root          string
 	ClusterID     string
 	MaxFileBytes  int64
@@ -73,8 +73,8 @@ type Config struct {
 	Retention     time.Duration
 }
 
-type Sink struct {
-	cfg   Config
+type fileSink struct {
+	cfg   fileConfig
 	state stateStore
 
 	mu            sync.Mutex
@@ -99,7 +99,7 @@ func (e capacityExhaustedError) Error() string {
 }
 func (capacityExhaustedError) Retryable() bool { return true }
 
-func New(cfg Config, store stateStore) (*Sink, error) {
+func newFileSink(cfg fileConfig, store stateStore) (*fileSink, error) {
 	if cfg.MaxFileBytes <= 0 || cfg.MaxFiles <= 0 || (cfg.Root != "" && cfg.MaxTotalBytes <= 0) {
 		return nil, errors.New("file limits must be positive")
 	}
@@ -118,20 +118,20 @@ func New(cfg Config, store stateStore) (*Sink, error) {
 			return nil, err
 		}
 	}
-	return &Sink{cfg: cfg, state: store, writers: make(map[string]*writer)}, nil
+	return &fileSink{cfg: cfg, state: store, writers: make(map[string]*writer)}, nil
 }
 
-func (s *Sink) Capabilities() api.Capabilities {
+func (s *fileSink) Capabilities() api.Capabilities {
 	return api.Capabilities{RecordKinds: []api.RecordKind{api.RecordKindContainerLog}}
 }
-func (s *Sink) Guarantee() api.DeliveryGuarantee {
+func (s *fileSink) Guarantee() api.DeliveryGuarantee {
 	if s.cfg.Root == "" {
 		return api.GuaranteeBestEffort
 	}
 	return api.GuaranteeDurable
 }
 
-func (s *Sink) Consume(_ context.Context, batch api.Batch) error {
+func (s *fileSink) Consume(_ context.Context, batch api.Batch) error {
 	if len(batch.Items) == 0 {
 		return nil
 	}
@@ -221,7 +221,7 @@ func (s *Sink) Consume(_ context.Context, batch api.Batch) error {
 	return nil
 }
 
-func (s *Sink) Finalize(ctx context.Context, request api.FinalizeRequest) error {
+func (s *fileSink) Finalize(ctx context.Context, request api.FinalizeRequest) error {
 	if s.cfg.Root == "" {
 		return nil
 	}
@@ -449,7 +449,7 @@ func removeTemporaryMarker(temporaryPath string) (bool, error) {
 	return true, syncDir(dir)
 }
 
-func (s *Sink) Close(_ context.Context) error {
+func (s *fileSink) Close(_ context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var errs []error
@@ -466,7 +466,7 @@ func (s *Sink) Close(_ context.Context) error {
 // persisted cleanup phase is the tombstone: a crash resumes from either the
 // canonical family path or the GC staging path and never deletes one
 // generation in isolation.
-func (s *Sink) CollectExpired(ctx context.Context, now time.Time) error {
+func (s *fileSink) CollectExpired(ctx context.Context, now time.Time) error {
 	if s.cfg.Root == "" {
 		return nil
 	}
@@ -486,7 +486,7 @@ func (s *Sink) CollectExpired(ctx context.Context, now time.Time) error {
 	return errors.Join(errs...)
 }
 
-func (s *Sink) collectExpiredStream(ctx context.Context, now time.Time, source state.SourceStream) error {
+func (s *fileSink) collectExpiredStream(ctx context.Context, now time.Time, source state.SourceStream) error {
 	if !source.Ended || source.RepairDeadline == nil || now.Before(source.RepairDeadline.Add(s.cfg.Retention)) {
 		return nil
 	}
@@ -574,7 +574,7 @@ func (s *Sink) collectExpiredStream(ctx context.Context, now time.Time, source s
 	return s.state.DeleteStream(source.StreamRef)
 }
 
-func (s *Sink) getWriter(streamRef api.StreamRef, resource api.Resource) (*writer, error) {
+func (s *fileSink) getWriter(streamRef api.StreamRef, resource api.Resource) (*writer, error) {
 	if existing := s.writers[streamRef.ID]; existing != nil {
 		if !lineformat.SameResourceIdentity(existing.resource, resource) {
 			return nil, api.Permanent(errors.New("file stream resource identity changed"))
@@ -722,14 +722,14 @@ func (s *Sink) getWriter(streamRef api.StreamRef, resource api.Resource) (*write
 	return w, nil
 }
 
-func (s *Sink) rollover(w *writer) error {
+func (s *fileSink) rollover(w *writer) error {
 	if err := s.closeGeneration(w); err != nil {
 		return err
 	}
 	return s.startNextGeneration(w)
 }
 
-func (s *Sink) startNextGeneration(w *writer) error {
+func (s *fileSink) startNextGeneration(w *writer) error {
 	if s.cfg.MaxFiles <= 0 || w.stream.Generation >= uint64(s.cfg.MaxFiles-1) {
 		return api.Permanent(errors.New("durable file generation limit reached"))
 	}
@@ -784,7 +784,7 @@ func (s *Sink) startNextGeneration(w *writer) error {
 	return s.state.PutSinkStream(name, w.stream)
 }
 
-func (s *Sink) closeGeneration(w *writer) error {
+func (s *fileSink) closeGeneration(w *writer) error {
 	if w.file == nil {
 		return nil
 	}
@@ -868,7 +868,7 @@ func recoverAppend(w *writer) error {
 	return nil
 }
 
-func (s *Sink) recoverFailedAppend(w *writer, cause error) error {
+func (s *fileSink) recoverFailedAppend(w *writer, cause error) error {
 	recoveryErr := recoverAppend(w)
 	if recoveryErr != nil {
 		s.invalidateCapacity()
@@ -876,7 +876,7 @@ func (s *Sink) recoverFailedAppend(w *writer, cause error) error {
 	return errors.Join(cause, recoveryErr)
 }
 
-func (s *Sink) reserveCapacity(additional int64) error {
+func (s *fileSink) reserveCapacity(additional int64) error {
 	if additional < 0 {
 		return api.Permanent(errors.New("durable file capacity reservation cannot be negative"))
 	}
@@ -922,7 +922,7 @@ func measureCapacity(root string) (int64, error) {
 	return used, err
 }
 
-func (s *Sink) adjustCapacity(delta int64) {
+func (s *fileSink) adjustCapacity(delta int64) {
 	if !s.capacityKnown {
 		return
 	}
@@ -933,12 +933,12 @@ func (s *Sink) adjustCapacity(delta int64) {
 	s.capacityUsed += delta
 }
 
-func (s *Sink) invalidateCapacity() {
+func (s *fileSink) invalidateCapacity() {
 	s.capacityUsed = 0
 	s.capacityKnown = false
 }
 
-func (s *Sink) validateClosedFileLayout(resource api.Resource, stream state.SinkStream) error {
+func (s *fileSink) validateClosedFileLayout(resource api.Resource, stream state.SinkStream) error {
 	// Validate every resource-derived path segment before reconstructing object keys.
 	if _, err := familyDir(s.cfg.Root, resource); err != nil {
 		return err
@@ -971,7 +971,7 @@ func (s *Sink) validateClosedFileLayout(resource api.Resource, stream state.Sink
 	return nil
 }
 
-func (s *Sink) verifyClosedFiles(ctx context.Context, resource api.Resource, stream state.SinkStream) error {
+func (s *fileSink) verifyClosedFiles(ctx context.Context, resource api.Resource, stream state.SinkStream) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}

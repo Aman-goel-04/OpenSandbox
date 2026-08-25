@@ -51,7 +51,7 @@ func TestRealOSSSmoke(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	sink, err := New(Config{Endpoint: endpoint, Bucket: bucket, Prefix: prefix, ClusterID: "integration", AccessKeyID: accessKeyID, AccessKeySecret: accessKeySecret, SessionToken: os.Getenv("OSS_SESSION_TOKEN"), WriterID: db.WriterID(), TargetID: targetID, MaxObjectBytes: 1 << 20, Timeout: 30 * time.Second}, db)
+	sink, err := newOSSSink(ossConfig{Endpoint: endpoint, Bucket: bucket, Prefix: prefix, ClusterID: "integration", AccessKeyID: accessKeyID, AccessKeySecret: accessKeySecret, SessionToken: os.Getenv("OSS_SESSION_TOKEN"), WriterID: db.WriterID(), TargetID: targetID, MaxObjectBytes: 1 << 20, Timeout: 30 * time.Second}, db)
 	if err != nil {
 		t.Fatal(err)
 	}
