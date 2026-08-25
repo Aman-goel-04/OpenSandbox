@@ -224,6 +224,40 @@ def test_proxy_forwards_filtered_headers_and_query(
     assert fake_client.response.aclose_called is True
 
 
+def test_proxy_honors_configured_resolve_internal_false(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+):
+    class StubService:
+        @staticmethod
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+            assert sandbox_id == "sbx-123"
+            assert port == 44772
+            assert resolve_internal is False
+            return Endpoint(endpoint="127.0.0.1:51999")
+
+    monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
+    monkeypatch.setattr(
+        proxy_api,
+        "get_config",
+        lambda: SimpleNamespace(proxy=SimpleNamespace(resolve_internal=False)),
+    )
+
+    fake_client = _FakeAsyncClient()
+    fake_client.response = _FakeStreamingResponse(
+        status_code=200,
+        headers={},
+        chunks=[b"ok"],
+    )
+    _set_http_client(client, fake_client)
+
+    response = client.get("/v1/sandboxes/sbx-123/proxy/44772/status", headers=auth_headers)
+    assert response.status_code == 200
+    assert fake_client.built is not None
+    assert fake_client.built["url"] == "http://127.0.0.1:51999/status"
+
+
 def test_proxy_preserves_origin_date_and_filters_server_header(
     client: TestClient,
     auth_headers: dict,
