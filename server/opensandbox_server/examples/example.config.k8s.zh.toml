@@ -81,6 +81,11 @@ mode = "dns"
 # Default is true (recommended for dual-stack CNI). Set false only if you need IPv6 in the netns (see server/configuration.md).
 # disable_ipv6 = false
 
+# 可选：为生成的 egress sidecar 配置独立的 Kubernetes 资源，请根据实际负载调整。
+# [egress.resources]
+# requests = { cpu = "25m", memory = "64Mi" }
+# limits = { cpu = "250m", memory = "256Mi" }
+
 # 按访问续期。默认关闭 — 见 server/README_zh.md。
 [renew_intent]
 enabled = false
