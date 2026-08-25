@@ -903,7 +903,7 @@ class SandboxPool internal constructor(
         dropped.forEach { task ->
             when (task) {
                 is TrackedCleanupTask -> task.completeIfDropped()
-                is TrackedWarmupTask -> task.completeIfDropped()
+                is TrackedWarmupTask -> task.completeCancelled(WarmupReason.POOL_STOPPED)
             }
         }
     }
@@ -1083,7 +1083,7 @@ class SandboxPool internal constructor(
     private fun markPrimaryLost(run: RunContext) {
         if (!run.primaryOwned.compareAndSet(true, false)) return
         run.leaderEpoch.incrementAndGet()
-        val cancellation = Runnable { cancelDelayedWarmups(run, "warmup-leader-lost") }
+        val cancellation = Runnable { cancelDelayedWarmups(run, WarmupReason.PRIMARY_LOCK_LOST) }
         try {
             run.scheduler.execute(cancellation)
         } catch (_: RejectedExecutionException) {
@@ -1093,15 +1093,15 @@ class SandboxPool internal constructor(
 
     private fun cancelDelayedWarmups(
         run: RunContext,
-        source: String,
+        reason: WarmupReason,
     ) {
         val sandboxIds = mutableListOf<String>()
         run.delayQueue.toList().forEach { task ->
             if (run.delayQueue.remove(task)) {
-                task.completeCancelledLocally(source)?.let(sandboxIds::add)
+                task.completeCancelledLocally(reason)?.let(sandboxIds::add)
             }
         }
-        scheduleCancelledWarmupCleanup(run, sandboxIds, source)
+        scheduleCancelledWarmupCleanup(run, sandboxIds, cleanupSource(reason))
     }
 
     /**
@@ -1209,7 +1209,7 @@ class SandboxPool internal constructor(
                     config.poolName,
                     e.message,
                 )
-                task.completeIfDropped()
+                task.completeAdmissionRejected()
                 return
             }
         }
@@ -1232,7 +1232,7 @@ class SandboxPool internal constructor(
         private var trace: WarmupTrace? = null
 
         @Volatile
-        private var stage: WarmupStage = WarmupStage.CREATING
+        private var stage: WarmupStage = WarmupStage.CREATE
 
         @Volatile
         private var dueNanos: Long = 0L
@@ -1259,22 +1259,22 @@ class SandboxPool internal constructor(
                     submittedEpochNanos = submittedEpochNanos,
                 )
             if (!canAdvance()) {
-                completeCancelled("warmup-stale-before-create")
+                completeCancelled(WarmupReason.STALE_RUN)
                 return
             }
             try {
                 val created = withTrace { poolTracer.withPhaseSpan(PoolTracer.WARMUP_CREATE_SPAN) { buildWarmupSandbox() } }
                 sandbox = created
                 if (!canAdvance()) {
-                    completeCancelled("warmup-stale-after-create")
+                    completeCancelled(WarmupReason.STALE_RUN)
                     return
                 }
                 val now = System.nanoTime()
                 if (config.warmupSkipHealthCheck) {
-                    stage = WarmupStage.PREPARING
+                    stage = WarmupStage.PREPARE
                     scheduleAt(now)
                 } else {
-                    stage = WarmupStage.CHECKING_READINESS
+                    stage = WarmupStage.READINESS
                     stageDeadlineNanos = saturatedAdd(now, config.warmupReadyTimeout.toNanos())
                     val requestedFirstCheck = saturatedAdd(now, config.warmupHealthCheckInitialDelay.toNanos())
                     finalAttempt = requestedFirstCheck >= stageDeadlineNanos
@@ -1285,14 +1285,14 @@ class SandboxPool internal constructor(
             }
         }
 
-        fun completeIfDropped() {
-            completeCancelled("warmup-create-dropped")
+        fun completeAdmissionRejected() {
+            completeDropped(WarmupStage.ADMISSION, WarmupReason.CREATE_EXECUTOR_REJECTED)
         }
 
         fun processDue() {
             if (completed.get()) return
             if (!canAdvance()) {
-                completeCancelled("warmup-stale-run")
+                completeCancelled(WarmupReason.STALE_RUN)
                 return
             }
             try {
@@ -1300,7 +1300,7 @@ class SandboxPool internal constructor(
             } catch (failure: Throwable) {
                 if (failure.isCausedByInterruption() || Thread.currentThread().isInterrupted) {
                     Thread.currentThread().interrupt()
-                    completeCancelled("warmup-interrupted")
+                    completeCancelled(WarmupReason.INTERRUPTED)
                 } else {
                     completeFailure(failure)
                 }
@@ -1314,16 +1314,17 @@ class SandboxPool internal constructor(
         private fun advanceStages() {
             while (!completed.get()) {
                 if (!canAdvance()) {
-                    completeCancelled("warmup-stale-run")
+                    completeCancelled(WarmupReason.STALE_RUN)
                     return
                 }
                 when (stage) {
-                    WarmupStage.CREATING -> error("Create task cannot run on post-create executor")
-                    WarmupStage.CHECKING_READINESS -> {
+                    WarmupStage.ADMISSION -> error("Admission stage cannot run on post-create executor")
+                    WarmupStage.CREATE -> error("Create task cannot run on post-create executor")
+                    WarmupStage.READINESS -> {
                         if (!runHealthCheck(HealthStage.READINESS)) return
-                        stage = WarmupStage.PREPARING
+                        stage = WarmupStage.PREPARE
                     }
-                    WarmupStage.PREPARING -> {
+                    WarmupStage.PREPARE -> {
                         if (!preparerExecuted) {
                             preparerExecuted = true
                             poolTracer.withPhaseSpan(PoolTracer.WARMUP_PREPARE_SPAN) {
@@ -1331,21 +1332,21 @@ class SandboxPool internal constructor(
                             }
                         }
                         if (config.warmupPostPrepareHealthCheck == null) {
-                            stage = WarmupStage.RENEWING
+                            stage = WarmupStage.RENEW
                         } else {
                             val now = System.nanoTime()
-                            stage = WarmupStage.CHECKING_POST_PREPARE
+                            stage = WarmupStage.POST_PREPARE_READINESS
                             stageDeadlineNanos =
                                 saturatedAdd(now, config.warmupPostPrepareHealthCheckTimeout.toNanos())
                             finalAttempt = false
                             lastHealthCheckError = null
                         }
                     }
-                    WarmupStage.CHECKING_POST_PREPARE -> {
+                    WarmupStage.POST_PREPARE_READINESS -> {
                         if (!runHealthCheck(HealthStage.POST_PREPARE)) return
-                        stage = WarmupStage.RENEWING
+                        stage = WarmupStage.RENEW
                     }
-                    WarmupStage.RENEWING -> {
+                    WarmupStage.RENEW -> {
                         val current = requireSandbox()
                         poolTracer.withPhaseSpan(PoolTracer.WARMUP_RENEW_SPAN) {
                             current.renew(config.idleTimeout)
@@ -1353,26 +1354,26 @@ class SandboxPool internal constructor(
                         val sandboxId = current.id
                         current.close()
                         localResourcesClosed = true
-                        stage = WarmupStage.COMMITTING
-                        val cleanupSource =
+                        stage = WarmupStage.COMMIT
+                        val commitFailure =
                             poolTracer.withPhaseSpan(PoolTracer.WARMUP_COMMIT_SPAN) {
                                 commitWarmupSandbox(run, leaderEpoch, sandboxId)
                             }
-                        if (cleanupSource == null) {
+                        if (commitFailure == null) {
                             completeSuccess(sandboxId)
                         } else {
                             scheduleKillDiscardedAlive(
                                 config.poolName,
                                 listOf(sandboxId),
-                                source = cleanupSource,
+                                source = cleanupSource(commitFailure.reason),
                                 executor = run.warmupExecutor,
                                 run = run,
                             )
-                            completeDropped(cleanupSource)
+                            completeDropped(WarmupStage.COMMIT, commitFailure.reason, commitFailure.error)
                         }
                         return
                     }
-                    WarmupStage.COMMITTING -> error("Commit stage cannot be re-entered")
+                    WarmupStage.COMMIT -> error("Commit stage cannot be re-entered")
                 }
             }
         }
@@ -1419,60 +1420,105 @@ class SandboxPool internal constructor(
             if (completed.get()) return
             dueNanos = nextDueNanos
             if (!canAdvance()) {
-                completeCancelled("warmup-stale-before-queue")
+                completeCancelled(WarmupReason.STALE_RUN)
                 return
             }
             run.delayQueue.offer(this)
         }
 
         private fun completeSuccess(sandboxId: String) {
-            if (!completed.compareAndSet(false, true)) return
-            try {
-                trace?.endSuccess(sandboxId, creationSpec.imageSpec.image)
-            } finally {
-                finish()
-            }
+            completeTerminal(
+                WarmupTerminalOutcome(
+                    stage = WarmupStage.COMMIT,
+                    result = WarmupResult.SUCCESS,
+                    sandboxId = sandboxId,
+                ),
+            )
         }
 
         private fun completeFailure(failure: Throwable) {
-            if (!completed.compareAndSet(false, true)) return
-            try {
-                cleanupSandbox(failure)
-                if (isCurrentRun(run) && lifecycleState.get() == LifecycleState.RUNNING) {
-                    reconcileState.recordAsyncFailure(failure.message)
-                }
-                trace?.endFailure(failure)
-                logger.warn("Pool warmup failed: pool_name={}", config.poolName, failure)
-            } finally {
-                finish()
-            }
+            completeTerminal(
+                WarmupTerminalOutcome(
+                    stage = stage,
+                    result = WarmupResult.FAILURE,
+                    reason = failureReason(stage),
+                    error = failure,
+                    sandboxId = sandbox?.id,
+                ),
+            )
         }
 
-        fun completeCancelled(source: String) {
-            val sandboxId = completeCancelledLocally(source) ?: return
-            scheduleCancelledWarmupCleanup(run, listOf(sandboxId), source)
+        fun completeCancelled(reason: WarmupReason) {
+            val sandboxId = completeCancelledLocally(reason) ?: return
+            scheduleCancelledWarmupCleanup(run, listOf(sandboxId), cleanupSource(reason))
         }
 
-        fun completeCancelledLocally(source: String): String? {
+        fun completeCancelledLocally(reason: WarmupReason): String? {
+            val sandboxId = sandbox?.id
+            return completeTerminal(
+                WarmupTerminalOutcome(
+                    stage = stage,
+                    result = WarmupResult.CANCELLED,
+                    reason = reason,
+                    sandboxId = sandboxId,
+                ),
+            )
+        }
+
+        private fun completeDropped(
+            terminalStage: WarmupStage,
+            reason: WarmupReason,
+            error: Throwable? = null,
+        ) {
+            completeTerminal(
+                WarmupTerminalOutcome(
+                    stage = terminalStage,
+                    result = WarmupResult.DROPPED,
+                    reason = reason,
+                    error = error,
+                    sandboxId = sandbox?.id,
+                ),
+            )
+        }
+
+        private fun completeTerminal(outcome: WarmupTerminalOutcome): String? {
             if (!completed.compareAndSet(false, true)) return null
-            var sandboxId: String? = null
+            var cleanupSandboxId: String? = null
             try {
-                sandboxId = closeCancelledSandboxLocally()
-                trace?.endDropped(source)
+                when (outcome.result) {
+                    WarmupResult.SUCCESS ->
+                        trace?.endSuccess(requireNotNull(outcome.sandboxId), creationSpec.imageSpec.image)
+                    WarmupResult.FAILURE -> {
+                        val failure = requireNotNull(outcome.error)
+                        cleanupSandbox(failure)
+                        if (isCurrentRun(run) && lifecycleState.get() == LifecycleState.RUNNING) {
+                            reconcileState.recordAsyncFailure(failure.message)
+                        }
+                        trace?.endFailure(failure)
+                        logger.warn("Pool warmup failed: pool_name={}", config.poolName, failure)
+                    }
+                    WarmupResult.CANCELLED -> {
+                        cleanupSandboxId = closeCancelledSandboxLocally()
+                        trace?.endDropped(cleanupSource(requireNotNull(outcome.reason)))
+                    }
+                    WarmupResult.DROPPED -> trace?.endDropped(cleanupSource(requireNotNull(outcome.reason)))
+                }
             } finally {
                 finish()
             }
-            return sandboxId
+            return cleanupSandboxId
         }
 
-        private fun completeDropped(source: String) {
-            if (!completed.compareAndSet(false, true)) return
-            try {
-                trace?.endDropped(source)
-            } finally {
-                finish()
+        private fun failureReason(stage: WarmupStage): WarmupReason =
+            when (stage) {
+                WarmupStage.ADMISSION -> WarmupReason.UNKNOWN
+                WarmupStage.CREATE -> WarmupReason.CREATE_FAILED
+                WarmupStage.READINESS -> WarmupReason.READINESS_TIMEOUT
+                WarmupStage.PREPARE -> WarmupReason.PREPARE_FAILED
+                WarmupStage.POST_PREPARE_READINESS -> WarmupReason.POST_PREPARE_READINESS_TIMEOUT
+                WarmupStage.RENEW -> WarmupReason.RENEW_FAILED
+                WarmupStage.COMMIT -> WarmupReason.COMMIT_FAILED
             }
-        }
 
         private fun cleanupSandbox(failure: Throwable?) {
             val current = sandbox ?: return
@@ -1548,7 +1594,7 @@ class SandboxPool internal constructor(
                 val task = run.delayQueue.take()
                 dueTask = task
                 if (!isCurrentRun(run)) {
-                    task.completeCancelled("warmup-dispatcher-stopped")
+                    task.completeCancelled(WarmupReason.POOL_STOPPED)
                     continue
                 }
                 run.warmupExecutor.execute {
@@ -1564,7 +1610,7 @@ class SandboxPool internal constructor(
                 return
             } catch (_: RejectedExecutionException) {
                 if (!isCurrentRun(run)) {
-                    dueTask?.completeCancelled("warmup-executor-stopped")
+                    dueTask?.completeCancelled(WarmupReason.POOL_STOPPED)
                     return
                 }
                 dueTask?.rescheduleAfterRejection()
@@ -1578,7 +1624,7 @@ class SandboxPool internal constructor(
         run: RunContext,
         leaderEpoch: Long,
         sandboxId: String,
-    ): String? {
+    ): WarmupCommitFailure? {
         run.commitLock.lock()
         try {
             val state = lifecycleState.get()
@@ -1587,7 +1633,7 @@ class SandboxPool internal constructor(
                 run.leaderEpoch.get() != leaderEpoch ||
                 (state != LifecycleState.RUNNING && state != LifecycleState.DRAINING)
             ) {
-                return "warmup-stale-run"
+                return WarmupCommitFailure(WarmupReason.STALE_RUN)
             }
             try {
                 ensurePoolNamespaceActive()
@@ -1600,7 +1646,7 @@ class SandboxPool internal constructor(
                         sandboxId,
                         run.generation,
                     )
-                    return "warmup-lock-lost"
+                    return WarmupCommitFailure(WarmupReason.PRIMARY_LOCK_LOST)
                 }
                 stateStore.putIdle(config.poolName, sandboxId)
                 reconcileState.recordSuccess()
@@ -1627,7 +1673,7 @@ class SandboxPool internal constructor(
                     run.generation,
                     failure.message,
                 )
-                return "warmup-commit-failed"
+                return WarmupCommitFailure(WarmupReason.COMMIT_FAILED, failure)
             }
         } finally {
             run.commitLock.unlock()
@@ -1644,14 +1690,17 @@ class SandboxPool internal constructor(
             base + delta
         }
 
-    private enum class WarmupStage {
-        CREATING,
-        CHECKING_READINESS,
-        PREPARING,
-        CHECKING_POST_PREPARE,
-        RENEWING,
-        COMMITTING,
-    }
+    private data class WarmupCommitFailure(
+        val reason: WarmupReason,
+        val error: Throwable? = null,
+    )
+
+    private fun cleanupSource(reason: WarmupReason): String =
+        when (reason) {
+            WarmupReason.CREATE_EXECUTOR_REJECTED -> "warmup-create-dropped"
+            WarmupReason.PRIMARY_LOCK_LOST -> "warmup-lock-lost"
+            else -> "warmup-${reason.value.replace('_', '-')}"
+        }
 
     private enum class HealthStage {
         READINESS,
@@ -2126,7 +2175,7 @@ class SandboxPool internal constructor(
         } finally {
             run.commitLock.unlock()
         }
-        cancelDelayedWarmups(run, "warmup-run-retired")
+        cancelDelayedWarmups(run, WarmupReason.RUN_RETIRED)
     }
 
     /**
