@@ -67,6 +67,7 @@ import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.atomic.LongAdder
 import java.util.concurrent.locks.Condition
 import java.util.concurrent.locks.ReentrantLock
+import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.withLock
 import kotlin.math.ceil
 
@@ -357,7 +358,9 @@ class SandboxPool internal constructor(
                     try {
                         // Linearize the active-run fence with the destructive take against retireRun.
                         // Otherwise an old acquire could pop an idle committed by a restarted run.
-                        run.commitLock.withLock {
+                        // Acquires and warmup commits are mutually safe state-store operations, so
+                        // they share the read side of the lifecycle fence instead of serializing.
+                        run.runFence.readLock().withLock {
                             ensureAcquireRunActive(run)
                             stateStore.tryTakeIdle(poolName, config.acquireMinRemainingTtl)
                         }
@@ -1926,14 +1929,9 @@ class SandboxPool internal constructor(
         leaderEpoch: Long,
         sandboxId: String,
     ): WarmupCommitFailure? {
-        run.commitLock.lock()
+        run.runFence.readLock().lock()
         try {
-            val state = lifecycleState.get()
-            if (!isCurrentRun(run) ||
-                !run.primaryOwned.get() ||
-                run.leaderEpoch.get() != leaderEpoch ||
-                (state != LifecycleState.RUNNING && state != LifecycleState.DRAINING)
-            ) {
+            if (!canCommitWarmup(run, leaderEpoch)) {
                 return WarmupCommitFailure(WarmupReason.STALE_RUN)
             }
             try {
@@ -1948,6 +1946,12 @@ class SandboxPool internal constructor(
                         run.generation,
                     )
                     return WarmupCommitFailure(WarmupReason.PRIMARY_LOCK_LOST)
+                }
+                // Primary ownership may change concurrently with the remote renewal (for example,
+                // when the heartbeat observes a lost lease). Re-check the local run fence before
+                // publishing the sandbox to idle.
+                if (!canCommitWarmup(run, leaderEpoch)) {
+                    return WarmupCommitFailure(WarmupReason.STALE_RUN)
                 }
                 stateStore.putIdle(config.poolName, sandboxId)
                 reconcileState.recordSuccess()
@@ -1977,8 +1981,19 @@ class SandboxPool internal constructor(
                 return WarmupCommitFailure(WarmupReason.COMMIT_FAILED, failure)
             }
         } finally {
-            run.commitLock.unlock()
+            run.runFence.readLock().unlock()
         }
+    }
+
+    private fun canCommitWarmup(
+        run: RunContext,
+        leaderEpoch: Long,
+    ): Boolean {
+        val state = lifecycleState.get()
+        return isCurrentRun(run) &&
+            run.primaryOwned.get() &&
+            run.leaderEpoch.get() == leaderEpoch &&
+            (state == LifecycleState.RUNNING || state == LifecycleState.DRAINING)
     }
 
     private fun saturatedAdd(
@@ -2467,14 +2482,14 @@ class SandboxPool internal constructor(
 
     private fun retireRun(run: RunContext?) {
         if (run == null) return
-        run.commitLock.lock()
+        run.runFence.writeLock().lock()
         try {
             run.active.set(false)
             if (currentRun === run) {
                 currentRun = null
             }
         } finally {
-            run.commitLock.unlock()
+            run.runFence.writeLock().unlock()
         }
         cancelDelayedWarmups(run, WarmupReason.RUN_RETIRED)
     }
@@ -2483,8 +2498,10 @@ class SandboxPool internal constructor(
      * Internal identity and executors for one start/shutdown lifecycle.
      *
      * Warmup workers capture this context so a task that outlives forced shutdown can only
-     * complete against the scheduler that submitted it. [commitLock] linearizes retirement
-     * with the final primary-lock renewal and idle-store commit.
+     * complete against the scheduler that submitted it. [runFence] linearizes retirement with
+     * destructive idle takes and final warmup commits, while its shared read side allows those
+     * normal operations to proceed concurrently. Fair ordering prevents continuous readers from
+     * starving a queued retirement writer.
      */
     private class RunContext(
         val generation: Long,
@@ -2495,7 +2512,7 @@ class SandboxPool internal constructor(
         warmupConcurrency: Int,
     ) {
         val active = AtomicBoolean(true)
-        val commitLock = ReentrantLock()
+        val runFence = ReentrantReadWriteLock(true)
         val warmingCount = AtomicInteger(0)
         val warmupSubmissionsOpen = AtomicBoolean(true)
         val primaryOwned = AtomicBoolean(false)
