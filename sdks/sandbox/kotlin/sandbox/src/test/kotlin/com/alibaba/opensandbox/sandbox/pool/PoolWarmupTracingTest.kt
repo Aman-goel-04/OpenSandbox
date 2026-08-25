@@ -23,13 +23,16 @@ import com.alibaba.opensandbox.sandbox.domain.pool.PooledSandboxCreator
 import com.alibaba.opensandbox.sandbox.domain.pool.SandboxPreparer
 import com.alibaba.opensandbox.sandbox.infrastructure.pool.InMemoryPoolStateStore
 import com.alibaba.opensandbox.sandbox.internal.PoolTracer
+import com.alibaba.opensandbox.sandbox.transport.RetryPolicy
 import io.mockk.every
 import io.mockk.mockk
 import io.opentelemetry.api.GlobalOpenTelemetry
+import io.opentelemetry.api.OpenTelemetry
 import io.opentelemetry.api.common.AttributeKey
 import io.opentelemetry.api.trace.StatusCode
 import io.opentelemetry.api.trace.propagation.W3CTraceContextPropagator
 import io.opentelemetry.context.propagation.ContextPropagators
+import io.opentelemetry.context.propagation.TextMapPropagator
 import io.opentelemetry.sdk.OpenTelemetrySdk
 import io.opentelemetry.sdk.testing.exporter.InMemorySpanExporter
 import io.opentelemetry.sdk.trace.SdkTracerProvider
@@ -94,7 +97,12 @@ class PoolWarmupTracingTest {
                 .maxIdle(1)
                 .warmupConcurrency(1)
                 .stateStore(store)
-                .connectionConfig(ConnectionConfig.builder().enableTracing().build())
+                .connectionConfig(
+                    ConnectionConfig.builder()
+                        .enableTracing()
+                        .retryPolicy(RetryPolicy.disabled())
+                        .build(),
+                )
                 .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
                 .sandboxCreator(
                     PooledSandboxCreator {
@@ -190,7 +198,12 @@ class PoolWarmupTracingTest {
                 .maxIdle(1)
                 .warmupConcurrency(1)
                 .stateStore(store)
-                .connectionConfig(ConnectionConfig.builder().enableTracing().build())
+                .connectionConfig(
+                    ConnectionConfig.builder()
+                        .enableTracing()
+                        .retryPolicy(RetryPolicy.disabled())
+                        .build(),
+                )
                 .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
                 .sandboxCreator(
                     PooledSandboxCreator {
@@ -235,7 +248,12 @@ class PoolWarmupTracingTest {
                 .maxIdle(1)
                 .warmupConcurrency(1)
                 .stateStore(store)
-                .connectionConfig(ConnectionConfig.builder().enableTracing().build())
+                .connectionConfig(
+                    ConnectionConfig.builder()
+                        .enableTracing()
+                        .retryPolicy(RetryPolicy.disabled())
+                        .build(),
+                )
                 .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
                 .sandboxCreator(
                     PooledSandboxCreator {
@@ -265,10 +283,16 @@ class PoolWarmupTracingTest {
             )
             assertEquals("warmup-dropped-1", root.attributes[AttributeKey.stringKey(PoolTracer.ATTR_SANDBOX_ID)])
             assertEquals(StatusCode.ERROR, root.status.statusCode)
-            assertTrue(
-                spans.any { it.name == PoolTracer.WARMUP_COMMIT_SPAN },
-                "commit phase must still be traced",
+            val commit = spans.single { it.name == PoolTracer.WARMUP_COMMIT_SPAN }
+            assertEquals(
+                "dropped",
+                commit.attributes[AttributeKey.stringKey(PoolTracer.ATTR_RESULT)],
             )
+            assertEquals(
+                "primary_lock_lost",
+                commit.attributes[AttributeKey.stringKey(PoolTracer.ATTR_REASON)],
+            )
+            assertEquals(StatusCode.ERROR, commit.status.statusCode)
         } finally {
             pool.shutdown(graceful = false)
         }
@@ -310,11 +334,79 @@ class PoolWarmupTracingTest {
                 }
             assertEquals(3, attempts.get())
             assertEquals(3L, readiness.attributes[AttributeKey.longKey(PoolTracer.ATTR_HEALTH_ATTEMPT_COUNT)])
+            assertEquals(2L, readiness.attributes[AttributeKey.longKey(PoolTracer.ATTR_HEALTH_FALSE_COUNT)])
+            assertEquals(0L, readiness.attributes[AttributeKey.longKey(PoolTracer.ATTR_HEALTH_EXCEPTION_COUNT)])
             assertEquals("success", readiness.attributes[AttributeKey.stringKey(PoolTracer.ATTR_RESULT)])
             assertTrue(
                 spanExporter.finishedSpanItems.count {
                     it.name == PoolTracer.WARMUP_READINESS_CHECK_SPAN
                 } == 1,
+            )
+        } finally {
+            pool.shutdown(graceful = false)
+        }
+    }
+
+    @Test
+    fun `health summary distinguishes false results from callback exceptions`() {
+        val spanExporter = installSdkTracerProvider()
+        val attempts = AtomicInteger(0)
+        val pool =
+            SandboxPool.builder()
+                .poolName("trace-health-failure-pool")
+                .ownerId("trace-health-failure-owner")
+                .maxIdle(1)
+                .warmupConcurrency(1)
+                .stateStore(InMemoryPoolStateStore())
+                .connectionConfig(
+                    ConnectionConfig.builder()
+                        .enableTracing()
+                        .retryPolicy(RetryPolicy.disabled())
+                        .build(),
+                )
+                .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
+                .sandboxCreator(
+                    PooledSandboxCreator {
+                        mockk<Sandbox>(relaxed = true).also { sandbox ->
+                            every { sandbox.id } returns "warmup-health-failure-${attempts.get()}"
+                        }
+                    },
+                ).warmupHealthCheck {
+                    if (attempts.incrementAndGet() == 1) throw IllegalStateException("probe boom")
+                    false
+                }.warmupHealthCheckInitialDelay(Duration.ZERO)
+                .warmupHealthCheckPollingInterval(Duration.ofMillis(10))
+                .warmupReadyTimeout(Duration.ofMillis(40))
+                .drainTimeout(Duration.ofSeconds(1))
+                .build()
+
+        pool.start()
+        try {
+            awaitCondition {
+                spanExporter.finishedSpanItems.any {
+                    it.name == PoolTracer.WARMUP_READINESS_CHECK_SPAN &&
+                        it.attributes[AttributeKey.stringKey(PoolTracer.ATTR_RESULT)] == "failure"
+                }
+            }
+            val readiness =
+                spanExporter.finishedSpanItems.first {
+                    it.name == PoolTracer.WARMUP_READINESS_CHECK_SPAN &&
+                        it.attributes[AttributeKey.stringKey(PoolTracer.ATTR_RESULT)] == "failure"
+                }
+            assertTrue(readiness.attributes[AttributeKey.longKey(PoolTracer.ATTR_HEALTH_FALSE_COUNT)]!! >= 1L)
+            assertEquals(1L, readiness.attributes[AttributeKey.longKey(PoolTracer.ATTR_HEALTH_EXCEPTION_COUNT)])
+            assertEquals(
+                "callback",
+                readiness.attributes[AttributeKey.stringKey(PoolTracer.ATTR_ERROR_CATEGORY)],
+            )
+            val root =
+                spanExporter.finishedSpanItems.first {
+                    it.name == PoolTracer.WARMUP_ROOT_SPAN &&
+                        it.attributes[AttributeKey.stringKey(PoolTracer.ATTR_REASON)] == "readiness_timeout"
+                }
+            assertEquals(
+                "timeout",
+                root.attributes[AttributeKey.stringKey(PoolTracer.ATTR_ERROR_CATEGORY)],
             )
         } finally {
             pool.shutdown(graceful = false)
@@ -351,6 +443,85 @@ class PoolWarmupTracingTest {
                 spanExporter.finishedSpanItems.isEmpty(),
                 "no spans may be emitted when enableTracing is false",
             )
+        } finally {
+            pool.shutdown(graceful = false)
+        }
+    }
+
+    @Test
+    fun `broken telemetry provider cannot prevent warmup completion`() {
+        val brokenTelemetry = mockk<OpenTelemetry>()
+        every { brokenTelemetry.tracerBuilder(any()) } throws IllegalStateException("otel boom")
+        GlobalOpenTelemetry.set(brokenTelemetry)
+        val store = InMemoryPoolStateStore()
+        val pool =
+            SandboxPool.builder()
+                .poolName("broken-otel-pool")
+                .ownerId("broken-otel-owner")
+                .maxIdle(1)
+                .warmupConcurrency(1)
+                .stateStore(store)
+                .connectionConfig(ConnectionConfig.builder().enableTracing().build())
+                .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
+                .sandboxCreator(
+                    PooledSandboxCreator {
+                        mockk<Sandbox>(relaxed = true).also { sandbox ->
+                            every { sandbox.id } returns "broken-otel-warmup-1"
+                        }
+                    },
+                ).warmupSkipHealthCheck()
+                .drainTimeout(Duration.ofSeconds(1))
+                .build()
+
+        pool.start()
+        try {
+            awaitCondition {
+                store.snapshotCounters("broken-otel-pool").idleCount == 1 &&
+                    pool.snapshot().inFlightOperations == 0
+            }
+        } finally {
+            pool.shutdown(graceful = false)
+        }
+    }
+
+    @Test
+    fun `forced shutdown reports delayed warmup as run retired`() {
+        val spanExporter = installSdkTracerProvider()
+        val created = AtomicInteger(0)
+        val pool =
+            SandboxPool.builder()
+                .poolName("trace-retired-pool")
+                .ownerId("trace-retired-owner")
+                .maxIdle(1)
+                .warmupConcurrency(1)
+                .stateStore(InMemoryPoolStateStore())
+                .connectionConfig(
+                    ConnectionConfig.builder()
+                        .enableTracing()
+                        .retryPolicy(RetryPolicy.disabled())
+                        .build(),
+                )
+                .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
+                .sandboxCreator(
+                    PooledSandboxCreator {
+                        created.incrementAndGet()
+                        mockk<Sandbox>(relaxed = true).also { sandbox ->
+                            every { sandbox.id } returns "retired-warmup-1"
+                        }
+                    },
+                ).warmupHealthCheck { true }
+                .warmupHealthCheckInitialDelay(Duration.ofSeconds(30))
+                .drainTimeout(Duration.ofMillis(100))
+                .build()
+
+        pool.start()
+        try {
+            awaitCondition { created.get() == 1 }
+            pool.shutdown(graceful = false)
+            awaitCondition { spanExporter.finishedSpanItems.any { it.name == PoolTracer.WARMUP_ROOT_SPAN } }
+            val root = spanExporter.finishedSpanItems.single { it.name == PoolTracer.WARMUP_ROOT_SPAN }
+            assertEquals("cancelled", root.attributes[AttributeKey.stringKey(PoolTracer.ATTR_RESULT)])
+            assertEquals("run_retired", root.attributes[AttributeKey.stringKey(PoolTracer.ATTR_REASON)])
         } finally {
             pool.shutdown(graceful = false)
         }
@@ -412,6 +583,35 @@ class PoolWarmupTracingTest {
             }
             disabledSpan.end()
             assertTrue(spanExporter.finishedSpanItems.isNotEmpty())
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun `broken trace propagation cannot fail or duplicate an HTTP request`() {
+        val brokenPropagator = mockk<TextMapPropagator>()
+        every { brokenPropagator.inject<Any>(any(), any(), any()) } throws IllegalStateException("inject boom")
+        val telemetry =
+            OpenTelemetrySdk.builder()
+                .setPropagators(ContextPropagators.create(brokenPropagator))
+                .build()
+        GlobalOpenTelemetry.set(telemetry)
+        openTelemetry = telemetry
+        val server = MockWebServer()
+        try {
+            server.enqueue(MockResponse().setResponseCode(204))
+            HttpClientProvider(
+                ConnectionConfig.builder()
+                    .domain(server.url("/").toString().removeSuffix("/"))
+                    .enableTracing()
+                    .retryPolicy(RetryPolicy.disabled())
+                    .build(),
+            ).use { provider ->
+                provider.httpClient.newCall(Request.Builder().url(server.url("/broken-propagator")).build())
+                    .execute().use { response -> assertEquals(204, response.code) }
+            }
+            assertEquals(1, server.requestCount)
         } finally {
             server.shutdown()
         }

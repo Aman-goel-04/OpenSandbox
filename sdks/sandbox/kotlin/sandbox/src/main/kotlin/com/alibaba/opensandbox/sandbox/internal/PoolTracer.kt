@@ -20,6 +20,7 @@ import com.alibaba.opensandbox.sandbox.config.ConnectionConfig
 import com.alibaba.opensandbox.sandbox.pool.WarmupResult
 import com.alibaba.opensandbox.sandbox.pool.WarmupStage
 import com.alibaba.opensandbox.sandbox.pool.WarmupTerminalOutcome
+import com.alibaba.opensandbox.sandbox.pool.classifyWarmupError
 import io.opentelemetry.api.GlobalOpenTelemetry
 import io.opentelemetry.api.trace.Span
 import io.opentelemetry.api.trace.StatusCode
@@ -68,49 +69,102 @@ internal class PoolTracer private constructor(
         submittedEpochNanos: Long,
     ): WarmupTrace? {
         val t = tracer ?: return null
-        val root =
-            t.spanBuilder(WARMUP_ROOT_SPAN)
-                .setAttribute(ATTR_POOL_NAME, poolName)
-                .setAttribute(ATTR_POOL_OWNER, ownerId)
-                .setAttribute(ATTR_POOL_RUN_GENERATION, runGeneration)
-                .setAttribute(ATTR_POOL_LEADER_EPOCH, leaderEpoch)
-                .setStartTimestamp(submittedEpochNanos, TimeUnit.NANOSECONDS)
-                .startSpan()
-        return WarmupTrace(t, root)
+        return safeTelemetry {
+            val root =
+                t.spanBuilder(WARMUP_ROOT_SPAN)
+                    .setAttribute(ATTR_POOL_NAME, poolName)
+                    .setAttribute(ATTR_POOL_OWNER, ownerId)
+                    .setAttribute(ATTR_POOL_RUN_GENERATION, runGeneration)
+                    .setAttribute(ATTR_POOL_LEADER_EPOCH, leaderEpoch)
+                    .setStartTimestamp(submittedEpochNanos, TimeUnit.NANOSECONDS)
+                    .startSpan()
+            WarmupTrace(t, root)
+        }
     }
 
     /**
      * Runs [block] under a child span of the currently-current span (the
      * warmup root). No-op span when tracing is disabled.
      */
-    internal inline fun <T> withPhaseSpan(
+    internal fun <T> withPhaseSpan(
         spanName: String,
-        crossinline block: () -> T,
+        block: () -> T,
+    ): T = withOutcomePhaseSpan(spanName, { null }, block)
+
+    /**
+     * Variant for phases such as commit that return a domain failure instead
+     * of throwing. A non-null [outcome] marks the child span consistently
+     * with the terminal warmup result.
+     */
+    internal fun <T> withOutcomePhaseSpan(
+        spanName: String,
+        outcome: (T) -> WarmupTerminalOutcome?,
+        block: () -> T,
     ): T {
         val t = tracer ?: return block()
-        val span = t.spanBuilder(spanName).startSpan()
-        val scope = span.makeCurrent()
+        val span = safeTelemetry { t.spanBuilder(spanName).startSpan() } ?: return block()
+        val scope = safeTelemetry { span.makeCurrent() }
         return try {
-            block().also {
-                span.setAttribute(ATTR_RESULT, WarmupResult.SUCCESS.value)
+            block().also { value ->
+                val phaseOutcome = safeTelemetry { outcome(value) }
+                if (phaseOutcome == null) {
+                    safeTelemetry { span.setAttribute(ATTR_RESULT, WarmupResult.SUCCESS.value) }
+                } else {
+                    annotateOutcome(span, phaseOutcome)
+                }
             }
         } catch (failure: Throwable) {
-            span.setAttribute(ATTR_RESULT, WarmupResult.FAILURE.value)
-            span.setStatus(StatusCode.ERROR)
-            span.recordException(failure)
+            safeTelemetry {
+                span.setAttribute(ATTR_RESULT, WarmupResult.FAILURE.value)
+                span.setAttribute(
+                    ATTR_ERROR_CATEGORY,
+                    classifyWarmupError(stageForSpan(spanName), failure)?.value ?: "unclassified",
+                )
+                span.setAttribute(ATTR_ERROR_TYPE, failure.javaClass.name)
+                span.setStatus(StatusCode.ERROR)
+                span.recordException(failure)
+            }
             throw failure
         } finally {
-            safeClose(scope)
-            span.end()
+            scope?.let(::safeClose)
+            safeTelemetry { span.end() }
         }
     }
+
+    private fun annotateOutcome(
+        span: Span,
+        outcome: WarmupTerminalOutcome,
+    ) {
+        safeTelemetry {
+            span.setAttribute(ATTR_STAGE, outcome.stage.value)
+            span.setAttribute(ATTR_RESULT, outcome.result.value)
+            outcome.reason?.let { span.setAttribute(ATTR_REASON, it.value) }
+            outcome.errorCategory?.let { span.setAttribute(ATTR_ERROR_CATEGORY, it.value) }
+            outcome.error?.let { span.setAttribute(ATTR_ERROR_TYPE, it.javaClass.name) }
+            if (outcome.result == WarmupResult.FAILURE || outcome.result == WarmupResult.DROPPED) {
+                span.setStatus(StatusCode.ERROR)
+            }
+            outcome.error?.let(span::recordException)
+        }
+    }
+
+    private fun stageForSpan(spanName: String): WarmupStage =
+        when (spanName) {
+            WARMUP_CREATE_SPAN -> WarmupStage.CREATE
+            WARMUP_READINESS_CHECK_SPAN -> WarmupStage.READINESS
+            WARMUP_PREPARE_SPAN -> WarmupStage.PREPARE
+            WARMUP_POST_PREPARE_CHECK_SPAN -> WarmupStage.POST_PREPARE_READINESS
+            WARMUP_RENEW_SPAN -> WarmupStage.RENEW
+            WARMUP_COMMIT_SPAN -> WarmupStage.COMMIT
+            else -> WarmupStage.ADMISSION
+        }
 
     companion object {
         const val WARMUP_ROOT_SPAN = "pool.warmup"
         const val WARMUP_CREATE_SPAN = "pool.warmup.create"
-        const val WARMUP_READINESS_CHECK_SPAN = "pool.warmup.readiness_check"
+        const val WARMUP_READINESS_CHECK_SPAN = "pool.warmup.readiness"
         const val WARMUP_PREPARE_SPAN = "pool.warmup.prepare"
-        const val WARMUP_POST_PREPARE_CHECK_SPAN = "pool.warmup.post_prepare_check"
+        const val WARMUP_POST_PREPARE_CHECK_SPAN = "pool.warmup.post_prepare_readiness"
         const val WARMUP_RENEW_SPAN = "pool.warmup.renew"
         const val WARMUP_COMMIT_SPAN = "pool.warmup.commit"
 
@@ -124,9 +178,13 @@ internal class PoolTracer private constructor(
         const val ATTR_SANDBOX_ID = "sandbox.id"
         const val ATTR_SANDBOX_IMAGE = "sandbox.image"
         const val ATTR_STAGE = "warmup.stage"
-        const val ATTR_RESULT = "result"
+        const val ATTR_RESULT = "warmup.result"
         const val ATTR_REASON = "warmup.reason"
+        const val ATTR_ERROR_CATEGORY = "warmup.error.category"
+        const val ATTR_ERROR_TYPE = "warmup.error.type"
         const val ATTR_HEALTH_ATTEMPT_COUNT = "warmup.health.attempt_count"
+        const val ATTR_HEALTH_FALSE_COUNT = "warmup.health.false_count"
+        const val ATTR_HEALTH_EXCEPTION_COUNT = "warmup.health.exception_count"
         const val ATTR_SCHEDULER_DELAY_MS = "warmup.scheduler.delay_ms"
 
         @Deprecated("Use ATTR_REASON")
@@ -137,7 +195,9 @@ internal class PoolTracer private constructor(
         fun from(connectionConfig: ConnectionConfig): PoolTracer {
             if (!connectionConfig.enableTracing) return PoolTracer(null)
             return PoolTracer(
-                GlobalOpenTelemetry.get().tracerBuilder(INSTRUMENTATION_NAME).build(),
+                safeTelemetry {
+                    GlobalOpenTelemetry.get().tracerBuilder(INSTRUMENTATION_NAME).build()
+                },
             )
         }
     }
@@ -153,10 +213,10 @@ internal class WarmupTrace internal constructor(
     private val root: Span,
 ) {
     val traceId: String
-        get() = root.spanContext.traceId
+        get() = safeTelemetry { root.spanContext.traceId }.orEmpty()
 
     val spanId: String
-        get() = root.spanContext.spanId
+        get() = safeTelemetry { root.spanContext.spanId }.orEmpty()
 
     /**
      * Runs [block] with this trace's root span current (child spans
@@ -167,13 +227,13 @@ internal class WarmupTrace internal constructor(
     fun <T> withCurrent(block: () -> T): T {
         val prevTrace = safeMdcGet(PoolTracer.MDC_TRACE_ID)
         val prevSpan = safeMdcGet(PoolTracer.MDC_SPAN_ID)
-        safeMdcPut(PoolTracer.MDC_TRACE_ID, traceId)
-        safeMdcPut(PoolTracer.MDC_SPAN_ID, spanId)
-        val scope = root.makeCurrent()
+        traceId.takeIf(String::isNotBlank)?.let { safeMdcPut(PoolTracer.MDC_TRACE_ID, it) }
+        spanId.takeIf(String::isNotBlank)?.let { safeMdcPut(PoolTracer.MDC_SPAN_ID, it) }
+        val scope = safeTelemetry { root.makeCurrent() }
         return try {
             block()
         } finally {
-            safeClose(scope)
+            scope?.let(::safeClose)
             safeMdcRestore(PoolTracer.MDC_TRACE_ID, prevTrace)
             safeMdcRestore(PoolTracer.MDC_SPAN_ID, prevSpan)
         }
@@ -186,27 +246,44 @@ internal class WarmupTrace internal constructor(
         startEpochNanos: Long,
         endEpochNanos: Long,
         attemptCount: Long,
+        falseCount: Long,
+        exceptionCount: Long,
         schedulerDelayNanos: Long,
         result: WarmupResult,
         error: Throwable? = null,
     ) {
         val span =
-            tracer.spanBuilder(spanName)
-                .setParent(Context.root().with(root))
-                .setStartTimestamp(startEpochNanos, TimeUnit.NANOSECONDS)
-                .startSpan()
-        span.setAttribute(PoolTracer.ATTR_STAGE, stage.value)
-        span.setAttribute(PoolTracer.ATTR_RESULT, result.value)
-        span.setAttribute(PoolTracer.ATTR_HEALTH_ATTEMPT_COUNT, attemptCount)
-        span.setAttribute(
-            PoolTracer.ATTR_SCHEDULER_DELAY_MS,
-            schedulerDelayNanos.coerceAtLeast(0L).toDouble() / 1_000_000.0,
-        )
-        if (result == WarmupResult.FAILURE || result == WarmupResult.DROPPED) {
-            span.setStatus(StatusCode.ERROR)
+            safeTelemetry {
+                tracer.spanBuilder(spanName)
+                    .setParent(Context.root().with(root))
+                    .setStartTimestamp(startEpochNanos, TimeUnit.NANOSECONDS)
+                    .startSpan()
+            } ?: return
+        try {
+            safeTelemetry {
+                span.setAttribute(PoolTracer.ATTR_STAGE, stage.value)
+                span.setAttribute(PoolTracer.ATTR_RESULT, result.value)
+                span.setAttribute(PoolTracer.ATTR_HEALTH_ATTEMPT_COUNT, attemptCount)
+                span.setAttribute(PoolTracer.ATTR_HEALTH_FALSE_COUNT, falseCount)
+                span.setAttribute(PoolTracer.ATTR_HEALTH_EXCEPTION_COUNT, exceptionCount)
+                span.setAttribute(
+                    PoolTracer.ATTR_SCHEDULER_DELAY_MS,
+                    schedulerDelayNanos.coerceAtLeast(0L).toDouble() / 1_000_000.0,
+                )
+                error?.let {
+                    classifyWarmupError(stage, it)?.let { category ->
+                        span.setAttribute(PoolTracer.ATTR_ERROR_CATEGORY, category.value)
+                    }
+                    span.setAttribute(PoolTracer.ATTR_ERROR_TYPE, it.javaClass.name)
+                }
+                if (result == WarmupResult.FAILURE || result == WarmupResult.DROPPED) {
+                    span.setStatus(StatusCode.ERROR)
+                }
+                error?.let(span::recordException)
+            }
+        } finally {
+            safeTelemetry { span.end(endEpochNanos, TimeUnit.NANOSECONDS) }
         }
-        error?.let(span::recordException)
-        span.end(endEpochNanos, TimeUnit.NANOSECONDS)
     }
 
     /** Ends the trace once with the task's unified terminal outcome. */
@@ -214,17 +291,22 @@ internal class WarmupTrace internal constructor(
         outcome: WarmupTerminalOutcome,
         image: String?,
     ) {
-        outcome.sandboxId?.let { root.setAttribute(PoolTracer.ATTR_SANDBOX_ID, it) }
-        if (!image.isNullOrBlank()) {
-            root.setAttribute(PoolTracer.ATTR_SANDBOX_IMAGE, image)
+        try {
+            safeTelemetry {
+                outcome.sandboxId?.let { root.setAttribute(PoolTracer.ATTR_SANDBOX_ID, it) }
+                if (!image.isNullOrBlank()) root.setAttribute(PoolTracer.ATTR_SANDBOX_IMAGE, image)
+                root.setAttribute(PoolTracer.ATTR_STAGE, outcome.stage.value)
+                root.setAttribute(PoolTracer.ATTR_RESULT, outcome.result.value)
+                outcome.reason?.let { root.setAttribute(PoolTracer.ATTR_REASON, it.value) }
+                outcome.errorCategory?.let { root.setAttribute(PoolTracer.ATTR_ERROR_CATEGORY, it.value) }
+                outcome.error?.let { root.setAttribute(PoolTracer.ATTR_ERROR_TYPE, it.javaClass.name) }
+                if (outcome.result == WarmupResult.FAILURE || outcome.result == WarmupResult.DROPPED) {
+                    root.setStatus(StatusCode.ERROR)
+                }
+            }
+        } finally {
+            safeTelemetry { root.end() }
         }
-        root.setAttribute(PoolTracer.ATTR_STAGE, outcome.stage.value)
-        root.setAttribute(PoolTracer.ATTR_RESULT, outcome.result.value)
-        outcome.reason?.let { root.setAttribute(PoolTracer.ATTR_REASON, it.value) }
-        if (outcome.result == WarmupResult.FAILURE || outcome.result == WarmupResult.DROPPED) {
-            root.setStatus(StatusCode.ERROR)
-        }
-        root.end()
     }
 }
 
@@ -268,3 +350,10 @@ private fun safeClose(scope: io.opentelemetry.context.Scope) {
         // best-effort
     }
 }
+
+private inline fun <T> safeTelemetry(block: () -> T): T? =
+    try {
+        block()
+    } catch (_: Throwable) {
+        null
+    }

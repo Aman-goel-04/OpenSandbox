@@ -25,6 +25,7 @@ import com.alibaba.opensandbox.sandbox.config.ConnectionConfig
 import com.alibaba.opensandbox.sandbox.domain.pool.PoolCreationSpec
 import com.alibaba.opensandbox.sandbox.domain.pool.PooledSandboxCreator
 import com.alibaba.opensandbox.sandbox.infrastructure.pool.InMemoryPoolStateStore
+import com.alibaba.opensandbox.sandbox.transport.RetryPolicy
 import io.mockk.every
 import io.mockk.mockk
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -42,7 +43,10 @@ class PoolWarmupLoggingTest {
             val pool = successfulPool("log-success-pool", store)
             pool.start()
             try {
-                awaitCondition { store.snapshotCounters("log-success-pool").idleCount == 1 }
+                awaitCondition {
+                    store.snapshotCounters("log-success-pool").idleCount == 1 &&
+                        pool.snapshot().inFlightOperations == 0
+                }
                 pool.logPoolSummaryForTests()
 
                 val terminal =
@@ -59,8 +63,22 @@ class PoolWarmupLoggingTest {
                             it.formattedMessage.contains("pool_name=log-success-pool")
                     }
                 assertEquals(Level.INFO, summary.level)
-                assertTrue(summary.formattedMessage.contains("idle=1 inflight=0 queue=0"))
-                assertTrue(summary.formattedMessage.contains("admitted_delta=1 success_delta=1"))
+                assertTrue(
+                    summary.formattedMessage.contains(
+                        "snapshot_consistency=eventual idle_snapshot=1 inflight_current=0 delay_queue_size=0",
+                    ),
+                )
+                assertTrue(summary.formattedMessage.contains("admission_attempts_delta=1 success_delta=1"))
+
+                pool.logPoolSummaryForTests()
+                assertEquals(
+                    1,
+                    events.count {
+                        it.formattedMessage.startsWith("Pool warmup summary:") &&
+                            it.formattedMessage.contains("pool_name=log-success-pool")
+                    },
+                    "an idle but inactive pool must not emit a periodic heartbeat",
+                )
             } finally {
                 pool.shutdown(graceful = false)
             }
@@ -79,7 +97,11 @@ class PoolWarmupLoggingTest {
                     .maxIdle(1)
                     .warmupConcurrency(1)
                     .stateStore(store)
-                    .connectionConfig(ConnectionConfig.builder().build())
+                    .connectionConfig(
+                        ConnectionConfig.builder()
+                            .retryPolicy(RetryPolicy.disabled())
+                            .build(),
+                    )
                     .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
                     .sandboxCreator(
                         PooledSandboxCreator {
@@ -100,8 +122,49 @@ class PoolWarmupLoggingTest {
                         it.formattedMessage.startsWith("Pool warmup summary:") &&
                             it.formattedMessage.contains("pool_name=log-delayed-pool")
                     }
-                assertTrue(summary.formattedMessage.contains("inflight=1 queue=1"))
-                assertTrue(summary.formattedMessage.contains("stage_readiness=1"))
+                assertTrue(summary.formattedMessage.contains("inflight_current=1 delay_queue_size=1"))
+                assertTrue(summary.formattedMessage.contains("stage_readiness_approx=1"))
+            } finally {
+                pool.shutdown(graceful = false)
+            }
+        }
+    }
+
+    @Test
+    fun `repeated failures are rate limited while summary retains exact deltas`() {
+        withPoolAppender { events ->
+            val pool =
+                SandboxPool.builder()
+                    .poolName("log-rate-limit-pool")
+                    .ownerId("log-owner")
+                    .maxIdle(1)
+                    .warmupConcurrency(1)
+                    .stateStore(InMemoryPoolStateStore())
+                    .connectionConfig(ConnectionConfig.builder().build())
+                    .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
+                    .sandboxCreator(PooledSandboxCreator { throw IllegalStateException("create boom") })
+                    .warmupSkipHealthCheck()
+                    .drainTimeout(Duration.ofSeconds(1))
+                    .build()
+
+            pool.start()
+            try {
+                awaitCondition { pool.snapshot().failureCount >= 2 }
+                pool.logPoolSummaryForTests()
+                val warnings =
+                    events.filter {
+                        it.level == Level.WARN &&
+                            it.formattedMessage.startsWith("Pool warmup terminal:") &&
+                            it.formattedMessage.contains("pool_name=log-rate-limit-pool")
+                    }
+                assertEquals(1, warnings.size)
+                val summary =
+                    events.single {
+                        it.formattedMessage.startsWith("Pool warmup summary:") &&
+                            it.formattedMessage.contains("pool_name=log-rate-limit-pool")
+                    }
+                assertTrue(summary.formattedMessage.contains("failure_delta=2"))
+                assertTrue(summary.formattedMessage.contains("create_failed_delta=2"))
             } finally {
                 pool.shutdown(graceful = false)
             }

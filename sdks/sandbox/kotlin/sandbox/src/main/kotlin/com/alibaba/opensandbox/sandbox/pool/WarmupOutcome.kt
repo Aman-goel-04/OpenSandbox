@@ -16,6 +16,12 @@
 
 package com.alibaba.opensandbox.sandbox.pool
 
+import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxApiException
+import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxConnectionException
+import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxRateLimitException
+import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxReadyTimeoutException
+import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxTimeoutException
+
 /** Stable, internal vocabulary shared by pool warmup tracing and structured logs. */
 internal enum class WarmupStage(
     val value: String,
@@ -53,7 +59,21 @@ internal enum class WarmupReason(
     RUN_RETIRED("run_retired"),
     POOL_STOPPED("pool_stopped"),
     INTERRUPTED("interrupted"),
-    UNKNOWN("unknown"),
+    UNEXPECTED_FAILURE("unexpected_failure"),
+}
+
+internal enum class WarmupErrorCategory(
+    val value: String,
+) {
+    RATE_LIMIT("rate_limit"),
+    HTTP_4XX("http_4xx"),
+    HTTP_5XX("http_5xx"),
+    HTTP_OTHER("http_other"),
+    TIMEOUT("timeout"),
+    CONNECTION("connection"),
+    CALLBACK("callback"),
+    STATE_STORE("state_store"),
+    UNCLASSIFIED("unclassified"),
 }
 
 internal data class WarmupTerminalOutcome(
@@ -62,4 +82,31 @@ internal data class WarmupTerminalOutcome(
     val reason: WarmupReason? = null,
     val error: Throwable? = null,
     val sandboxId: String? = null,
+    val errorCategory: WarmupErrorCategory? = classifyWarmupError(stage, error),
 )
+
+internal fun classifyWarmupError(
+    stage: WarmupStage,
+    error: Throwable?,
+): WarmupErrorCategory? =
+    when (error) {
+        null -> null
+        is SandboxRateLimitException -> WarmupErrorCategory.RATE_LIMIT
+        is SandboxTimeoutException, is SandboxReadyTimeoutException -> WarmupErrorCategory.TIMEOUT
+        is SandboxConnectionException -> WarmupErrorCategory.CONNECTION
+        is SandboxApiException ->
+            when (error.statusCode) {
+                in 400..499 -> WarmupErrorCategory.HTTP_4XX
+                in 500..599 -> WarmupErrorCategory.HTTP_5XX
+                else -> WarmupErrorCategory.HTTP_OTHER
+            }
+        else ->
+            when (stage) {
+                WarmupStage.READINESS,
+                WarmupStage.PREPARE,
+                WarmupStage.POST_PREPARE_READINESS,
+                -> WarmupErrorCategory.CALLBACK
+                WarmupStage.COMMIT -> WarmupErrorCategory.STATE_STORE
+                else -> WarmupErrorCategory.UNCLASSIFIED
+            }
+    }
