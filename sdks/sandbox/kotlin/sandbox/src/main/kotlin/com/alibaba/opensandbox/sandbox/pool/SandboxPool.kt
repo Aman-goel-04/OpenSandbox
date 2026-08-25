@@ -185,6 +185,14 @@ class SandboxPool internal constructor(
     /** Exposed for tests: the resolved upper bound of the elastic create executor. */
     internal fun createExecutorMaxSizeForTests(): Int = createExecutorMaxSize()
 
+    /** Forces the current leader's periodic summary deadline for deterministic log assertions. */
+    internal fun logPoolSummaryForTests() {
+        currentRun?.let { run ->
+            run.nextSummaryNanos.set(0L)
+            maybeLogPoolSummary(run)
+        }
+    }
+
     @Volatile
     private var currentMaxIdle: Int = config.maxIdle
 
