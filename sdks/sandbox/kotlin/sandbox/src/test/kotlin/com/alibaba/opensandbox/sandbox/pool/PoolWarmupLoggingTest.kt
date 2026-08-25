@@ -158,6 +158,10 @@ class PoolWarmupLoggingTest {
                             it.formattedMessage.contains("pool_name=log-rate-limit-pool")
                     }
                 assertEquals(1, warnings.size)
+                val warning = warnings.single()
+                assertTrue(warning.formattedMessage.contains("error=create boom"))
+                assertEquals(IllegalStateException::class.java.name, warning.throwableProxy.className)
+                assertEquals("create boom", warning.throwableProxy.message)
                 val summary =
                     events.single {
                         it.formattedMessage.startsWith("Pool warmup summary:") &&
