@@ -60,8 +60,11 @@ import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicIntegerArray
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicLongArray
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.LongAdder
 import java.util.concurrent.locks.Condition
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
@@ -1044,6 +1047,7 @@ class SandboxPool internal constructor(
                         submitWarmups = { count -> submitWarmups(run, count) },
                     )
                 if (!primaryOwned) markPrimaryLost(run)
+                if (primaryOwned) maybeLogPoolSummary(run)
             } catch (e: Exception) {
                 markPrimaryLost(run)
                 throw e
@@ -1052,6 +1056,97 @@ class SandboxPool internal constructor(
             endOperation(run)
         }
     }
+
+    /**
+     * Emits an O(1) leader-side warmup summary without adding a scheduler or scanning the delay
+     * queue. The existing reconcile thread calls this method; all task-stage and outcome values
+     * come from atomic counters maintained on transitions and terminal completion.
+     */
+    private fun maybeLogPoolSummary(run: RunContext) {
+        if (!isCurrentRun(run) || !run.primaryOwned.get()) return
+        val now = System.nanoTime()
+        val due = run.nextSummaryNanos.get()
+        if (now < due || !run.nextSummaryNanos.compareAndSet(due, saturatedAdd(now, POOL_SUMMARY_INTERVAL_NANOS))) {
+            return
+        }
+
+        val admissions = counterDelta(run.admissionCount.sum(), run.lastAdmissionCount)
+        val terminalDeltas =
+            LongArray(WarmupResult.entries.size) { index ->
+                counterDelta(run.terminalCounts[index].sum(), run.lastTerminalCounts, index)
+            }
+        val reasonDeltas =
+            LongArray(WarmupReason.entries.size) { index ->
+                counterDelta(run.reasonCounts[index].sum(), run.lastReasonCounts, index)
+            }
+        val dispatchRejections =
+            counterDelta(run.dispatchRejectionCount.sum(), run.lastDispatchRejectionCount)
+        val healthCompletions =
+            counterDelta(run.healthStageCompletionCount.sum(), run.lastHealthStageCompletionCount)
+        val schedulerDelayNanos =
+            counterDelta(run.healthSchedulerDelayNanos.sum(), run.lastHealthSchedulerDelayNanos)
+
+        val idleCount =
+            try {
+                stateStore.snapshotCounters(config.poolName).idleCount
+            } catch (failure: Exception) {
+                logger.debug(
+                    "Pool warmup summary idle snapshot failed: pool_name={} error={}",
+                    config.poolName,
+                    failure.message,
+                )
+                -1
+            }
+        val warming = run.warmingCount.get()
+        val eventCount = admissions + terminalDeltas.sum() + dispatchRejections
+        if (warming == 0 && idleCount <= 0 && eventCount == 0L) return
+
+        val createPool = run.createExecutor as? ThreadPoolExecutor
+        val warmupPool = run.warmupExecutor as? ThreadPoolExecutor
+        val averageSchedulerDelayMs =
+            if (healthCompletions == 0L) 0.0 else schedulerDelayNanos.toDouble() / healthCompletions / 1_000_000.0
+        logger.info(
+            "Pool warmup summary: pool_name={} run={} idle={} inflight={} queue={} " +
+                "stage_create={} stage_readiness={} stage_prepare={} stage_post_prepare_readiness={} " +
+                "stage_renew={} stage_commit={} create_active={} create_max={} warmup_active={} warmup_max={} " +
+                "admitted_delta={} success_delta={} failure_delta={} dropped_delta={} cancelled_delta={} " +
+                "create_rejected_delta={} dispatch_rejected_delta={} health_scheduler_delay_avg_ms={}",
+            config.poolName,
+            run.generation,
+            idleCount,
+            warming,
+            run.delayQueue.size,
+            run.stageCounts.get(WarmupStage.CREATE.ordinal),
+            run.stageCounts.get(WarmupStage.READINESS.ordinal),
+            run.stageCounts.get(WarmupStage.PREPARE.ordinal),
+            run.stageCounts.get(WarmupStage.POST_PREPARE_READINESS.ordinal),
+            run.stageCounts.get(WarmupStage.RENEW.ordinal),
+            run.stageCounts.get(WarmupStage.COMMIT.ordinal),
+            createPool?.activeCount ?: -1,
+            createPool?.maximumPoolSize ?: -1,
+            warmupPool?.activeCount ?: -1,
+            warmupPool?.maximumPoolSize ?: -1,
+            admissions,
+            terminalDeltas[WarmupResult.SUCCESS.ordinal],
+            terminalDeltas[WarmupResult.FAILURE.ordinal],
+            terminalDeltas[WarmupResult.DROPPED.ordinal],
+            terminalDeltas[WarmupResult.CANCELLED.ordinal],
+            reasonDeltas[WarmupReason.CREATE_EXECUTOR_REJECTED.ordinal],
+            dispatchRejections,
+            averageSchedulerDelayMs,
+        )
+    }
+
+    private fun counterDelta(
+        current: Long,
+        previous: AtomicLong,
+    ): Long = (current - previous.getAndSet(current)).coerceAtLeast(0L)
+
+    private fun counterDelta(
+        current: Long,
+        previous: AtomicLongArray,
+        index: Int,
+    ): Long = (current - previous.getAndSet(index, current)).coerceAtLeast(0L)
 
     private fun runPrimaryHeartbeat(run: RunContext) {
         if (!isCurrentRun(run)) return
@@ -1254,9 +1349,12 @@ class SandboxPool internal constructor(
         private var healthAttemptCount: Long = 0L
         private var healthSchedulerDelayNanos: Long = 0L
         private var healthSummaryPending: Boolean = false
+        private var stageCounted: Boolean = true
 
         init {
             run.warmingCount.incrementAndGet()
+            run.stageCounts.incrementAndGet(WarmupStage.CREATE.ordinal)
+            run.admissionCount.increment()
             run.activeWarmups.add(this)
             beginOperation(run)
         }
@@ -1275,10 +1373,10 @@ class SandboxPool internal constructor(
                 }
                 val now = System.nanoTime()
                 if (config.warmupSkipHealthCheck) {
-                    stage = WarmupStage.PREPARE
+                    transitionTo(WarmupStage.PREPARE)
                     scheduleAt(now)
                 } else {
-                    stage = WarmupStage.READINESS
+                    transitionTo(WarmupStage.READINESS)
                     beginHealthStage()
                     stageDeadlineNanos = saturatedAdd(now, config.warmupReadyTimeout.toNanos())
                     val requestedFirstCheck = saturatedAdd(now, config.warmupHealthCheckInitialDelay.toNanos())
@@ -1328,7 +1426,7 @@ class SandboxPool internal constructor(
                     WarmupStage.CREATE -> error("Create task cannot run on post-create executor")
                     WarmupStage.READINESS -> {
                         if (!runHealthCheck(HealthStage.READINESS)) return
-                        stage = WarmupStage.PREPARE
+                        transitionTo(WarmupStage.PREPARE)
                     }
                     WarmupStage.PREPARE -> {
                         if (!preparerExecuted) {
@@ -1338,10 +1436,10 @@ class SandboxPool internal constructor(
                             }
                         }
                         if (config.warmupPostPrepareHealthCheck == null) {
-                            stage = WarmupStage.RENEW
+                            transitionTo(WarmupStage.RENEW)
                         } else {
                             val now = System.nanoTime()
-                            stage = WarmupStage.POST_PREPARE_READINESS
+                            transitionTo(WarmupStage.POST_PREPARE_READINESS)
                             beginHealthStage()
                             stageDeadlineNanos =
                                 saturatedAdd(now, config.warmupPostPrepareHealthCheckTimeout.toNanos())
@@ -1351,7 +1449,7 @@ class SandboxPool internal constructor(
                     }
                     WarmupStage.POST_PREPARE_READINESS -> {
                         if (!runHealthCheck(HealthStage.POST_PREPARE)) return
-                        stage = WarmupStage.RENEW
+                        transitionTo(WarmupStage.RENEW)
                     }
                     WarmupStage.RENEW -> {
                         val current = requireSandbox()
@@ -1361,7 +1459,7 @@ class SandboxPool internal constructor(
                         val sandboxId = current.id
                         current.close()
                         localResourcesClosed = true
-                        stage = WarmupStage.COMMIT
+                        transitionTo(WarmupStage.COMMIT)
                         val commitFailure =
                             poolTracer.withPhaseSpan(PoolTracer.WARMUP_COMMIT_SPAN) {
                                 commitWarmupSandbox(run, leaderEpoch, sandboxId)
@@ -1463,6 +1561,8 @@ class SandboxPool internal constructor(
                 result = result,
                 error = error,
             )
+            run.healthStageCompletionCount.increment()
+            run.healthSchedulerDelayNanos.add(healthSchedulerDelayNanos)
         }
 
         private fun scheduleAt(nextDueNanos: Long) {
@@ -1532,6 +1632,8 @@ class SandboxPool internal constructor(
 
         private fun completeTerminal(outcome: WarmupTerminalOutcome): String? {
             if (!completed.compareAndSet(false, true)) return null
+            run.terminalCounts[outcome.result.ordinal].increment()
+            outcome.reason?.let { run.reasonCounts[it.ordinal].increment() }
             return withTrace {
                 var cleanupSandboxId: String? = null
                 try {
@@ -1644,6 +1746,7 @@ class SandboxPool internal constructor(
         }
 
         private fun finish() {
+            removeStageCount()
             run.delayQueue.remove(this)
             run.activeWarmups.remove(this)
             run.warmingCount.decrementAndGet()
@@ -1651,6 +1754,21 @@ class SandboxPool internal constructor(
         }
 
         private fun requireSandbox(): Sandbox = checkNotNull(sandbox) { "Warmup sandbox is not available" }
+
+        @Synchronized
+        private fun transitionTo(next: WarmupStage) {
+            if (!stageCounted || completed.get() || stage == next) return
+            run.stageCounts.decrementAndGet(stage.ordinal)
+            stage = next
+            run.stageCounts.incrementAndGet(next.ordinal)
+        }
+
+        @Synchronized
+        private fun removeStageCount() {
+            if (!stageCounted) return
+            stageCounted = false
+            run.stageCounts.decrementAndGet(stage.ordinal)
+        }
 
         private fun canAdvance(): Boolean {
             val state = lifecycleState.get()
@@ -1702,6 +1820,7 @@ class SandboxPool internal constructor(
                     dueTask?.completeCancelled(WarmupReason.POOL_STOPPED)
                     return
                 }
+                run.dispatchRejectionCount.increment()
                 dueTask?.rescheduleAfterRejection()
             } finally {
                 if (permitHeld) run.warmupPermits.release()
@@ -2294,6 +2413,20 @@ class SandboxPool internal constructor(
         val inFlightOperations = AtomicInteger(0)
         val inFlightLock = ReentrantLock()
         val inFlightZero: Condition = inFlightLock.newCondition()
+        val stageCounts = AtomicIntegerArray(WarmupStage.entries.size)
+        val admissionCount = LongAdder()
+        val terminalCounts = Array(WarmupResult.entries.size) { LongAdder() }
+        val reasonCounts = Array(WarmupReason.entries.size) { LongAdder() }
+        val dispatchRejectionCount = LongAdder()
+        val healthStageCompletionCount = LongAdder()
+        val healthSchedulerDelayNanos = LongAdder()
+        val lastAdmissionCount = AtomicLong(0L)
+        val lastTerminalCounts = AtomicLongArray(WarmupResult.entries.size)
+        val lastReasonCounts = AtomicLongArray(WarmupReason.entries.size)
+        val lastDispatchRejectionCount = AtomicLong(0L)
+        val lastHealthStageCompletionCount = AtomicLong(0L)
+        val lastHealthSchedulerDelayNanos = AtomicLong(0L)
+        val nextSummaryNanos = AtomicLong(System.nanoTime() + POOL_SUMMARY_INTERVAL_NANOS)
     }
 
     @Suppress("ktlint:standard:property-naming")
@@ -2317,6 +2450,7 @@ class SandboxPool internal constructor(
 
     companion object {
         private const val RECONCILE_INTERVAL_MS = 1_000L
+        private val POOL_SUMMARY_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(30L)
         private const val CREATE_EXECUTOR_HEADROOM = 1.5
         private const val EXECUTOR_KEEP_ALIVE_SECONDS = 30L
         private const val CANCELLATION_CLEANUP_CONCURRENCY = 4
