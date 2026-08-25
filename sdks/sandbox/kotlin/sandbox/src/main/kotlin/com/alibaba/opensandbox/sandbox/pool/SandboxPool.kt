@@ -1209,7 +1209,7 @@ class SandboxPool internal constructor(
                     config.poolName,
                     e.message,
                 )
-                task.completeAdmissionRejected()
+                task.completeAdmissionRejected(e)
                 return
             }
         }
@@ -1229,7 +1229,14 @@ class SandboxPool internal constructor(
     ) : Runnable, Delayed {
         private val completed = AtomicBoolean(false)
         private var sandbox: Sandbox? = null
-        private var trace: WarmupTrace? = null
+        private val trace: WarmupTrace? =
+            poolTracer.startWarmupRoot(
+                poolName = config.poolName,
+                ownerId = config.ownerId,
+                runGeneration = run.generation,
+                leaderEpoch = leaderEpoch,
+                submittedEpochNanos = submittedEpochNanos,
+            )
 
         @Volatile
         private var stage: WarmupStage = WarmupStage.CREATE
@@ -1242,6 +1249,10 @@ class SandboxPool internal constructor(
         private var preparerExecuted: Boolean = false
         private var localResourcesClosed: Boolean = false
         private var lastHealthCheckError: Throwable? = null
+        private var healthStageStartedEpochNanos: Long = 0L
+        private var healthAttemptCount: Long = 0L
+        private var healthSchedulerDelayNanos: Long = 0L
+        private var healthSummaryPending: Boolean = false
 
         init {
             run.warmingCount.incrementAndGet()
@@ -1250,14 +1261,6 @@ class SandboxPool internal constructor(
         }
 
         override fun run() {
-            trace =
-                poolTracer.startWarmupRoot(
-                    poolName = config.poolName,
-                    ownerId = config.ownerId,
-                    runGeneration = run.generation,
-                    leaderEpoch = leaderEpoch,
-                    submittedEpochNanos = submittedEpochNanos,
-                )
             if (!canAdvance()) {
                 completeCancelled(WarmupReason.STALE_RUN)
                 return
@@ -1275,6 +1278,7 @@ class SandboxPool internal constructor(
                     scheduleAt(now)
                 } else {
                     stage = WarmupStage.READINESS
+                    beginHealthStage()
                     stageDeadlineNanos = saturatedAdd(now, config.warmupReadyTimeout.toNanos())
                     val requestedFirstCheck = saturatedAdd(now, config.warmupHealthCheckInitialDelay.toNanos())
                     finalAttempt = requestedFirstCheck >= stageDeadlineNanos
@@ -1285,12 +1289,13 @@ class SandboxPool internal constructor(
             }
         }
 
-        fun completeAdmissionRejected() {
-            completeDropped(WarmupStage.ADMISSION, WarmupReason.CREATE_EXECUTOR_REJECTED)
+        fun completeAdmissionRejected(failure: Throwable) {
+            completeDropped(WarmupStage.ADMISSION, WarmupReason.CREATE_EXECUTOR_REJECTED, failure)
         }
 
         fun processDue() {
             if (completed.get()) return
+            recordHealthSchedulerDelay()
             if (!canAdvance()) {
                 completeCancelled(WarmupReason.STALE_RUN)
                 return
@@ -1336,6 +1341,7 @@ class SandboxPool internal constructor(
                         } else {
                             val now = System.nanoTime()
                             stage = WarmupStage.POST_PREPARE_READINESS
+                            beginHealthStage()
                             stageDeadlineNanos =
                                 saturatedAdd(now, config.warmupPostPrepareHealthCheckTimeout.toNanos())
                             finalAttempt = false
@@ -1381,39 +1387,81 @@ class SandboxPool internal constructor(
         private fun runHealthCheck(healthStage: HealthStage): Boolean {
             val current = requireSandbox()
             val isFinalAttempt = finalAttempt || System.nanoTime() >= stageDeadlineNanos
-            val spanName =
-                when (healthStage) {
-                    HealthStage.READINESS -> PoolTracer.WARMUP_READINESS_CHECK_SPAN
-                    HealthStage.POST_PREPARE -> PoolTracer.WARMUP_POST_PREPARE_CHECK_SPAN
-                }
+            healthAttemptCount++
             val healthy =
-                poolTracer.withPhaseSpan(spanName) {
-                    try {
-                        val result =
-                            when (healthStage) {
-                                HealthStage.READINESS -> config.warmupHealthCheck?.invoke(current) ?: current.ping()
-                                HealthStage.POST_PREPARE ->
-                                    requireNotNull(config.warmupPostPrepareHealthCheck).invoke(current)
-                            }
-                        lastHealthCheckError = null
-                        result
-                    } catch (failure: Throwable) {
-                        if (failure.isCausedByInterruption() || Thread.currentThread().isInterrupted) throw failure
-                        lastHealthCheckError = failure
-                        false
-                    }
+                try {
+                    val result =
+                        when (healthStage) {
+                            HealthStage.READINESS -> config.warmupHealthCheck?.invoke(current) ?: current.ping()
+                            HealthStage.POST_PREPARE ->
+                                requireNotNull(config.warmupPostPrepareHealthCheck).invoke(current)
+                        }
+                    lastHealthCheckError = null
+                    result
+                } catch (failure: Throwable) {
+                    if (failure.isCausedByInterruption() || Thread.currentThread().isInterrupted) throw failure
+                    lastHealthCheckError = failure
+                    false
                 }
-            if (healthy) return true
+            if (healthy) {
+                endHealthStage(WarmupResult.SUCCESS)
+                return true
+            }
             if (isFinalAttempt) {
                 val stageName = if (healthStage == HealthStage.READINESS) "readiness" else "post-prepare health check"
                 val detail = lastHealthCheckError?.message?.let { "; last error: $it" }.orEmpty()
-                throw SandboxReadyTimeoutException("Pool warmup $stageName timed out$detail")
+                val timeout = SandboxReadyTimeoutException("Pool warmup $stageName timed out$detail")
+                lastHealthCheckError?.let(timeout::initCause)
+                endHealthStage(WarmupResult.FAILURE, lastHealthCheckError ?: timeout)
+                throw timeout
             }
             val completedAt = System.nanoTime()
             val requestedNext = saturatedAdd(completedAt, config.warmupHealthCheckPollingInterval.toNanos())
             finalAttempt = requestedNext >= stageDeadlineNanos
             scheduleAt(minOf(requestedNext, stageDeadlineNanos))
             return false
+        }
+
+        private fun beginHealthStage() {
+            healthStageStartedEpochNanos = submittedEpochNanos()
+            healthAttemptCount = 0L
+            healthSchedulerDelayNanos = 0L
+            healthSummaryPending = true
+        }
+
+        private fun recordHealthSchedulerDelay() {
+            if (!healthSummaryPending || (stage != WarmupStage.READINESS && stage != WarmupStage.POST_PREPARE_READINESS)) {
+                return
+            }
+            healthSchedulerDelayNanos =
+                saturatedAdd(
+                    healthSchedulerDelayNanos,
+                    (System.nanoTime() - dueNanos).coerceAtLeast(0L),
+                )
+        }
+
+        private fun endHealthStage(
+            result: WarmupResult,
+            error: Throwable? = null,
+        ) {
+            if (!healthSummaryPending) return
+            healthSummaryPending = false
+            val spanName =
+                when (stage) {
+                    WarmupStage.READINESS -> PoolTracer.WARMUP_READINESS_CHECK_SPAN
+                    WarmupStage.POST_PREPARE_READINESS -> PoolTracer.WARMUP_POST_PREPARE_CHECK_SPAN
+                    else -> return
+                }
+            trace?.endHealthStage(
+                spanName = spanName,
+                stage = stage,
+                startEpochNanos = healthStageStartedEpochNanos,
+                endEpochNanos = submittedEpochNanos(),
+                attemptCount = healthAttemptCount,
+                schedulerDelayNanos = healthSchedulerDelayNanos,
+                result = result,
+                error = error,
+            )
         }
 
         private fun scheduleAt(nextDueNanos: Long) {
@@ -1485,24 +1533,25 @@ class SandboxPool internal constructor(
             if (!completed.compareAndSet(false, true)) return null
             var cleanupSandboxId: String? = null
             try {
+                if (healthSummaryPending) {
+                    endHealthStage(outcome.result, outcome.error)
+                }
                 when (outcome.result) {
-                    WarmupResult.SUCCESS ->
-                        trace?.endSuccess(requireNotNull(outcome.sandboxId), creationSpec.imageSpec.image)
+                    WarmupResult.SUCCESS -> Unit
                     WarmupResult.FAILURE -> {
                         val failure = requireNotNull(outcome.error)
                         cleanupSandbox(failure)
                         if (isCurrentRun(run) && lifecycleState.get() == LifecycleState.RUNNING) {
                             reconcileState.recordAsyncFailure(failure.message)
                         }
-                        trace?.endFailure(failure)
                         logger.warn("Pool warmup failed: pool_name={}", config.poolName, failure)
                     }
                     WarmupResult.CANCELLED -> {
                         cleanupSandboxId = closeCancelledSandboxLocally()
-                        trace?.endDropped(cleanupSource(requireNotNull(outcome.reason)))
                     }
-                    WarmupResult.DROPPED -> trace?.endDropped(cleanupSource(requireNotNull(outcome.reason)))
+                    WarmupResult.DROPPED -> Unit
                 }
+                trace?.end(outcome, creationSpec.imageSpec.image)
             } finally {
                 finish()
             }

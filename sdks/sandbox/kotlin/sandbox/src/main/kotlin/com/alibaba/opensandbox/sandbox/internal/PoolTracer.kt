@@ -17,9 +17,14 @@
 package com.alibaba.opensandbox.sandbox.internal
 
 import com.alibaba.opensandbox.sandbox.config.ConnectionConfig
+import com.alibaba.opensandbox.sandbox.pool.WarmupResult
+import com.alibaba.opensandbox.sandbox.pool.WarmupStage
+import com.alibaba.opensandbox.sandbox.pool.WarmupTerminalOutcome
 import io.opentelemetry.api.GlobalOpenTelemetry
 import io.opentelemetry.api.trace.Span
+import io.opentelemetry.api.trace.StatusCode
 import io.opentelemetry.api.trace.Tracer
+import io.opentelemetry.context.Context
 import org.slf4j.MDC
 import java.util.concurrent.TimeUnit
 
@@ -71,7 +76,7 @@ internal class PoolTracer private constructor(
                 .setAttribute(ATTR_POOL_LEADER_EPOCH, leaderEpoch)
                 .setStartTimestamp(submittedEpochNanos, TimeUnit.NANOSECONDS)
                 .startSpan()
-        return WarmupTrace(root)
+        return WarmupTrace(t, root)
     }
 
     /**
@@ -86,7 +91,14 @@ internal class PoolTracer private constructor(
         val span = t.spanBuilder(spanName).startSpan()
         val scope = span.makeCurrent()
         return try {
-            block()
+            block().also {
+                span.setAttribute(ATTR_RESULT, WarmupResult.SUCCESS.value)
+            }
+        } catch (failure: Throwable) {
+            span.setAttribute(ATTR_RESULT, WarmupResult.FAILURE.value)
+            span.setStatus(StatusCode.ERROR)
+            span.recordException(failure)
+            throw failure
         } finally {
             safeClose(scope)
             span.end()
@@ -111,8 +123,14 @@ internal class PoolTracer private constructor(
         const val ATTR_POOL_LEADER_EPOCH = "pool.leader.epoch"
         const val ATTR_SANDBOX_ID = "sandbox.id"
         const val ATTR_SANDBOX_IMAGE = "sandbox.image"
+        const val ATTR_STAGE = "warmup.stage"
         const val ATTR_RESULT = "result"
-        const val ATTR_DROP_REASON = "drop.reason"
+        const val ATTR_REASON = "warmup.reason"
+        const val ATTR_HEALTH_ATTEMPT_COUNT = "warmup.health.attempt_count"
+        const val ATTR_SCHEDULER_DELAY_MS = "warmup.scheduler.delay_ms"
+
+        @Deprecated("Use ATTR_REASON")
+        const val ATTR_DROP_REASON = ATTR_REASON
 
         private const val INSTRUMENTATION_NAME = "com.alibaba.opensandbox.sandbox"
 
@@ -131,6 +149,7 @@ internal class PoolTracer private constructor(
  * trace with outcome attributes.
  */
 internal class WarmupTrace internal constructor(
+    private val tracer: Tracer,
     private val root: Span,
 ) {
     val traceId: String
@@ -160,42 +179,52 @@ internal class WarmupTrace internal constructor(
         }
     }
 
-    /** Ends the trace as successful, recording sandbox identity for drill-down. */
-    fun endSuccess(
-        sandboxId: String,
+    /** Emits one backdated summary span for an entire health-check polling stage. */
+    fun endHealthStage(
+        spanName: String,
+        stage: WarmupStage,
+        startEpochNanos: Long,
+        endEpochNanos: Long,
+        attemptCount: Long,
+        schedulerDelayNanos: Long,
+        result: WarmupResult,
+        error: Throwable? = null,
+    ) {
+        val span =
+            tracer.spanBuilder(spanName)
+                .setParent(Context.root().with(root))
+                .setStartTimestamp(startEpochNanos, TimeUnit.NANOSECONDS)
+                .startSpan()
+        span.setAttribute(PoolTracer.ATTR_STAGE, stage.value)
+        span.setAttribute(PoolTracer.ATTR_RESULT, result.value)
+        span.setAttribute(PoolTracer.ATTR_HEALTH_ATTEMPT_COUNT, attemptCount)
+        span.setAttribute(
+            PoolTracer.ATTR_SCHEDULER_DELAY_MS,
+            schedulerDelayNanos.coerceAtLeast(0L).toDouble() / 1_000_000.0,
+        )
+        if (result == WarmupResult.FAILURE || result == WarmupResult.DROPPED) {
+            span.setStatus(StatusCode.ERROR)
+        }
+        error?.let(span::recordException)
+        span.end(endEpochNanos, TimeUnit.NANOSECONDS)
+    }
+
+    /** Ends the trace once with the task's unified terminal outcome. */
+    fun end(
+        outcome: WarmupTerminalOutcome,
         image: String?,
     ) {
-        root.setAttribute(PoolTracer.ATTR_SANDBOX_ID, sandboxId)
+        outcome.sandboxId?.let { root.setAttribute(PoolTracer.ATTR_SANDBOX_ID, it) }
         if (!image.isNullOrBlank()) {
             root.setAttribute(PoolTracer.ATTR_SANDBOX_IMAGE, image)
         }
-        root.setAttribute(PoolTracer.ATTR_RESULT, RESULT_SUCCESS)
+        root.setAttribute(PoolTracer.ATTR_STAGE, outcome.stage.value)
+        root.setAttribute(PoolTracer.ATTR_RESULT, outcome.result.value)
+        outcome.reason?.let { root.setAttribute(PoolTracer.ATTR_REASON, it.value) }
+        if (outcome.result == WarmupResult.FAILURE || outcome.result == WarmupResult.DROPPED) {
+            root.setStatus(StatusCode.ERROR)
+        }
         root.end()
-    }
-
-    /** Ends the trace as failed, recording the failure. */
-    fun endFailure(error: Throwable) {
-        root.recordException(error)
-        root.setAttribute(PoolTracer.ATTR_RESULT, RESULT_FAILURE)
-        root.end()
-    }
-
-    /**
-     * Ends the trace as failed because the warmup outcome could not be
-     * committed (stale run, primary lock lost, or putIdle failure) — the
-     * sandbox never entered the idle pool and is scheduled for cleanup.
-     * [source] matches the pool's cleanup-source values, e.g.
-     * `warmup-lock-lost`.
-     */
-    fun endDropped(source: String) {
-        root.setAttribute(PoolTracer.ATTR_RESULT, RESULT_FAILURE)
-        root.setAttribute(PoolTracer.ATTR_DROP_REASON, source)
-        root.end()
-    }
-
-    private companion object {
-        const val RESULT_SUCCESS = "success"
-        const val RESULT_FAILURE = "failure"
     }
 }
 
