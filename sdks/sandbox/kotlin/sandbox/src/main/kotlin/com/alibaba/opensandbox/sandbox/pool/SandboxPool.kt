@@ -1228,6 +1228,7 @@ class SandboxPool internal constructor(
         private val submittedEpochNanos: Long,
     ) : Runnable, Delayed {
         private val completed = AtomicBoolean(false)
+        private val startedNanos = System.nanoTime()
         private var sandbox: Sandbox? = null
         private val trace: WarmupTrace? =
             poolTracer.startWarmupRoot(
@@ -1531,31 +1532,70 @@ class SandboxPool internal constructor(
 
         private fun completeTerminal(outcome: WarmupTerminalOutcome): String? {
             if (!completed.compareAndSet(false, true)) return null
-            var cleanupSandboxId: String? = null
-            try {
-                if (healthSummaryPending) {
-                    endHealthStage(outcome.result, outcome.error)
-                }
-                when (outcome.result) {
-                    WarmupResult.SUCCESS -> Unit
-                    WarmupResult.FAILURE -> {
-                        val failure = requireNotNull(outcome.error)
-                        cleanupSandbox(failure)
-                        if (isCurrentRun(run) && lifecycleState.get() == LifecycleState.RUNNING) {
-                            reconcileState.recordAsyncFailure(failure.message)
+            return withTrace {
+                var cleanupSandboxId: String? = null
+                try {
+                    if (healthSummaryPending) {
+                        endHealthStage(outcome.result, outcome.error)
+                    }
+                    when (outcome.result) {
+                        WarmupResult.SUCCESS -> Unit
+                        WarmupResult.FAILURE -> {
+                            val failure = requireNotNull(outcome.error)
+                            cleanupSandbox(failure)
+                            if (isCurrentRun(run) && lifecycleState.get() == LifecycleState.RUNNING) {
+                                reconcileState.recordAsyncFailure(failure.message)
+                            }
                         }
-                        logger.warn("Pool warmup failed: pool_name={}", config.poolName, failure)
+                        WarmupResult.CANCELLED -> {
+                            cleanupSandboxId = closeCancelledSandboxLocally()
+                        }
+                        WarmupResult.DROPPED -> Unit
                     }
-                    WarmupResult.CANCELLED -> {
-                        cleanupSandboxId = closeCancelledSandboxLocally()
-                    }
-                    WarmupResult.DROPPED -> Unit
+                    trace?.end(outcome, creationSpec.imageSpec.image)
+                    logTerminalOutcome(outcome)
+                } finally {
+                    finish()
                 }
-                trace?.end(outcome, creationSpec.imageSpec.image)
-            } finally {
-                finish()
+                cleanupSandboxId
             }
-            return cleanupSandboxId
+        }
+
+        private fun logTerminalOutcome(outcome: WarmupTerminalOutcome) {
+            val durationMs = TimeUnit.NANOSECONDS.toMillis((System.nanoTime() - startedNanos).coerceAtLeast(0L))
+            val reason = outcome.reason?.value ?: "none"
+            val message =
+                "Pool warmup terminal: pool_name={} sandbox_id={} run={} stage={} result={} " +
+                    "reason={} duration_ms={}"
+            when (outcome.result) {
+                WarmupResult.SUCCESS, WarmupResult.CANCELLED ->
+                    logger.debug(
+                        message,
+                        config.poolName,
+                        outcome.sandboxId,
+                        run.generation,
+                        outcome.stage.value,
+                        outcome.result.value,
+                        reason,
+                        durationMs,
+                    )
+                WarmupResult.FAILURE, WarmupResult.DROPPED -> {
+                    val failure = outcome.error
+                    logger.warn(
+                        "$message error_type={} error={}",
+                        config.poolName,
+                        outcome.sandboxId,
+                        run.generation,
+                        outcome.stage.value,
+                        outcome.result.value,
+                        reason,
+                        durationMs,
+                        failure?.javaClass?.name,
+                        failure?.message,
+                        failure,
+                    )
+                }
+            }
         }
 
         private fun failureReason(stage: WarmupStage): WarmupReason =
