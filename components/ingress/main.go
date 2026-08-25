@@ -61,22 +61,23 @@ func main() {
 
 	var secure *signature.Verifier
 	var scopeVerifier *routescope.Verifier
+	fastPathEnabled := flag.FastPathEnabled || providerType == sandbox.ProviderTypeFleets
 	if keyStr := strings.TrimSpace(flag.SecureAccessKeys); keyStr != "" {
 		keys, parseErr := signature.ParseKeys(keyStr)
 		if parseErr != nil {
 			log.Panicf("parse secure-access-keys: %v", parseErr)
 		}
 		secure = &signature.Verifier{Keys: keys}
-		if providerType == sandbox.ProviderTypeFleets {
+		if fastPathEnabled {
 			scopeVerifier = &routescope.Verifier{Keys: keys}
 		}
+	}
+	if fastPathEnabled && scopeVerifier == nil {
+		log.Panic("FastPath routing requires --secure-access-keys for authenticated route scopes")
 	}
 
 	var sandboxProvider sandbox.Provider
 	if providerType == sandbox.ProviderTypeFleets {
-		if scopeVerifier == nil {
-			log.Panic("fleets provider requires --secure-access-keys for authenticated route scopes")
-		}
 		sandboxProvider, err = sandbox.NewFleetsProvider(
 			flag.FastPathEndpoint,
 			time.Duration(flag.FastPathWaitTimeoutMillis)*time.Millisecond,
@@ -88,6 +89,17 @@ func main() {
 		cfg.UserAgent = "opensandbox-ingress/" + version.GitCommit
 		providerFactory := sandbox.NewProviderFactory(cfg, time.Second*30)
 		sandboxProvider, err = providerFactory.CreateProvider(providerType)
+		if err == nil && flag.FastPathEnabled {
+			var fleetsProvider *sandbox.FleetsProvider
+			fleetsProvider, err = sandbox.NewFleetsProvider(
+				flag.FastPathEndpoint,
+				time.Duration(flag.FastPathWaitTimeoutMillis)*time.Millisecond,
+				flag.FastPathAccessMode,
+			)
+			if err == nil {
+				sandboxProvider = sandbox.NewCompositeProvider(sandboxProvider, fleetsProvider)
+			}
+		}
 	}
 	if err != nil {
 		log.Panicf("Failed to create sandbox provider: %v", err)

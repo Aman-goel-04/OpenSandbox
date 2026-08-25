@@ -7,10 +7,11 @@ description: HTTP/WebSocket reverse proxy that routes traffic to OpenSandbox ins
 
 ## Overview
 - HTTP/WebSocket reverse proxy that routes to sandbox instances.
-- Resolves sandbox routes using the provider selected by `--provider-type`:
+- Resolves legacy sandbox routes using the Kubernetes provider selected by `--provider-type`:
   - BatchSandbox: reads endpoints from `sandbox.opensandbox.io/endpoints` annotation.
   - AgentSandbox: reads `status.serviceFQDN`.
-  - Fleets: lazily calls FastPath v2 `ResolveEndpoint` when traffic arrives.
+- Can serve fleets routes from the same ingress when `--fastpath-enabled` is set.
+- Fleets routes lazily call FastPath v2 `ResolveEndpoint` when traffic arrives.
 - Exposes `/status.ok` health check; prints build metadata (version, commit, time, Go/platform) at startup.
 
 ## Quick Start
@@ -112,11 +113,30 @@ Port `18080` handles are reserved for SDK compatibility and traffic returns
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--provider-type` | `batchsandbox` | Set to `fleets` for FastPath-backed routing |
+| `--provider-type` | `batchsandbox` | Select the legacy Kubernetes provider, or set to `fleets` for fleets-only routing |
+| `--fastpath-enabled` | `false` | Also serve authenticated fleets routes when a Kubernetes provider is selected |
 | `--fastpath-endpoint` | `fast-sandbox-fastpath.fast-sandbox-system.svc:9090` | FastPath v2 gRPC endpoint |
 | `--fastpath-access-mode` | `direct-fastlet-proxy` | Use `central-proxy` when ingress cannot reach Fastlet Pod IPs |
 | `--fastpath-wait-timeout-millis` | `2000` | Bounded readiness wait for one request |
 | `--secure-access-keys` | empty | Shared signing key ring; required for fleets route-scope verification |
+
+With `--provider-type=batchsandbox --fastpath-enabled`, one ingress serves both
+legacy BatchSandbox routes and authenticated fleets routes. The same applies to
+`agent-sandbox`. The verified route format selects the backend explicitly:
+legacy host/URI routes use the Kubernetes provider, while `f1.*` route scopes
+use FastPath. Invalid `f1.*` scopes are rejected and never fall back to the
+legacy provider. `--provider-type=fleets` remains available for deployments
+that do not need Kubernetes-backed routes. BatchSandbox and AgentSandbox remain
+alternative Kubernetes providers; enabling FastPath does not enable both.
+
+For a shared BatchSandbox and fleets ingress:
+
+```bash
+go run main.go \
+  --provider-type batchsandbox \
+  --fastpath-enabled \
+  --secure-access-keys 'a=<base64-secret>'
+```
 
 Direct Fastlet mode bypasses fast-sandbox's central Sandbox Proxy. Restrict
 Fastlet port `5780` so only trusted ingress Pods can reach it. A matching
@@ -168,7 +188,7 @@ TAG=local VERSION=1.2.3 GIT_COMMIT=abc BUILD_TIME=2025-01-01T00:00:00Z bash buil
 - Access to Kubernetes API (in-cluster or via KUBECONFIG).
 - If `--provider-type=batchsandbox`: BatchSandbox CRs in any namespace with `sandbox.opensandbox.io/endpoints` annotation containing Pod IPs.
 - If `--provider-type=agent-sandbox`: AgentSandbox CRs in any namespace with `status.serviceFQDN` populated.
-- If `--provider-type=fleets`: network access to FastPath v2 and a matching
+- If `--provider-type=fleets` or `--fastpath-enabled` is set: network access to FastPath v2 and a matching
   `--secure-access-keys` key ring shared with the OpenSandbox server.
 
 ## Implementation Notes

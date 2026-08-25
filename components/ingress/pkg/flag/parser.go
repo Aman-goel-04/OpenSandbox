@@ -36,6 +36,7 @@ func InitFlags() {
 	flag.IntVar(&RenewIntentMinIntervalSec, "renew-intent-min-interval", 60, "Min seconds between publishing intents for the same sandbox (client-side throttle)")
 
 	flag.StringVar(&SecureAccessKeys, "secure-access-keys", "", "OSEP-0011 and fleets route-scope verification keys: a=base64,b=base64 (comma-separated; key_id is 1 char [0-9a-z])")
+	flag.BoolVar(&FastPathEnabled, "fastpath-enabled", false, "Enable FastPath-backed fleets routing alongside the selected Kubernetes provider")
 	flag.StringVar(&FastPathEndpoint, "fastpath-endpoint", "fast-sandbox-fastpath.fast-sandbox-system.svc:9090", "FastPath v2 gRPC endpoint used by the fleets provider")
 	flag.StringVar(&FastPathAccessMode, "fastpath-access-mode", "direct-fastlet-proxy", "FastPath fleets data-plane mode: central-proxy or direct-fastlet-proxy")
 	flag.IntVar(&FastPathWaitTimeoutMillis, "fastpath-wait-timeout-millis", 2000, "Bounded FastPath readiness wait for one ingress request")

@@ -141,7 +141,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		slogger.Field{Key: "uri", Value: r.RequestURI},
 		slogger.Field{Key: "method", Value: r.Method},
 	).Infof("ingress requested")
-	p.serve(sw, r, sandbox.EndpointTarget{Namespace: host.namespace, SandboxID: host.ingressKey, Port: host.port})
+	p.serve(sw, r, sandbox.EndpointTarget{RouteKind: host.routeKind, Namespace: host.namespace, SandboxID: host.ingressKey, Port: host.port})
 }
 
 func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, target sandbox.EndpointTarget) {
@@ -181,6 +181,9 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, target sandbox.End
 }
 
 func (p *Proxy) upstreamResponseObserver(target sandbox.EndpointTarget) func(*http.Response) {
+	if target.RouteKind != sandbox.RouteKindFleets {
+		return nil
+	}
 	invalidator, ok := p.sandboxProvider.(sandbox.EndpointInvalidator)
 	if !ok {
 		return nil
@@ -206,6 +209,9 @@ func (p *Proxy) upstreamResponseObserver(target sandbox.EndpointTarget) func(*ht
 }
 
 func (p *Proxy) upstreamErrorObserver(target sandbox.EndpointTarget) func(error) {
+	if target.RouteKind != sandbox.RouteKindFleets {
+		return nil
+	}
 	invalidator, ok := p.sandboxProvider.(sandbox.EndpointInvalidator)
 	if !ok {
 		return nil

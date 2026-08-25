@@ -94,7 +94,51 @@ func TestFleetsProxyPreservesPathQueryAndApplicationAuthorization(t *testing.T) 
 
 	require.Equal(t, http.StatusOK, response.Code)
 	require.Equal(t, "ok", response.Body.String())
-	require.Equal(t, sandbox.EndpointTarget{Namespace: "tenant-a", SandboxID: "sandbox-123", Port: sandbox.ExecdPort}, provider.target)
+	require.Equal(t, sandbox.EndpointTarget{RouteKind: sandbox.RouteKindFleets, Namespace: "tenant-a", SandboxID: "sandbox-123", Port: sandbox.ExecdPort}, provider.target)
+}
+
+func TestCompositeProviderServesLegacyAndFleetsRoutes(t *testing.T) {
+	legacyBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Test-Backend", "legacy")
+		w.Header().Set(sandbox.FastSandboxProxyError, "stale_route")
+	}))
+	defer legacyBackend.Close()
+	fleetsBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Test-Backend", "fleets")
+	}))
+	defer fleetsBackend.Close()
+
+	legacyAddress := legacyBackend.Listener.Addr().(*net.TCPAddr)
+	legacy := staticEndpointProvider{byID: map[string]sandbox.EndpointInfo{
+		"legacy-sandbox": {Endpoint: legacyAddress.IP.String()},
+	}}
+	fleets := &fleetsProxyProvider{info: &sandbox.EndpointInfo{UpstreamURL: fleetsBackend.URL}}
+	provider := sandbox.NewCompositeProvider(legacy, fleets)
+	ingress := httptest.NewServer(NewProxy(
+		context.Background(),
+		provider,
+		ModeHeader,
+		nil,
+		nil,
+		&routescope.Verifier{Keys: map[string][]byte{"k": []byte("shared-secret")}},
+	))
+	defer ingress.Close()
+
+	legacyRoute := fmt.Sprintf("legacy-sandbox-%d", legacyAddress.Port)
+	for _, test := range []struct {
+		route   string
+		backend string
+	}{{legacyRoute, "legacy"}, {fleetsScopeVector, "fleets"}, {legacyRoute, "legacy"}} {
+		request, err := http.NewRequest(http.MethodGet, ingress.URL, nil)
+		require.NoError(t, err)
+		request.Header.Set(SandboxIngress, test.route)
+		response, err := ingress.Client().Do(request)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, response.StatusCode)
+		require.Equal(t, test.backend, response.Header.Get("X-Test-Backend"))
+		require.NoError(t, response.Body.Close())
+	}
+	require.Equal(t, sandbox.RouteKindFleets, fleets.target.RouteKind)
 }
 
 func TestFleetsProxyPreservesEscapedSlashInHeaderPath(t *testing.T) {

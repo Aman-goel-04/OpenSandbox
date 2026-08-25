@@ -113,6 +113,7 @@ func (p *Proxy) doGetSandboxHostDefinition(r *http.Request) (*sandboxHost, int, 
 	}
 
 	endpoint, err := p.sandboxProvider.ResolveEndpoint(r.Context(), sandbox.EndpointTarget{
+		RouteKind: pr.routeKind,
 		Namespace: pr.namespace,
 		SandboxID: pr.sandboxID,
 		Port:      pr.port,
@@ -147,6 +148,7 @@ func (p *Proxy) doGetSandboxHostDefinition(r *http.Request) (*sandboxHost, int, 
 	}
 
 	return &sandboxHost{
+		routeKind:      pr.routeKind,
 		namespace:      pr.namespace,
 		ingressKey:     pr.sandboxID,
 		port:           pr.port,
@@ -181,6 +183,7 @@ func (p *Proxy) parseFleetsScope(token, requestURI string) (parsedRoute, error) 
 		return parsedRoute{}, err
 	}
 	return parsedRoute{
+		routeKind:  sandbox.RouteKindFleets,
 		namespace:  scope.Namespace,
 		sandboxID:  scope.SandboxID,
 		port:       scope.Port,
@@ -202,6 +205,7 @@ func (p *Proxy) parseTargetHostByHeader(r *http.Request) string {
 }
 
 type sandboxHost struct {
+	routeKind      sandbox.RouteKind
 	namespace      string
 	ingressKey     string
 	port           int

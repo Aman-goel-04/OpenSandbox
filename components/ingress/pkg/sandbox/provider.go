@@ -47,7 +47,19 @@ var (
 	ErrTargetUnsupported = errors.New("sandbox target not supported")
 )
 
+// RouteKind identifies the backend selected by the verified ingress route format.
+type RouteKind uint8
+
+const (
+	// RouteKindLegacy is the zero value so existing target construction keeps
+	// selecting the configured Kubernetes provider.
+	RouteKindLegacy RouteKind = iota
+	// RouteKindFleets selects FastPath-backed endpoint resolution.
+	RouteKindFleets
+)
+
 type EndpointTarget struct {
+	RouteKind RouteKind
 	Namespace string
 	SandboxID string
 	Port      int
