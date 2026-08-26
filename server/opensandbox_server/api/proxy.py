@@ -317,8 +317,12 @@ async def _proxy_http_request(
     port: int,
     full_path: str,
 ) -> StreamingResponse:
+    resolve_internal = get_config().proxy.resolve_internal
     endpoint = lifecycle.sandbox_service.get_endpoint(
-        sandbox_id, port, resolve_internal=get_config().proxy.resolve_internal
+        sandbox_id,
+        port,
+        resolve_internal=resolve_internal,
+        use_proxy_host=not resolve_internal,
     )
     _verify_secure_access(endpoint, request.headers)
     _schedule_proxy_renew(request, sandbox_id)
@@ -473,8 +477,12 @@ async def _proxy_websocket_request(
         return
 
     try:
+        resolve_internal = get_config().proxy.resolve_internal
         endpoint = lifecycle.sandbox_service.get_endpoint(
-            sandbox_id, port, resolve_internal=get_config().proxy.resolve_internal
+            sandbox_id,
+            port,
+            resolve_internal=resolve_internal,
+            use_proxy_host=not resolve_internal,
         )
     except HTTPException as exc:
         logger.warning(

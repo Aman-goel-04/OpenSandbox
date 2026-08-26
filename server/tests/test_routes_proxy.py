@@ -158,7 +158,7 @@ def test_proxy_forwards_filtered_headers_and_query(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             assert sandbox_id == "sbx-123"
             assert port == 44772
             assert resolve_internal is True
@@ -231,10 +231,11 @@ def test_proxy_honors_configured_resolve_internal_false(
 ):
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             assert sandbox_id == "sbx-123"
             assert port == 44772
             assert resolve_internal is False
+            assert use_proxy_host is True
             return Endpoint(endpoint="127.0.0.1:51999")
 
     monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
@@ -265,7 +266,7 @@ def test_proxy_preserves_origin_date_and_filters_server_header(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             assert sandbox_id == "sbx-123"
             assert port == 44772
             assert resolve_internal is True
@@ -338,7 +339,7 @@ def test_proxy_rewrites_only_root_relative_redirects(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             assert sandbox_id == "sbx-123"
             assert port == 44772
             assert resolve_internal is True
@@ -370,7 +371,7 @@ def test_proxy_rewrites_root_relative_redirect_with_server_eip_path(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             assert sandbox_id == "sbx-123"
             assert port == 44772
             assert resolve_internal is True
@@ -412,7 +413,7 @@ def test_proxy_root_path_forwards_endpoint_headers_and_query(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             assert sandbox_id == "sbx-123"
             assert port == 44772
             assert resolve_internal is True
@@ -453,7 +454,7 @@ def test_proxy_rejects_missing_secure_access_header(
     """Regression test: requests without the required secure-access token are rejected."""
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             assert sandbox_id == "sbx-123"
             assert port == 44772
             assert resolve_internal is True
@@ -489,7 +490,7 @@ def test_proxy_rejects_mismatched_secure_access_header(
     """Regression test: requests with a wrong secure-access token are rejected."""
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             assert sandbox_id == "sbx-123"
             assert port == 44772
             assert resolve_internal is True
@@ -527,7 +528,7 @@ def test_proxy_allows_valid_secure_access_header(
     """Valid secure-access token passes; header is stripped from forwarded request."""
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             assert sandbox_id == "sbx-123"
             assert port == 44772
             assert resolve_internal is True
@@ -577,7 +578,7 @@ def test_proxy_forwards_get_request_with_query_params(
     """
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             assert sandbox_id == "sbx-123"
             assert port == 44772
             assert resolve_internal is True
@@ -619,7 +620,7 @@ def test_proxy_forwards_delete_request_with_body(
     """
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             return Endpoint(endpoint="10.57.1.91:40109")
 
     monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
@@ -652,7 +653,7 @@ def test_proxy_filters_response_hop_by_hop_headers(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             assert resolve_internal is True
             return Endpoint(endpoint="10.57.1.91:40109")
 
@@ -693,7 +694,7 @@ def test_proxy_streams_raw_body_for_content_encoded_response(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             assert resolve_internal is True
             return Endpoint(endpoint="10.57.1.91:40109")
 
@@ -806,7 +807,7 @@ def test_proxy_rejects_websocket_upgrade(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             return Endpoint(endpoint="10.57.1.91:40109")
 
     monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
@@ -828,7 +829,7 @@ def test_proxy_rejects_websocket_upgrade_for_post_and_mixed_case_header(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             return Endpoint(endpoint="10.57.1.91:40109")
 
     monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
@@ -851,7 +852,7 @@ def test_proxy_websocket_relays_messages_and_forwards_safe_headers(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             assert sandbox_id == "sbx-123"
             assert port == 44772
             assert resolve_internal is True
@@ -917,7 +918,7 @@ def test_proxy_maps_connect_error_to_502(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             return Endpoint(endpoint="10.57.1.91:40109")
 
     monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
@@ -941,7 +942,7 @@ def test_proxy_maps_unexpected_error_to_500(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             return Endpoint(endpoint="10.57.1.91:40109")
 
     monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
@@ -965,7 +966,7 @@ def test_proxy_forwards_18080_without_server_side_egress_auth_check(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             assert port == 18080
             assert resolve_internal is True
             return Endpoint(
@@ -1002,7 +1003,7 @@ def test_proxy_forwards_egress_auth_header_for_18080(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             assert port == 18080
             assert resolve_internal is True
             return Endpoint(endpoint="10.57.1.91:18080")
@@ -1035,7 +1036,7 @@ def test_proxy_active_credential_vault_returns_sidecar_forbidden(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             assert port == 18080
             assert resolve_internal is True
             return Endpoint(endpoint="10.57.1.91:18080")
