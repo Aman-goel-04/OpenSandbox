@@ -36,7 +36,7 @@ from opensandbox_server.services.snapshot_repository import (
     SnapshotListResult,
 )
 
-POSTGRESQL_SCHEMA_LOCK_NAME = "opensandbox-server-snapshot-schema"
+_SCHEMA_LOCK_NAME = "opensandbox-server-snapshot-schema"
 
 _SELECT_COLUMNS = """
     id,
@@ -230,7 +230,7 @@ class PostgreSQLSnapshotRepository:
         with self._pool.connection() as conn:
             conn.execute(
                 "SELECT pg_advisory_xact_lock(hashtext(%s))",
-                (POSTGRESQL_SCHEMA_LOCK_NAME,),
+                (_SCHEMA_LOCK_NAME,),
             )
             conn.execute(
                 """
@@ -283,7 +283,7 @@ class PostgreSQLSnapshotRepository:
             "namespace": record.namespace,
             "name": record.name,
             "description": record.description,
-            "restore_config": Jsonb({"image": record.restore_config.image}),
+            "restore_config": Jsonb(record.restore_config.to_dict()),
             "state": record.status.state.value,
             "reason": record.status.reason,
             "message": record.status.message,
@@ -311,7 +311,7 @@ class PostgreSQLSnapshotRepository:
             namespace=row["namespace"],
             name=row["name"],
             description=row["description"],
-            restore_config=SnapshotRestoreConfig(image=restore_config.get("image")),
+            restore_config=SnapshotRestoreConfig.from_dict(restore_config),
             status=SnapshotStatusRecord(
                 state=SnapshotState(row["state"]),
                 reason=row["reason"],
@@ -324,6 +324,5 @@ class PostgreSQLSnapshotRepository:
 
 
 __all__ = [
-    "POSTGRESQL_SCHEMA_LOCK_NAME",
     "PostgreSQLSnapshotRepository",
 ]

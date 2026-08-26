@@ -162,7 +162,6 @@ jobs:
         working-directory: server
         run: |
           uv sync --all-groups
-          uv run python -c "import os, psycopg; psycopg.connect(os.environ['OPENSANDBOX_TEST_POSTGRESQL_DSN'], connect_timeout=10).close()"
           uv run pytest -v tests/test_snapshot_repository_postgresql.py
 
   required:

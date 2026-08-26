@@ -121,15 +121,11 @@ class SnapshotRepositoryContract:
         assert page.total_items == 1
         assert [item.id for item in page.items] == ["snap-002"]
 
-        tenant_b = repository.list(
-            SnapshotListQuery(page=1, page_size=10, namespace="tenant-b")
-        )
+        tenant_b = repository.list(SnapshotListQuery(page=1, page_size=10, namespace="tenant-b"))
         assert tenant_b.total_items == 1
         assert [item.id for item in tenant_b.items] == ["snap-003"]
 
-        partial_name = repository.list(
-            SnapshotListQuery(page=1, page_size=10, name="name-snap")
-        )
+        partial_name = repository.list(SnapshotListQuery(page=1, page_size=10, name="name-snap"))
         assert partial_name.total_items == 0
         assert partial_name.items == []
 
@@ -186,6 +182,3 @@ class SnapshotRepositoryContract:
         repository.delete(original.id)
         repository.delete(original.id)
         assert repository.get(original.id) is None
-
-
-__all__ = ["SnapshotRepositoryContract", "snapshot_record"]
