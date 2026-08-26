@@ -238,6 +238,9 @@ class SQLiteSnapshotRepository:
         with self._connect() as conn:
             conn.execute("DELETE FROM snapshots WHERE id = ?", (snapshot_id,))
 
+    def close(self) -> None:
+        """SQLite connections are scoped to individual operations."""
+
     def _initialize_schema(self) -> None:
         with self._connect() as conn:
             conn.executescript(
