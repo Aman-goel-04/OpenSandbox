@@ -35,6 +35,7 @@ from websockets.frames import EXTERNAL_CLOSE_CODES
 from websockets.typing import Origin
 
 from opensandbox_server.api import lifecycle
+from opensandbox_server.config import get_config
 from opensandbox_server.api.schema import Endpoint
 from opensandbox_server.middleware.auth import SANDBOX_API_KEY_HEADER
 from opensandbox_server.services.constants import OPEN_SANDBOX_EGRESS_AUTH_HEADER, OPEN_SANDBOX_SECURE_ACCESS_HEADER
@@ -317,7 +318,13 @@ async def _proxy_http_request(
     port: int,
     full_path: str,
 ) -> StreamingResponse:
-    endpoint = lifecycle.sandbox_service.get_endpoint(sandbox_id, port, resolve_internal=True)
+    resolve_internal = get_config().proxy.resolve_internal
+    endpoint = lifecycle.sandbox_service.get_endpoint(
+        sandbox_id,
+        port,
+        resolve_internal=resolve_internal,
+        use_proxy_host=not resolve_internal,
+    )
     _verify_secure_access(endpoint, request.headers)
     _schedule_proxy_renew(request, sandbox_id)
     query_string = request.url.query
@@ -480,7 +487,13 @@ async def _proxy_websocket_request(
         return
 
     try:
-        endpoint = lifecycle.sandbox_service.get_endpoint(sandbox_id, port, resolve_internal=True)
+        resolve_internal = get_config().proxy.resolve_internal
+        endpoint = lifecycle.sandbox_service.get_endpoint(
+            sandbox_id,
+            port,
+            resolve_internal=resolve_internal,
+            use_proxy_host=not resolve_internal,
+        )
     except HTTPException as exc:
         logger.warning(
             "Rejecting websocket proxy request for sandbox=%s port=%s: %s",
