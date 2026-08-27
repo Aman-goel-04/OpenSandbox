@@ -234,19 +234,23 @@ func TestMapFastPathErrorDoesNotExposeInternalDetails(t *testing.T) {
 }
 
 func TestFleetsProviderDoesNotExposeInvalidProxyEndpoint(t *testing.T) {
-	internalEndpoint := "http://10.0.3.17:5780/%zz"
-	resolver := fastPathResolverFunc(func(context.Context, *fastpathv2.ResolveEndpointRequest, ...grpc.CallOption) (*fastpathv2.ResolveEndpointResponse, error) {
-		return &fastpathv2.ResolveEndpointResponse{
-			ProxyEndpoint:        internalEndpoint,
-			RequiredHeaders:      map[string]string{FastSandboxCredential: "credential"},
-			ExpiresAtUnixSeconds: time.Now().Add(time.Minute).Unix(),
-		}, nil
-	})
-	provider := NewFleetsProviderWithResolver(resolver, time.Second, fastpathv2.EndpointAccessMode_DIRECT_FASTLET_PROXY)
-	_, err := provider.ResolveEndpoint(context.Background(), EndpointTarget{Namespace: "tenant-a", SandboxID: "sb", Port: ExecdPort})
-	require.EqualError(t, err, "FastPath returned an invalid proxy endpoint")
-	detailed := err.(interface{ InternalCause() error })
-	require.Contains(t, detailed.InternalCause().Error(), internalEndpoint)
+	for _, internalEndpoint := range []string{"http://10.0.3.17:5780/%zz", "/missing-authority"} {
+		t.Run(internalEndpoint, func(t *testing.T) {
+			resolver := fastPathResolverFunc(func(context.Context, *fastpathv2.ResolveEndpointRequest, ...grpc.CallOption) (*fastpathv2.ResolveEndpointResponse, error) {
+				return &fastpathv2.ResolveEndpointResponse{
+					ProxyEndpoint:        internalEndpoint,
+					RequiredHeaders:      map[string]string{FastSandboxCredential: "credential"},
+					ExpiresAtUnixSeconds: time.Now().Add(time.Minute).Unix(),
+				}, nil
+			})
+			provider := NewFleetsProviderWithResolver(resolver, time.Second, fastpathv2.EndpointAccessMode_DIRECT_FASTLET_PROXY)
+			_, err := provider.ResolveEndpoint(context.Background(), EndpointTarget{Namespace: "tenant-a", SandboxID: "sb", Port: ExecdPort})
+			require.EqualError(t, err, "FastPath returned an invalid proxy endpoint")
+			detailed := err.(interface{ InternalCause() error })
+			require.Contains(t, detailed.InternalCause().Error(), internalEndpoint)
+			require.NotContains(t, detailed.InternalCause().Error(), "%!w")
+		})
+	}
 }
 
 func TestNewFleetsProviderRejectsUnknownAccessMode(t *testing.T) {

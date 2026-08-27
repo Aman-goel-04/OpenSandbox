@@ -58,47 +58,12 @@ func routingResultFromErr(err error) string {
 }
 
 func (p *Proxy) doGetSandboxHostDefinition(r *http.Request) (*sandboxHost, int, error) {
-	var pr parsedRoute
-	var err error
-
-	switch p.mode {
-	case ModeHeader:
-		targetHost := p.parseTargetHostByHeader(r)
-		if targetHost == "" {
-			return nil, http.StatusBadRequest, fmt.Errorf("missing header '%s' or 'Host'", SandboxIngress)
+	pr, status, err := p.parseRequestedRoute(r)
+	if status != 0 {
+		if err == nil {
+			err = errors.New("invalid ingress route")
 		}
-		if routescope.IsToken(targetHost) {
-			pr, err = p.parseFleetsScope(targetHost, "")
-		} else {
-			pr, err = parseHostRoute(targetHost)
-		}
-	case ModeURI:
-		if r.URL == nil || r.URL.Path == "" {
-			return nil, http.StatusBadRequest, errors.New("missing URI path")
-		}
-		trimmed := strings.TrimPrefix(r.URL.Path, "/")
-		first, rest, found := strings.Cut(trimmed, "/")
-		if routescope.IsToken(first) {
-			requestURI := "/"
-			if found && rest != "" {
-				requestURI += rest
-			}
-			pr, err = p.parseFleetsScope(first, requestURI)
-			if err == nil {
-				pr.requestRawPath = escapedPathSuffix(r.URL.EscapedPath(), 1)
-			}
-		} else {
-			pr, err = parseURIRoute(r.URL.Path)
-			if err != nil {
-				break
-			} else if pr.uriParsedAsOSEP {
-				pr.requestRawPath = escapedPathSuffix(r.URL.EscapedPath(), 4)
-			} else {
-				pr.requestRawPath = escapedPathSuffix(r.URL.EscapedPath(), 2)
-			}
-		}
-	default:
-		return nil, http.StatusBadRequest, fmt.Errorf("unknown ingress mode: %s", p.mode)
+		return nil, status, err
 	}
 
 	if err != nil || pr.sandboxID == "" || pr.port == 0 {
@@ -157,6 +122,60 @@ func (p *Proxy) doGetSandboxHostDefinition(r *http.Request) (*sandboxHost, int, 
 		requestURI:     pr.requestURI,
 		requestRawPath: pr.requestRawPath,
 	}, 0, nil
+}
+
+func (p *Proxy) parseRequestedRoute(r *http.Request) (parsedRoute, int, error) {
+	switch p.mode {
+	case ModeHeader:
+		return p.parseRequestedHeaderRoute(r)
+	case ModeURI:
+		return p.parseRequestedURIRoute(r)
+	default:
+		return parsedRoute{}, http.StatusBadRequest, fmt.Errorf("unknown ingress mode: %s", p.mode)
+	}
+}
+
+func (p *Proxy) parseRequestedHeaderRoute(r *http.Request) (parsedRoute, int, error) {
+	targetHost := p.parseTargetHostByHeader(r)
+	if targetHost == "" {
+		return parsedRoute{}, http.StatusBadRequest, fmt.Errorf("missing header '%s' or 'Host'", SandboxIngress)
+	}
+	if routescope.IsToken(targetHost) {
+		pr, err := p.parseFleetsScope(targetHost, "")
+		return pr, 0, err
+	}
+	pr, err := parseHostRoute(targetHost)
+	return pr, 0, err
+}
+
+func (p *Proxy) parseRequestedURIRoute(r *http.Request) (parsedRoute, int, error) {
+	if r.URL == nil || r.URL.Path == "" {
+		return parsedRoute{}, http.StatusBadRequest, errors.New("missing URI path")
+	}
+	trimmed := strings.TrimPrefix(r.URL.Path, "/")
+	first, rest, found := strings.Cut(trimmed, "/")
+	if routescope.IsToken(first) {
+		requestURI := "/"
+		if found && rest != "" {
+			requestURI += rest
+		}
+		pr, err := p.parseFleetsScope(first, requestURI)
+		if err == nil {
+			pr.requestRawPath = escapedPathSuffix(r.URL.EscapedPath(), 1)
+		}
+		return pr, 0, err
+	}
+
+	pr, err := parseURIRoute(r.URL.Path)
+	if err != nil {
+		return pr, 0, err
+	}
+	if pr.uriParsedAsOSEP {
+		pr.requestRawPath = escapedPathSuffix(r.URL.EscapedPath(), 4)
+	} else {
+		pr.requestRawPath = escapedPathSuffix(r.URL.EscapedPath(), 2)
+	}
+	return pr, 0, nil
 }
 
 func escapedPathSuffix(path string, prefixSegments int) string {

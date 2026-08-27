@@ -25,13 +25,16 @@ import (
 	"strings"
 	"time"
 
+	slogger "github.com/alibaba/opensandbox/internal/logger"
+
 	"github.com/alibaba/opensandbox/ingress/pkg/renewintent"
 	"github.com/alibaba/opensandbox/ingress/pkg/routescope"
 	"github.com/alibaba/opensandbox/ingress/pkg/sandbox"
 	"github.com/alibaba/opensandbox/ingress/pkg/signature"
 	"github.com/alibaba/opensandbox/ingress/pkg/telemetry"
-	slogger "github.com/alibaba/opensandbox/internal/logger"
 )
+
+const httpScheme = "http"
 
 type Proxy struct {
 	sandboxProvider      sandbox.Provider
@@ -55,7 +58,7 @@ func NewProxy(_ context.Context, sandboxProvider sandbox.Provider, mode Mode, re
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	sw := &statusCapturingResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
-	proxyType := "http"
+	proxyType := httpScheme
 	if p.isWebSocketRequest(r) {
 		proxyType = "websocket"
 	}
@@ -156,7 +159,7 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, target sandbox.End
 		}
 
 		switch r.URL.Scheme {
-		case "http":
+		case httpScheme:
 			r.URL.Scheme = "ws"
 		case "https":
 			r.URL.Scheme = "wss"
@@ -167,7 +170,7 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, target sandbox.End
 				r.URL.Scheme = "ws"
 			}
 		}
-		websocketProxy := NewWebSocketProxy(r.URL, p.upstreamResponseObserver(target))
+		websocketProxy := NewWebSocketProxy(r.URL, p.upstreamResponseObserver(target)) //nolint:bodyclose // Failed handshake bodies are closed by copyResponse.
 		websocketProxy.errorObserver = p.upstreamErrorObserver(target)
 		websocketProxy.ServeHTTP(w, r)
 	} else {
@@ -175,10 +178,10 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, target sandbox.End
 			if r.TLS != nil {
 				r.URL.Scheme = "https"
 			} else {
-				r.URL.Scheme = "http"
+				r.URL.Scheme = httpScheme
 			}
 		}
-		httpProxy := NewHTTPProxy(p.upstreamResponseObserver(target))
+		httpProxy := NewHTTPProxy(p.upstreamResponseObserver(target)) //nolint:bodyclose // httputil.ReverseProxy owns response bodies.
 		httpProxy.errorObserver = p.upstreamErrorObserver(target)
 		httpProxy.ServeHTTP(w, r)
 	}
@@ -324,7 +327,7 @@ func (w *statusCapturingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, e
 		}
 		return conn, buf, err
 	}
-	return nil, nil, fmt.Errorf("upstream ResponseWriter does not implement http.Hijacker")
+	return nil, nil, errors.New("upstream ResponseWriter does not implement http.Hijacker")
 }
 
 func (w *statusCapturingResponseWriter) Flush() {

@@ -24,12 +24,13 @@ import (
 	"sync"
 	"time"
 
-	fastpathv2 "github.com/alibaba/opensandbox/ingress/pkg/fastpath/v2"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+
+	fastpathv2 "github.com/alibaba/opensandbox/ingress/pkg/fastpath/v2"
 )
 
 const (
@@ -255,9 +256,13 @@ func (p *FleetsProvider) endpointInfo(response *fastpathv2.ResolveEndpointRespon
 	}
 	parsed, err := url.Parse(response.ProxyEndpoint)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		cause := fmt.Errorf("FastPath returned an invalid proxy endpoint %q without scheme or host", response.ProxyEndpoint)
+		if err != nil {
+			cause = fmt.Errorf("FastPath returned an invalid proxy endpoint %q: %w", response.ProxyEndpoint, err)
+		}
 		return nil, &fastPathResolutionError{
 			public: errors.New("FastPath returned an invalid proxy endpoint"),
-			cause:  fmt.Errorf("FastPath returned an invalid proxy endpoint %q: %v", response.ProxyEndpoint, err),
+			cause:  cause,
 		}
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {

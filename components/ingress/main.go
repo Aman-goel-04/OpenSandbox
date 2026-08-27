@@ -22,6 +22,8 @@ import (
 	"strings"
 	"time"
 
+	slogger "github.com/alibaba/opensandbox/internal/logger"
+	"github.com/alibaba/opensandbox/internal/version"
 	"k8s.io/apimachinery/pkg/runtime"
 	"knative.dev/pkg/injection"
 	"knative.dev/pkg/signals"
@@ -33,8 +35,6 @@ import (
 	"github.com/alibaba/opensandbox/ingress/pkg/sandbox"
 	"github.com/alibaba/opensandbox/ingress/pkg/signature"
 	"github.com/alibaba/opensandbox/ingress/pkg/telemetry"
-	slogger "github.com/alibaba/opensandbox/internal/logger"
-	"github.com/alibaba/opensandbox/internal/version"
 )
 
 func main() {

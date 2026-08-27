@@ -57,7 +57,7 @@ type RedisPublisher struct {
 
 func NewRedisPublisher(ctx context.Context, client *redis.Client, cfg RedisPublisherConfig) *RedisPublisher {
 	p := &RedisPublisher{client: client, cfg: cfg, ch: make(chan intentReq, publishChanCap)}
-	for i := 0; i < publishWorkers; i++ {
+	for range publishWorkers {
 		go func() {
 			for {
 				select {
