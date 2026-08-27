@@ -35,16 +35,16 @@ import (
 	"github.com/alibaba/opensandbox/internal/logger"
 	"github.com/alibaba/opensandbox/nodeagent/pkg/api"
 	"github.com/alibaba/opensandbox/nodeagent/pkg/config"
-	"github.com/alibaba/opensandbox/nodeagent/pkg/objectlayout"
 	"github.com/alibaba/opensandbox/nodeagent/pkg/registry"
 	"github.com/alibaba/opensandbox/nodeagent/pkg/state"
 	"github.com/alibaba/opensandbox/nodeagent/pkg/store"
+	"github.com/alibaba/opensandbox/nodeagent/pkg/streamformat"
 	"github.com/fsnotify/fsnotify"
 	"github.com/google/uuid"
 )
 
 const (
-	sourceName = "container-logs"
+	sourceName = api.SourceNameContainerLogs
 	// This must not exceed the state package's on-disk checkpoint limit.
 	maxFingerprintHashBytes = 4096
 )
@@ -60,9 +60,19 @@ func (s *containerLogSource) commitSource(checkpoints []state.FileCheckpoint, st
 }
 
 func init() {
-	registry.RegisterSource(sourceName, func(dependencies registry.Dependencies) (api.Source, error) {
+	registry.RegisterSource(sourceName, func(dependencies registry.SourceDependencies) (api.Source, error) {
+		provider, ok := dependencies.State.(interface {
+			LegacyContainerLogCheckpoint() (state.LegacyContainerLogCheckpoint, error)
+		})
+		if !ok {
+			return nil, errors.New("container-logs Source requires its legacy checkpoint adapter")
+		}
+		checkpoints, err := provider.LegacyContainerLogCheckpoint()
+		if err != nil {
+			return nil, err
+		}
 		cfg := dependencies.Config
-		return newSource(sourceConfig{MaxLineBytes: cfg.MaxLineBytes, PartialTimeout: cfg.PartialTimeout, ReconcileInterval: config.InternalReconcileInterval, EndedStateRetention: cfg.EndedStateRetention, PruneEndedState: pruneEndedState(cfg)}, dependencies.Store, dependencies.State, dependencies.Logger, dependencies.OnError), nil
+		return newSource(sourceConfig{LogRoot: cfg.LogRoot, MaxLineBytes: cfg.MaxLineBytes, PartialTimeout: cfg.PartialTimeout, ReconcileInterval: config.InternalReconcileInterval, EndedStateRetention: cfg.EndedStateRetention, PruneEndedState: pruneEndedState(cfg)}, dependencies.Store, checkpoints, dependencies.Logger, dependencies.OnError), nil
 	})
 }
 
@@ -80,7 +90,10 @@ type checkpointStore interface {
 	DeleteStream(string) error
 }
 
+var _ checkpointStore = state.LegacyContainerLogCheckpoint(nil)
+
 type sourceConfig struct {
+	LogRoot             string
 	MaxLineBytes        int
 	PartialTimeout      time.Duration
 	ReconcileInterval   time.Duration
@@ -113,7 +126,7 @@ type watchIdentity struct {
 
 type streamRuntime struct {
 	mu          sync.Mutex
-	resource    store.Resource
+	resource    streamResource
 	files       map[string]*fileRuntime
 	assembler   *assembler
 	pending     []*pendingSpan
@@ -124,6 +137,12 @@ type streamRuntime struct {
 	stableEOF   int
 	outcome     api.SourceOutcome
 	persisted   state.SourceStream
+}
+
+type streamResource struct {
+	api.Resource
+	Terminated   bool
+	LogDirectory string
 }
 
 type fileRuntime struct {
@@ -317,50 +336,92 @@ func (s *containerLogSource) Acknowledge(_ context.Context, results []api.AckRes
 }
 
 func (s *containerLogSource) AcknowledgeEnd(_ context.Context, token api.EndToken) error {
-	if token.Source != sourceName {
-		return api.Permanent(fmt.Errorf("end token source %q does not match", token.Source))
-	}
-	revision, err := strconv.ParseUint(string(token.Value), 10, 64)
-	if err != nil || revision == 0 {
-		return api.Permanent(errors.New("invalid end token revision"))
+	revision, err := validateEndToken(token)
+	if err != nil {
+		return err
 	}
 	s.mu.Lock()
 	runtime := s.streams[token.StreamRef.ID]
-	s.mu.Unlock()
 	if runtime == nil {
-		return api.Permanent(fmt.Errorf("unknown stream %q", token.StreamRef.ID))
+		persisted, found, err := s.state.GetSourceStream(token.StreamRef.ID)
+		if err != nil {
+			s.mu.Unlock()
+			return err
+		}
+		if !found {
+			s.mu.Unlock()
+			return api.Permanent(fmt.Errorf("unknown stream %q", token.StreamRef.ID))
+		}
+		next, changed, err := s.acknowledgedEndState(persisted, revision, persisted.Resource.LogDirectory)
+		if err != nil {
+			s.mu.Unlock()
+			return err
+		}
+		if changed {
+			err = s.state.PutSourceStream(next)
+		}
+		s.mu.Unlock()
+		return err
 	}
+	s.mu.Unlock()
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
-	if runtime.persisted.AcknowledgedRevision >= revision {
-		return nil
-	}
-	if revision != runtime.revision || runtime.persisted.FinalizingRevision != revision {
-		return api.Permanent(fmt.Errorf("end token revision %d is not the active finalization", revision))
-	}
-	if len(runtime.pending) != 0 {
+	if runtime.persisted.AcknowledgedRevision < revision && len(runtime.pending) != 0 {
 		return api.Permanent(errors.New("cannot acknowledge stream end with unresolved source spans"))
 	}
-	next := runtime.persisted
+	next, changed, err := s.acknowledgedEndState(runtime.persisted, revision, runtime.resource.LogDirectory)
+	if err != nil {
+		return err
+	}
+	if changed {
+		if err := s.state.PutSourceStream(next); err != nil {
+			return err
+		}
+		runtime.persisted = next
+		runtime.endAcked = true
+		runtime.outcome = outcomeFromState(next)
+	}
+	return nil
+}
+
+func validateEndToken(token api.EndToken) (uint64, error) {
+	if token.Source != sourceName {
+		return 0, api.Permanent(fmt.Errorf("end token source %q does not match", token.Source))
+	}
+	if token.StreamRef.ID == "" || token.StreamRef.Kind != api.RecordKindContainerLog {
+		return 0, api.Permanent(errors.New("invalid end token stream reference"))
+	}
+	revision, err := strconv.ParseUint(string(token.Value), 10, 64)
+	if err != nil || revision == 0 || strconv.FormatUint(revision, 10) != string(token.Value) {
+		return 0, api.Permanent(errors.New("invalid end token revision"))
+	}
+	if token.ID != endTokenID(token.StreamRef.ID, token.Value) {
+		return 0, api.Permanent(errors.New("invalid end token ID"))
+	}
+	return revision, nil
+}
+
+func (s *containerLogSource) acknowledgedEndState(current state.SourceStream, revision uint64, logDirectory string) (state.SourceStream, bool, error) {
+	if current.AcknowledgedRevision >= revision {
+		return current, false, nil
+	}
+	if revision != current.Revision || current.FinalizingRevision != revision {
+		return state.SourceStream{}, false, api.Permanent(fmt.Errorf("end token revision %d is not the active finalization", revision))
+	}
+	next := current
 	next.AcknowledgedRevision = revision
 	next.FinalizingRevision = 0
 	next.FinalizingOutcome = nil
 	next.Ended = true
 	if !next.CoverageStartedAt.IsZero() && next.MonitoringEpoch != s.epochID {
-		appendCoverageGapToStream(&next, next.MonitoringEpoch, "monitor-interrupted", runtime.resource.LogDirectory)
+		appendCoverageGapToStream(&next, next.MonitoringEpoch, "monitor-interrupted", logDirectory)
 		next.MonitoringEpoch = s.epochID
 	}
 	if next.RepairDeadline == nil {
 		deadline := time.Now().UTC().Add(s.cfg.EndedStateRetention)
 		next.RepairDeadline = &deadline
 	}
-	if err := s.state.PutSourceStream(next); err != nil {
-		return err
-	}
-	runtime.persisted = next
-	runtime.endAcked = true
-	runtime.outcome = outcomeFromState(next)
-	return nil
+	return next, true, nil
 }
 
 func (r *streamRuntime) pendingForToken(tokenID string, spans []sourceSpan) ([]int, error) {
@@ -1492,7 +1553,7 @@ func (s *containerLogSource) flushExpired(ctx context.Context, now time.Time) {
 	for id, runtime := range s.streams {
 		runtime.mu.Lock()
 		for _, record := range runtime.assembler.expired(now) {
-			expired = append(expired, expiredRecord{streamRef: api.StreamRef{ID: id}, runtime: runtime, record: record})
+			expired = append(expired, expiredRecord{streamRef: api.StreamRef{ID: id, Kind: api.RecordKindContainerLog}, runtime: runtime, record: record})
 		}
 		runtime.mu.Unlock()
 	}
@@ -1534,10 +1595,12 @@ func (s *containerLogSource) emit(ctx context.Context, streamRef api.StreamRef, 
 		runtime.outcome.LossReasons = addReason(runtime.outcome.LossReasons, reason)
 	}
 	resource := runtime.resource.Resource
+	metadata := streamMetadata(runtime.resource)
 	runtime.mu.Unlock()
 	event := api.SourceEvent{Delivery: &api.Delivery{
 		Record:    api.Record{Kind: api.RecordKindContainerLog, Timestamp: record.timestamp, Body: record.body, Resource: resource, Attributes: map[string]string{"source": "container." + record.stream, "stream": record.stream, "log.file.path": record.spans[len(record.spans)-1].Path}},
 		StreamRef: streamRef,
+		Metadata:  metadata,
 		AckToken:  api.AckToken{ID: recordID, Source: sourceName, StreamRef: streamRef, Value: value},
 		RecordID:  recordID,
 	}}
@@ -1552,8 +1615,7 @@ func (s *containerLogSource) emit(ctx context.Context, streamRef api.StreamRef, 
 func (s *containerLogSource) emitEnd(ctx context.Context, streamRef api.StreamRef, runtime *streamRuntime) error {
 	runtime.mu.Lock()
 	value := []byte(strconv.FormatUint(runtime.revision, 10))
-	hash := sha256.Sum256(append([]byte(streamRef.ID), value...))
-	id := hex.EncodeToString(hash[:])
+	id := endTokenID(streamRef.ID, value)
 	next := runtime.persisted
 	replaying := next.FinalizingRevision == runtime.revision
 	next.FinalizingRevision = runtime.revision
@@ -1574,7 +1636,7 @@ func (s *containerLogSource) emitEnd(ctx context.Context, streamRef api.StreamRe
 		runtime.latePending = false
 	}
 	frozenOutcome := api.SourceOutcome{HadDrops: next.FinalizingOutcome.HadDrops, HadSourceGaps: next.FinalizingOutcome.HadSourceGaps, LossReasons: append([]string(nil), next.FinalizingOutcome.LossReasons...)}
-	event := api.SourceEvent{End: &api.StreamEnd{StreamRef: streamRef, EndToken: api.EndToken{ID: id, Source: sourceName, StreamRef: streamRef, Value: value}, Revision: runtime.revision, CoverageStartedAt: next.CoverageStartedAt, Resource: runtime.resource.Resource, Outcome: frozenOutcome}}
+	event := api.SourceEvent{End: &api.StreamEnd{StreamRef: streamRef, EndToken: api.EndToken{ID: id, Source: sourceName, StreamRef: streamRef, Value: value}, Revision: runtime.revision, CoverageStartedAt: next.CoverageStartedAt, Resource: runtime.resource.Resource, Metadata: streamMetadata(runtime.resource), Outcome: frozenOutcome}}
 	runtime.ended = true
 	runtime.endAcked = false
 	runtime.mu.Unlock()
@@ -1584,6 +1646,11 @@ func (s *containerLogSource) emitEnd(ctx context.Context, streamRef api.StreamRe
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+func endTokenID(streamRef string, value []byte) string {
+	hash := sha256.Sum256(append([]byte(streamRef), value...))
+	return hex.EncodeToString(hash[:])
 }
 
 func (s *containerLogSource) finishStream(ctx context.Context, streamRef api.StreamRef, runtime *streamRuntime) error {
@@ -1625,33 +1692,12 @@ func (s *containerLogSource) restoreStreams(ctx context.Context, watcher *fsnoti
 	if err != nil {
 		return err
 	}
-	for _, persisted := range streams {
-		if persisted.Revision == 0 {
-			return api.Permanent(fmt.Errorf("persisted stream %q has revision zero", persisted.StreamRef))
-		}
-		resource := thawResource(persisted.Resource)
-		expectedStreamRef := streamRef(resource).ID
-		if persisted.StreamRef != expectedStreamRef {
-			return api.Permanent(fmt.Errorf("persisted stream_ref %q does not match resource-derived stream_ref %q", persisted.StreamRef, expectedStreamRef))
-		}
-		if _, present := s.store.GetByUID(resource.PodUID); !present && !resource.Terminated {
-			resource.Terminated = true
-			persisted.Resource.Terminated = true
-			if err := s.state.PutSourceStream(persisted); err != nil {
-				return err
-			}
-		}
-		runtime := runtimeFromState(s.cfg, resource, persisted)
-		if err := s.hydrateFiles(runtime); err != nil {
+	for _, listed := range streams {
+		streamRef := api.StreamRef{ID: listed.StreamRef, Kind: api.RecordKindContainerLog}
+		_, resource, runtime, err := s.restoreRuntime(listed.StreamRef)
+		if err != nil {
 			return err
 		}
-		s.mu.Lock()
-		if existing := s.streams[persisted.StreamRef]; existing != nil {
-			runtime = existing
-		} else {
-			s.streams[persisted.StreamRef] = runtime
-		}
-		s.mu.Unlock()
 		leafWatched, discontinuities, watchErr := s.ensureResourceWatches(watcher, resource.LogDirectory)
 		if err := s.recordSharedRootWatchReplacements(resource.LogDirectory, discontinuities); err != nil {
 			return err
@@ -1659,8 +1705,11 @@ func (s *containerLogSource) restoreStreams(ctx context.Context, watcher *fsnoti
 		if err := s.resumeMonitoring(runtime, leafWatched, discontinuities); err != nil {
 			return err
 		}
-		if persisted.FinalizingRevision == runtime.revision && persisted.AcknowledgedRevision < runtime.revision {
-			if err := s.emitEnd(ctx, api.StreamRef{ID: persisted.StreamRef}, runtime); err != nil {
+		runtime.mu.Lock()
+		shouldReplayEnd := runtime.persisted.FinalizingRevision == runtime.revision && runtime.persisted.AcknowledgedRevision < runtime.revision
+		runtime.mu.Unlock()
+		if shouldReplayEnd {
+			if err := s.emitEnd(ctx, streamRef, runtime); err != nil {
 				return err
 			}
 			if watchErr != nil {
@@ -1675,10 +1724,59 @@ func (s *containerLogSource) restoreStreams(ctx context.Context, watcher *fsnoti
 	return nil
 }
 
-func (s *containerLogSource) allResources() []store.Resource {
-	byStream := make(map[string]store.Resource)
+// restoreRuntime re-reads the stream while holding the runtime map lock. This
+// orders startup recovery against AcknowledgeEnd's persistent fallback, so a
+// stale ListSourceStreams snapshot cannot resurrect an unacknowledged runtime.
+func (s *containerLogSource) restoreRuntime(streamID string) (state.SourceStream, streamResource, *streamRuntime, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	persisted, found, err := s.state.GetSourceStream(streamID)
+	if err != nil {
+		return state.SourceStream{}, streamResource{}, nil, err
+	}
+	if !found {
+		return state.SourceStream{}, streamResource{}, nil, api.Permanent(fmt.Errorf("persisted stream %q disappeared during restore", streamID))
+	}
+	if existing := s.streams[persisted.StreamRef]; existing != nil {
+		existing.mu.Lock()
+		current := existing.persisted
+		resource := existing.resource
+		existing.mu.Unlock()
+		return current, resource, existing, nil
+	}
+
+	if persisted.Revision == 0 {
+		return state.SourceStream{}, streamResource{}, nil, api.Permanent(fmt.Errorf("persisted stream %q has revision zero", persisted.StreamRef))
+	}
+	resource := thawResource(persisted.Resource)
+	expectedStreamRef := streamRef(resource).ID
+	if persisted.StreamRef != expectedStreamRef {
+		return state.SourceStream{}, streamResource{}, nil, api.Permanent(fmt.Errorf("persisted stream_ref %q does not match resource-derived stream_ref %q", persisted.StreamRef, expectedStreamRef))
+	}
+	if _, present := s.store.GetByUID(resource.PodUID); !present && !resource.Terminated {
+		resource.Terminated = true
+		persisted.Resource.Terminated = true
+		if err := s.state.PutSourceStream(persisted); err != nil {
+			return state.SourceStream{}, streamResource{}, nil, err
+		}
+	}
+	runtime := runtimeFromState(s.cfg, resource, persisted)
+	if err := s.hydrateFiles(runtime); err != nil {
+		return state.SourceStream{}, streamResource{}, nil, err
+	}
+	s.streams[persisted.StreamRef] = runtime
+	return persisted, resource, runtime, nil
+}
+
+func (s *containerLogSource) allResources() []streamResource {
+	byStream := make(map[string]streamResource)
 	for _, resource := range s.store.List() {
-		byStream[streamRef(resource).ID] = resource
+		resolved := streamResource{
+			Resource:     resource.Resource,
+			Terminated:   resource.Terminated,
+			LogDirectory: filepath.Join(s.cfg.LogRoot, fmt.Sprintf("%s_%s_%s", resource.Namespace, resource.PodName, resource.PodUID), resource.Container),
+		}
+		byStream[streamRef(resolved).ID] = resolved
 	}
 	s.mu.Lock()
 	for id, runtime := range s.streams {
@@ -1689,7 +1787,7 @@ func (s *containerLogSource) allResources() []store.Resource {
 		runtime.mu.Unlock()
 	}
 	s.mu.Unlock()
-	out := make([]store.Resource, 0, len(byStream))
+	out := make([]streamResource, 0, len(byStream))
 	for _, resource := range byStream {
 		out = append(out, resource)
 	}
@@ -1697,7 +1795,7 @@ func (s *containerLogSource) allResources() []store.Resource {
 	return out
 }
 
-func (s *containerLogSource) getOrCreateRuntime(streamRef api.StreamRef, resource store.Resource) (*streamRuntime, error) {
+func (s *containerLogSource) getOrCreateRuntime(streamRef api.StreamRef, resource streamResource) (*streamRuntime, error) {
 	s.mu.Lock()
 	runtime := s.streams[streamRef.ID]
 	s.mu.Unlock()
@@ -1767,7 +1865,7 @@ func (s *containerLogSource) hydrateFiles(runtime *streamRuntime) error {
 	return nil
 }
 
-func runtimeFromState(cfg sourceConfig, resource store.Resource, persisted state.SourceStream) *streamRuntime {
+func runtimeFromState(cfg sourceConfig, resource streamResource, persisted state.SourceStream) *streamRuntime {
 	return &streamRuntime{
 		resource:    resource,
 		files:       make(map[string]*fileRuntime),
@@ -1781,12 +1879,16 @@ func runtimeFromState(cfg sourceConfig, resource store.Resource, persisted state
 	}
 }
 
-func freezeResource(resource store.Resource) state.FrozenResource {
+func freezeResource(resource streamResource) state.FrozenResource {
 	return state.FrozenResource{SandboxID: resource.SandboxID, ClusterName: resource.ClusterName, Namespace: resource.Namespace, PodName: resource.PodName, PodUID: resource.PodUID, NodeName: resource.NodeName, Container: resource.Container, LogDirectory: resource.LogDirectory, Terminated: resource.Terminated}
 }
 
-func thawResource(resource state.FrozenResource) store.Resource {
-	return store.Resource{Resource: api.Resource{SandboxID: resource.SandboxID, ClusterName: resource.ClusterName, Namespace: resource.Namespace, PodName: resource.PodName, PodUID: resource.PodUID, NodeName: resource.NodeName, Container: resource.Container, LogDirectory: resource.LogDirectory}, Terminated: resource.Terminated}
+func thawResource(resource state.FrozenResource) streamResource {
+	return streamResource{Resource: api.Resource{SandboxID: resource.SandboxID, ClusterName: resource.ClusterName, Namespace: resource.Namespace, PodName: resource.PodName, PodUID: resource.PodUID, NodeName: resource.NodeName, Container: resource.Container}, Terminated: resource.Terminated, LogDirectory: resource.LogDirectory}
+}
+
+func streamMetadata(resource streamResource) api.StreamMetadata {
+	return api.StreamMetadata{streamformat.ContainerLogDirectoryMetadata: resource.LogDirectory}
 }
 
 func (s *containerLogSource) runtimeHasNewBytes(runtime *streamRuntime, files []string) (bool, error) {
@@ -2351,8 +2453,8 @@ func (s *containerLogSource) fail(err error) {
 	}
 }
 
-func streamRef(resource store.Resource) api.StreamRef {
-	return api.StreamRef{ID: objectlayout.StreamRef(resource.PodUID, resource.Container)}
+func streamRef(resource streamResource) api.StreamRef {
+	return api.StreamRef{ID: streamformat.ContainerLogStreamID(resource.PodUID, resource.Container), Kind: api.RecordKindContainerLog}
 }
 
 type discoveredFile struct {

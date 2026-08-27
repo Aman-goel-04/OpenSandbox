@@ -19,6 +19,7 @@ package registry
 
 import (
 	"errors"
+	"strings"
 
 	"github.com/alibaba/opensandbox/internal/logger"
 	"github.com/alibaba/opensandbox/nodeagent/pkg/api"
@@ -27,16 +28,32 @@ import (
 	"github.com/alibaba/opensandbox/nodeagent/pkg/store"
 )
 
-type Dependencies struct {
-	Config  config.Config
+// SourceState is the private persistent namespace owned by one Source.
+// Source implementations cannot use it to inspect Pipeline, Sink, or another
+// Source's state.
+type SourceState interface {
+	View(func(state.SourceStateReader) error) error
+	Update(func(state.SourceStateWriter) error) error
+}
+
+type SourceDependencies struct {
+	Config config.Config
+	// Store is an isolated view of the node-local sandbox Pod cache. A Source
+	// must call Store.Forget for each terminated Pod after it no longer needs
+	// that identity; the shared Store retains the Pod until every Source does so.
 	Store   store.View
-	State   *state.DB
+	State   SourceState
 	Logger  logger.Logger
 	OnError func(error)
 }
 
-type sourceFactory func(Dependencies) (api.Source, error)
-type sinkFactory func(Dependencies) (api.Sink, error)
+type SinkDependencies struct {
+	Config config.Config
+	State  *state.DB
+}
+
+type sourceFactory func(SourceDependencies) (api.Source, error)
+type sinkFactory func(SinkDependencies) (api.Sink, error)
 type sinkTargetID func(config.Config) (string, error)
 
 type sinkRegistration struct {
@@ -50,7 +67,7 @@ var (
 )
 
 func RegisterSource(name string, factory sourceFactory) {
-	if name == "" || factory == nil {
+	if name == "" || strings.Contains(name, "/") || factory == nil {
 		panic("nodeagent: invalid Source factory registration")
 	}
 	if _, exists := sources[name]; exists {
@@ -69,9 +86,9 @@ func RegisterSink(name string, targetID sinkTargetID, factory sinkFactory) {
 	sinks[name] = sinkRegistration{targetID: targetID, factory: factory}
 }
 
-func BuildSource(name string, dependencies Dependencies) (api.Source, error) {
+func BuildSource(name string, dependencies SourceDependencies) (api.Source, error) {
 	if dependencies.State == nil || dependencies.Store == nil || dependencies.Logger == nil {
-		return nil, errors.New("source dependencies require State, Store, and Logger")
+		return nil, errors.New("source dependencies require private State, Store, and Logger")
 	}
 	factory := sources[name]
 	if factory == nil {
@@ -88,7 +105,7 @@ func TargetID(name string, cfg config.Config) (string, error) {
 	return registration.targetID(cfg)
 }
 
-func BuildSink(name string, dependencies Dependencies) (api.Sink, error) {
+func BuildSink(name string, dependencies SinkDependencies) (api.Sink, error) {
 	if dependencies.State == nil {
 		return nil, errors.New("sink dependencies require State")
 	}
