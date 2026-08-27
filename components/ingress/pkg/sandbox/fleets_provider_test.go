@@ -17,6 +17,7 @@ package sandbox
 import (
 	"context"
 	"fmt"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -25,6 +26,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 )
 
@@ -38,7 +40,7 @@ func (f *fakeFastPathResolver) ResolveEndpoint(_ context.Context, request *fastp
 	namespace := request.GetSandbox().GetNamespacedName().GetNamespace()
 	return &fastpathv2.ResolveEndpointResponse{
 		ProxyEndpoint:        "http://sandbox-proxy:8080/v2/" + namespace,
-		RequiredHeaders:      map[string]string{FastSandboxCredential: "credential-" + namespace, "Ignored": "value"},
+		RequiredHeaders:      map[string]string{FastSandboxCredential: "credential-" + namespace},
 		ExpiresAtUnixSeconds: f.now.Add(time.Minute).Unix(),
 	}, nil
 }
@@ -54,7 +56,6 @@ func TestFleetsProviderMapsTargetsAndCachesByNamespace(t *testing.T) {
 		info, err := provider.ResolveEndpoint(context.Background(), target)
 		require.NoError(t, err)
 		require.Equal(t, "credential-"+namespace, info.UpstreamHeaders.Get(FastSandboxCredential))
-		require.Equal(t, "value", info.UpstreamHeaders.Get("Ignored"))
 		_, err = provider.ResolveEndpoint(context.Background(), target)
 		require.NoError(t, err)
 	}
@@ -86,7 +87,7 @@ func TestFleetsProviderUsesRawPortAndRefreshesNearExpiry(t *testing.T) {
 	require.Len(t, resolver.requests, 2)
 }
 
-func TestFleetsProviderRemovesExpiredEntriesWhenCachingRoute(t *testing.T) {
+func TestFleetsProviderSweepRemovesExpiredEntries(t *testing.T) {
 	now := time.Unix(2_000_000_000, 0)
 	resolver := &fakeFastPathResolver{now: now}
 	provider := NewFleetsProviderWithResolver(resolver, time.Second, fastpathv2.EndpointAccessMode_DIRECT_FASTLET_PROXY)
@@ -100,9 +101,36 @@ func TestFleetsProviderRemovesExpiredEntriesWhenCachingRoute(t *testing.T) {
 	resolver.now = now
 	_, err = provider.ResolveEndpoint(context.Background(), newTarget)
 	require.NoError(t, err)
+	provider.sweepExpired(now)
 
 	require.NotContains(t, provider.cache, oldTarget)
 	require.Contains(t, provider.cache, newTarget)
+}
+
+func TestWaitForFastPathReady(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	server := grpc.NewServer()
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	t.Cleanup(server.Stop)
+
+	connection, err := grpc.NewClient(listener.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = connection.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	require.NoError(t, waitForFastPathReady(ctx, connection))
+}
+
+func TestWaitForFastPathReadyTimesOut(t *testing.T) {
+	connection, err := grpc.NewClient("passthrough:///127.0.0.1:1", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = connection.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	require.ErrorIs(t, waitForFastPathReady(ctx, connection), context.DeadlineExceeded)
 }
 
 func TestFleetsProviderRejectsPhase1aEgressWithoutRPC(t *testing.T) {
@@ -122,7 +150,9 @@ func TestFleetsProviderRejectsMissingCredential(t *testing.T) {
 	})
 	provider := NewFleetsProviderWithResolver(resolver, time.Second, fastpathv2.EndpointAccessMode_CENTRAL_PROXY)
 	_, err := provider.ResolveEndpoint(context.Background(), EndpointTarget{Namespace: "tenant-a", SandboxID: "sb", Port: 8080})
-	require.EqualError(t, err, fmt.Sprintf("FastPath response is missing %s", FastSandboxCredential))
+	require.EqualError(t, err, "FastPath returned an invalid route credential")
+	detailed := err.(interface{ InternalCause() error })
+	require.EqualError(t, detailed.InternalCause(), fmt.Sprintf("FastPath response is missing %s", FastSandboxCredential))
 }
 
 func TestFleetsProviderAcceptsCaseInsensitiveCredentialHeader(t *testing.T) {
@@ -137,6 +167,44 @@ func TestFleetsProviderAcceptsCaseInsensitiveCredentialHeader(t *testing.T) {
 	info, err := provider.ResolveEndpoint(context.Background(), EndpointTarget{Namespace: "tenant-a", SandboxID: "sb", Port: ExecdPort})
 	require.NoError(t, err)
 	require.Equal(t, "credential", info.UpstreamHeaders.Get(FastSandboxCredential))
+}
+
+func TestFleetsProviderRejectsDuplicateCredentialHeaders(t *testing.T) {
+	resolver := fastPathResolverFunc(func(context.Context, *fastpathv2.ResolveEndpointRequest, ...grpc.CallOption) (*fastpathv2.ResolveEndpointResponse, error) {
+		return &fastpathv2.ResolveEndpointResponse{
+			ProxyEndpoint: "http://fastlet-proxy:5780/v2/sandboxes/uid/components/execd",
+			RequiredHeaders: map[string]string{
+				FastSandboxCredential:             "credential",
+				"x-fast-sandbox-route-credential": "",
+			},
+			ExpiresAtUnixSeconds: time.Now().Add(time.Minute).Unix(),
+		}, nil
+	})
+	provider := NewFleetsProviderWithResolver(resolver, time.Second, fastpathv2.EndpointAccessMode_DIRECT_FASTLET_PROXY)
+	_, err := provider.ResolveEndpoint(context.Background(), EndpointTarget{Namespace: "tenant-a", SandboxID: "sb", Port: ExecdPort})
+	require.EqualError(t, err, "FastPath returned duplicate route credentials")
+}
+
+func TestFleetsProviderRejectsUnsupportedRequiredHeaders(t *testing.T) {
+	for _, header := range []string{"Host", "Authorization"} {
+		t.Run(header, func(t *testing.T) {
+			resolver := fastPathResolverFunc(func(context.Context, *fastpathv2.ResolveEndpointRequest, ...grpc.CallOption) (*fastpathv2.ResolveEndpointResponse, error) {
+				return &fastpathv2.ResolveEndpointResponse{
+					ProxyEndpoint: "http://fastlet-proxy:5780/v2/sandboxes/uid/components/execd",
+					RequiredHeaders: map[string]string{
+						FastSandboxCredential: "credential",
+						header:                "unexpected",
+					},
+					ExpiresAtUnixSeconds: time.Now().Add(time.Minute).Unix(),
+				}, nil
+			})
+			provider := NewFleetsProviderWithResolver(resolver, time.Second, fastpathv2.EndpointAccessMode_DIRECT_FASTLET_PROXY)
+			_, err := provider.ResolveEndpoint(context.Background(), EndpointTarget{Namespace: "tenant-a", SandboxID: "sb", Port: ExecdPort})
+			require.EqualError(t, err, "FastPath returned unsupported required headers")
+			detailed := err.(interface{ InternalCause() error })
+			require.Contains(t, detailed.InternalCause().Error(), header)
+		})
+	}
 }
 
 func TestFleetsProviderRejectsNearExpiryCredential(t *testing.T) {

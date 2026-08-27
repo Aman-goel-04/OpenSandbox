@@ -61,7 +61,7 @@ func main() {
 
 	var secure *signature.Verifier
 	var scopeVerifier *routescope.Verifier
-	fastPathEnabled := flag.FastPathEnabled || providerType == sandbox.ProviderTypeFleets
+	fastPathEnabled := strings.TrimSpace(flag.FastPathEndpoint) != ""
 	if keyStr := strings.TrimSpace(flag.SecureAccessKeys); keyStr != "" {
 		keys, parseErr := signature.ParseKeys(keyStr)
 		if parseErr != nil {
@@ -89,7 +89,7 @@ func main() {
 		cfg.UserAgent = "opensandbox-ingress/" + version.GitCommit
 		providerFactory := sandbox.NewProviderFactory(cfg, time.Second*30)
 		sandboxProvider, err = providerFactory.CreateProvider(providerType)
-		if err == nil && flag.FastPathEnabled {
+		if err == nil && fastPathEnabled {
 			var fleetsProvider *sandbox.FleetsProvider
 			fleetsProvider, err = sandbox.NewFleetsProvider(
 				flag.FastPathEndpoint,

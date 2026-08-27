@@ -36,7 +36,6 @@ var (
 	SecureAccessKeys string
 
 	FastPathEndpoint          string
-	FastPathEnabled           bool
 	FastPathAccessMode        string
 	FastPathWaitTimeoutMillis int
 )

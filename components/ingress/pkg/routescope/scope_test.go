@@ -15,41 +15,17 @@
 package routescope
 
 import (
-	"encoding/base64"
-	"encoding/json"
 	"errors"
-	"os"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
 
-type scopeFixture struct {
-	KeyID        string `json:"key_id"`
-	SecretBase64 string `json:"secret_base64"`
-	Namespace    string `json:"namespace"`
-	SandboxID    string `json:"sandbox_id"`
-	Port         int    `json:"port"`
-	Token        string `json:"token"`
-}
-
-func loadFixture(t *testing.T) (scopeFixture, []byte) {
-	t.Helper()
-	data, err := os.ReadFile("../../../../specs/fixtures/ingress-route-scope-v1.json")
-	require.NoError(t, err)
-	var fixture scopeFixture
-	require.NoError(t, json.Unmarshal(data, &fixture))
-	secret, err := base64.StdEncoding.DecodeString(fixture.SecretBase64)
-	require.NoError(t, err)
-	return fixture, secret
-}
-
 func TestVerifyCrossLanguageVector(t *testing.T) {
-	fixture, secret := loadFixture(t)
-	verifier := &Verifier{Keys: map[string][]byte{fixture.KeyID: secret}}
-	scope, err := verifier.Verify(fixture.Token)
+	verifier := &Verifier{Keys: map[string][]byte{"k": []byte("shared-secret")}}
+	scope, err := verifier.Verify("f1.dGVuYW50LWE.c2FuZGJveC0xMjM.44772.k.uo11HjECmnSuCCRF3v-1AQ")
 	require.NoError(t, err)
-	require.Equal(t, Scope{Namespace: fixture.Namespace, SandboxID: fixture.SandboxID, Port: fixture.Port}, scope)
+	require.Equal(t, Scope{Namespace: "tenant-a", SandboxID: "sandbox-123", Port: 44772}, scope)
 }
 
 func TestVerifyRejectsTamperedNamespace(t *testing.T) {

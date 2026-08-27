@@ -96,7 +96,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	host, status, err := p.getSandboxHostDefinition(r)
 	if err != nil {
-		if detailed, ok := err.(interface{ InternalCause() error }); ok {
+		var detailed interface{ InternalCause() error }
+		if errors.As(err, &detailed) {
 			Logger.With(slogger.Field{Key: "error", Value: detailed.InternalCause()}).Errorf("ingress: provider resolution failed")
 		}
 		if status == 0 {
@@ -128,6 +129,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r.Header.Del(SandboxIngress)
 	r.Header.Del(DeprecatedSandboxIngress)
 	r.Header.Del(signature.OpenSandboxSecureAccessCanonical)
+	r.Header.Del(sandbox.FastSandboxCredential)
+	// Host is carried by r.Host, not r.Header. The Phase 1a Fleets provider
+	// accepts only the Fastlet route credential in UpstreamHeaders.
 	for name, values := range host.info.UpstreamHeaders {
 		r.Header.Del(name)
 		for _, value := range values {
@@ -189,7 +193,7 @@ func (p *Proxy) upstreamResponseObserver(target sandbox.EndpointTarget) func(*ht
 		return nil
 	}
 	return func(response *http.Response) {
-		if !sandbox.IsStaleFastPathResponse(response.Header) {
+		if response.StatusCode < http.StatusBadRequest || !sandbox.IsStaleFastPathResponse(response.Header) {
 			return
 		}
 		invalidator.Invalidate(target)

@@ -164,7 +164,7 @@ func (w *WebSocketProxy) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	// Connect to the backend URL, also pass the headers we get from the requst
 	// together with the Forwarded headers we prepared above.
 	connBackend, resp, err := dialer.Dial(backendURL.String(), requestHeader)
-	if resp != nil && w.responseObserver != nil {
+	if err != nil && resp != nil && w.responseObserver != nil {
 		w.responseObserver(resp)
 	}
 	if err != nil {

@@ -27,6 +27,7 @@ import (
 	fastpathv2 "github.com/alibaba/opensandbox/ingress/pkg/fastpath/v2"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 )
@@ -40,6 +41,8 @@ const (
 	fastSandboxCredentialFail = "credential_rejected"
 	fastSandboxRouteMissing   = "route_unavailable"
 	fastSandboxUpstreamFailed = "upstream_unavailable"
+	fastPathConnectTimeout    = 5 * time.Second
+	routeCacheSweepInterval   = time.Minute
 )
 
 type FastPathResolver interface {
@@ -67,7 +70,8 @@ type FleetsProvider struct {
 }
 
 func NewFleetsProvider(endpoint string, waitTimeout time.Duration, accessMode string) (*FleetsProvider, error) {
-	if strings.TrimSpace(endpoint) == "" {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
 		return nil, errors.New("FastPath endpoint is required")
 	}
 	if waitTimeout > 5*time.Minute {
@@ -77,6 +81,8 @@ func NewFleetsProvider(endpoint string, waitTimeout time.Duration, accessMode st
 	if err != nil {
 		return nil, err
 	}
+	// Phase 1a uses plaintext gRPC inside a NetworkPolicy-isolated cluster.
+	// TLS requires matching server support and is intentionally not implied here.
 	conn, err := grpc.NewClient(endpoint, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return nil, fmt.Errorf("create FastPath client: %w", err)
@@ -115,12 +121,60 @@ func (p *FleetsProvider) Start(ctx context.Context) error {
 		return errors.New("FastPath resolver is required")
 	}
 	if p.connection != nil {
+		connectCtx, cancel := context.WithTimeout(ctx, fastPathConnectTimeout)
+		defer cancel()
+		if err := waitForFastPathReady(connectCtx, p.connection); err != nil {
+			_ = p.connection.Close()
+			return fmt.Errorf("connect to FastPath: %w", err)
+		}
 		go func() {
 			<-ctx.Done()
 			_ = p.connection.Close()
 		}()
 	}
+	go p.runCacheJanitor(ctx)
 	return nil
+}
+
+func waitForFastPathReady(ctx context.Context, connection *grpc.ClientConn) error {
+	connection.Connect()
+	for {
+		state := connection.GetState()
+		switch state {
+		case connectivity.Ready:
+			return nil
+		case connectivity.Shutdown:
+			return errors.New("gRPC channel shut down before becoming ready")
+		case connectivity.Idle:
+			connection.Connect()
+		}
+		if !connection.WaitForStateChange(ctx, state) {
+			return fmt.Errorf("FastPath channel stuck in state %s: %w", state, ctx.Err())
+		}
+	}
+}
+
+func (p *FleetsProvider) runCacheJanitor(ctx context.Context) {
+	ticker := time.NewTicker(routeCacheSweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.sweepExpired(p.now())
+		}
+	}
+}
+
+func (p *FleetsProvider) sweepExpired(now time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for target, info := range p.cache {
+		if !p.fresh(info, now) {
+			delete(p.cache, target)
+		}
+	}
 }
 
 func (*FleetsProvider) RequiresAuthenticatedRouteScope() {}
@@ -163,13 +217,7 @@ func (p *FleetsProvider) ResolveEndpoint(ctx context.Context, target EndpointTar
 	if err != nil {
 		return nil, err
 	}
-	now := p.now()
 	p.mu.Lock()
-	for cachedTarget, cachedInfo := range p.cache {
-		if !p.fresh(cachedInfo, now) {
-			delete(p.cache, cachedTarget)
-		}
-	}
 	p.cache[target] = *info
 	p.mu.Unlock()
 	return info, nil
@@ -219,16 +267,31 @@ func (p *FleetsProvider) endpointInfo(response *fastpathv2.ResolveEndpointRespon
 		}
 	}
 	credential := ""
-	upstreamHeaders := make(http.Header, len(response.RequiredHeaders))
+	seenCredential := false
 	for name, value := range response.RequiredHeaders {
-		upstreamHeaders.Set(name, value)
-		if strings.EqualFold(name, FastSandboxCredential) {
-			credential = value
+		if !strings.EqualFold(name, FastSandboxCredential) {
+			return nil, &fastPathResolutionError{
+				public: errors.New("FastPath returned unsupported required headers"),
+				cause:  fmt.Errorf("FastPath returned unsupported required header %q", name),
+			}
 		}
+		if seenCredential {
+			return nil, &fastPathResolutionError{
+				public: errors.New("FastPath returned duplicate route credentials"),
+				cause:  fmt.Errorf("FastPath returned duplicate %s headers", FastSandboxCredential),
+			}
+		}
+		seenCredential = true
+		credential = value
 	}
 	if credential == "" {
-		return nil, fmt.Errorf("FastPath response is missing %s", FastSandboxCredential)
+		return nil, &fastPathResolutionError{
+			public: errors.New("FastPath returned an invalid route credential"),
+			cause:  fmt.Errorf("FastPath response is missing %s", FastSandboxCredential),
+		}
 	}
+	upstreamHeaders := make(http.Header, 1)
+	upstreamHeaders.Set(FastSandboxCredential, credential)
 	expiresAt := time.Unix(response.ExpiresAtUnixSeconds, 0)
 	if response.ExpiresAtUnixSeconds <= 0 || !p.fresh(EndpointInfo{ExpiresAt: expiresAt}, p.now()) {
 		return nil, errors.New("FastPath returned an expired or near-expiry route credential")
