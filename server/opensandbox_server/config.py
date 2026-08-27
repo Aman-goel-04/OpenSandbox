@@ -1117,7 +1117,7 @@ class StoreConfig(BaseModel):
         default="sqlite",
         description=(
             "Server persistence backend type. SQLite is the default local persistent backend; "
-            "PostgreSQL provides shared persistence across server instances."
+            "PostgreSQL provides external persistence."
         ),
     )
     path: str = Field(

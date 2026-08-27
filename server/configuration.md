@@ -287,8 +287,9 @@ the same backend.
 
 - The default SQLite backend gives local and single-node deployments persistent
   metadata without requiring an external database service.
-- PostgreSQL provides shared metadata for multi-instance deployments. The total
-  connection limit is `server process count * postgresql.max_pool_size`.
+- PostgreSQL provides externally managed persistence, but snapshot recovery is
+  not coordinated across server processes. Run only one active server process
+  against a PostgreSQL database.
 - `OPENSANDBOX_STORE_POSTGRESQL_DSN` overrides `postgresql.dsn`, keeping database
   credentials out of configuration files and Kubernetes ConfigMaps.
 - Switching backends does not copy existing snapshot metadata. Start with an
@@ -314,6 +315,8 @@ pool_timeout_seconds = 5
 ```bash
 export OPENSANDBOX_STORE_POSTGRESQL_DSN='postgresql://opensandbox:password@postgres:5432/opensandbox?sslmode=require'
 ```
+
+For Kubernetes configuration, see [Kubernetes Deployment](../docs/kubernetes/deployment.md#use-postgresql-for-server-persistence).
 
 ---
 
