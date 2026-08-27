@@ -21,20 +21,21 @@ Example files in this repository:
 
 1. [Top-level sections](#top-level-sections)
 2. [`[server]`](#server--lifecycle-api)
-3. [`[log]`](#log)
-4. [`[runtime]`](#runtime--required)
-5. [`[docker]`](#docker--only-when-runtime--docker)
-6. [`[kubernetes]`](#kubernetes--only-when-runtime--kubernetes)
-7. [`[agent_sandbox]`](#agent_sandbox--only-with-kubernetes--agent-sandbox)
-8. [`[ingress]`](#ingress)
-9. [`[egress]`](#egress)
-10. [`[storage]`](#storage)
-11. [`[store]`](#store)
-12. [`[secure_runtime]`](#secure_runtime)
-13. [`[renew_intent]`](#renew_intent)
-14. [`[otel]`](#otel)
-15. [Environment variables (outside TOML)](#environment-variables-outside-toml)
-16. [Cross-field validation rules](#cross-field-validation-rules)
+3. [`[proxy]`](#proxy)
+4. [`[log]`](#log)
+5. [`[runtime]`](#runtime--required)
+6. [`[docker]`](#docker--only-when-runtime--docker)
+7. [`[kubernetes]`](#kubernetes--only-when-runtime--kubernetes)
+8. [`[agent_sandbox]`](#agent_sandbox--only-with-kubernetes--agent-sandbox)
+9. [`[ingress]`](#ingress)
+10. [`[egress]`](#egress)
+11. [`[storage]`](#storage)
+12. [`[store]`](#store)
+13. [`[secure_runtime]`](#secure_runtime)
+14. [`[renew_intent]`](#renew_intent)
+15. [`[otel]`](#otel)
+16. [Environment variables (outside TOML)](#environment-variables-outside-toml)
+17. [Cross-field validation rules](#cross-field-validation-rules)
 
 ---
 
@@ -43,6 +44,7 @@ Example files in this repository:
 | Section | Required | When |
 |---------|----------|------|
 | `[server]` | No | Always (defaults apply if omitted) |
+| `[proxy]` | No | Always (defaults apply if omitted); controls the server-side reverse-proxy target |
 | `[log]` | No | Always (defaults apply if omitted) |
 | `[runtime]` | **Yes** | Always |
 | `[docker]` | No | `runtime.type = "docker"` |
@@ -74,6 +76,16 @@ Example files in this repository:
 | `thread_pool_size` | integer | `200` | Maximum size of the anyio default threadpool used by FastAPI to run sync route handlers. The anyio default of 40 throttles bursts of blocking sandbox list/get/delete operations under high concurrency. |
 | `loop` | `"auto"` \| `"uvloop"` \| `"asyncio"` | `"auto"` | Event loop implementation. `auto` prefers uvloop and falls back to asyncio. |
 | `http` | `"auto"` \| `"httptools"` \| `"h11"` | `"auto"` | HTTP protocol parser. `auto` prefers httptools and falls back to h11. |
+
+---
+
+## `[proxy]`
+
+Configuration for the server-side reverse-proxy routes.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `resolve_internal` | boolean | `true` | When `true` (default), the server-side reverse-proxy targets the sandbox's internal container IP (Docker bridge) or the provider's internal workload endpoint. When `false`, the proxy targets the **server-local host-mapped port** instead; this is required when the server process cannot route to container bridge IPs (for example a launchd or systemd user session on macOS where such traffic is blocked). On Docker, `false` resolves host-mapped endpoints via the server-local proxy host so deployments that advertise a public `[server]` `eip` still route proxied traffic to a locally reachable host. Backward compatible: the default preserves the historical behavior. |
 
 ---
 
@@ -131,6 +143,7 @@ If `runtime.type = "kubernetes"` and the `[kubernetes]` table is absent, the ser
 | `batchsandbox_template_file` | string \| omitted | `null` | Path to **BatchSandbox** CR YAML template when `workload_provider = "batchsandbox"`. |
 | `image_pull_policy` | string \| omitted | `"IfNotPresent"` | Image pull policy for the BatchSandbox main container. Values: **`Always`**, **`IfNotPresent`**, **`Never`**. |
 | `sandbox_create_timeout_seconds` | integer | `60` | Max time to wait for a new sandbox to become ready (e.g. IP assigned), in seconds. |
+| `pool_acquisition_timeout_seconds` | integer | `30` | Max cumulative time to wait while Pool capacity prevents allocation. This does not extend `sandbox_create_timeout_seconds`. |
 | `sandbox_create_poll_interval_seconds` | float | `1.0` | Poll interval while waiting for readiness. |
 | `snapshot_create_timeout_seconds` | integer | `900` | Max time to wait for a Kubernetes public snapshot to become ready, in seconds. Set this greater than the controller snapshot `commitJobTimeout` / `--commit-job-timeout`. |
 | `informer_enabled` | boolean | `true` | **[Beta]** Use informer/watch cache for reads to reduce API load. |
