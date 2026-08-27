@@ -221,6 +221,17 @@ Configures the **egress sidecar** image and enforcement mode. The server only at
 | `mode` | string | `"dns"` | Passed to the sidecar as `OPENSANDBOX_EGRESS_MODE`. Values: **`dns`** — DNS-proxy-based enforcement (CIDR/static IP rules **not** enforced); **`dns+nft`** — adds nftables where available so **CIDR/IP** rules can be enforced. |
 | `disable_ipv6` | bool | `true` | IPv6 egress is incomplete (especially on Kubernetes). **Default on**; set `false` only when you want IPv6 left up in the netns. Details in [IPv6 and egress](#ipv6-and-egress) below. |
 | `readiness_timeout_seconds` | float | `30.0` | **Docker only.** Maximum time to wait for the egress sidecar health endpoint to become ready. Must be greater than `0`. |
+| `requests` | map string → string \| omitted | `null` | **Kubernetes only.** Resource requests for the generated egress sidecar. |
+| `limits` | map string → string \| omitted | `null` | **Kubernetes only.** Resource limits for the generated egress sidecar. |
+
+```toml
+[egress]
+image = "opensandbox/egress:v1.1.7"
+requests = { cpu = "25m", memory = "64Mi" }
+limits = { cpu = "250m", memory = "256Mi" }
+```
+
+Requests and limits can be omitted independently. Invalid or negative Kubernetes resource quantities cause configuration loading to fail. When both settings are omitted, the egress container does not declare resources and namespace `LimitRange` defaults may apply.
 
 ### IPv6 and egress
 
@@ -235,6 +246,7 @@ OpenSandbox egress does **not** treat IPv6 as a first-class, fully covered path�
 **Kubernetes notes:**
 
 - When `networkPolicy` is set, the workload includes an egress sidecar built from `egress.image`.
+- Configure `egress.requests` and/or `egress.limits` when namespace-wide `LimitRange` defaults are too large for the sidecar.
 
 See [`components/egress/README.md`](../components/egress/README.md) for sidecar behavior and limits.
 
