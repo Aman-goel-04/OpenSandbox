@@ -25,7 +25,6 @@ from opensandbox_server.config import (
     EGRESS_MODE_DNS,
     EGRESS_MODE_DNS_NFT,
     EgressConfig,
-    EgressResources,
     ExecdInitResources,
     GatewayConfig,
     GatewayRouteModeConfig,
@@ -922,6 +921,8 @@ def test_egress_config_mode_literal():
     assert base.mode == EGRESS_MODE_DNS
     assert base.disable_ipv6 is True
     assert base.readiness_timeout_seconds == 30.0
+    assert base.requests is None
+    assert base.limits is None
     cfg = EgressConfig(image="opensandbox/egress:v1", mode=EGRESS_MODE_DNS_NFT)
     assert cfg.mode == EGRESS_MODE_DNS_NFT
 
@@ -939,12 +940,12 @@ def test_egress_config_mode_literal():
 def test_egress_config_accepts_kubernetes_container_resource_names(
     resource_name, quantity
 ):
-    resources = EgressResources(
+    config = EgressConfig(
         requests={resource_name: quantity},
         limits={resource_name: quantity},
     )
 
-    assert resources.requests == {resource_name: quantity}
+    assert config.requests == {resource_name: quantity}
 
 
 @pytest.mark.parametrize(
@@ -970,7 +971,7 @@ def test_egress_config_rejects_invalid_kubernetes_container_resource_names(
         ValidationError,
         match=r"invalid Kubernetes container resource name",
     ):
-        EgressResources(requests={resource_name: "1"})
+        EgressConfig(requests={resource_name: "1"})
 
 
 @pytest.mark.parametrize(
@@ -985,7 +986,7 @@ def test_egress_config_rejects_requests_greater_than_limits(requests, limits):
         ValidationError,
         match=r"resource request .* must not exceed limit",
     ):
-        EgressResources(requests=requests, limits=limits)
+        EgressConfig(requests=requests, limits=limits)
 
 
 def test_execd_init_resources_preserve_existing_unvalidated_quantity_semantics():
@@ -1006,9 +1007,7 @@ def test_egress_config_rejects_invalid_kubernetes_resource_quantities(
         ValidationError,
         match=r"invalid Kubernetes resource quantity for 'cpu'",
     ):
-        EgressConfig.model_validate(
-            {"resources": {resource_kind: {"cpu": quantity}}}
-        )
+        EgressConfig.model_validate({resource_kind: {"cpu": quantity}})
 
 
 def test_egress_config_readiness_timeout_must_be_positive():
@@ -1053,8 +1052,6 @@ def test_load_config_with_egress_resources(tmp_path, monkeypatch):
 
             [egress]
             image = "opensandbox/egress:test"
-
-            [egress.resources]
             requests = { cpu = "25m", memory = "64Mi" }
             limits = { cpu = "250m", memory = "256Mi" }
             """
@@ -1064,9 +1061,8 @@ def test_load_config_with_egress_resources(tmp_path, monkeypatch):
     loaded = config_module.load_config(config_path)
 
     assert loaded.egress is not None
-    assert loaded.egress.resources is not None
-    assert loaded.egress.resources.requests == {"cpu": "25m", "memory": "64Mi"}
-    assert loaded.egress.resources.limits == {"cpu": "250m", "memory": "256Mi"}
+    assert loaded.egress.requests == {"cpu": "25m", "memory": "64Mi"}
+    assert loaded.egress.limits == {"cpu": "250m", "memory": "256Mi"}
 
 
 @pytest.mark.parametrize(
@@ -1091,7 +1087,7 @@ def test_load_config_rejects_invalid_egress_resources_at_startup(
             type = "kubernetes"
             execd_image = "opensandbox/execd:test"
 
-            [egress.resources]
+            [egress]
             {resource_config}
             """
         )

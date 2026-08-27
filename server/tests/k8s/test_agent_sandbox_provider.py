@@ -75,7 +75,8 @@ def _egress_settings(
         credential_proxy_enabled=credential_proxy_enabled,
         env={},
         disable_ipv6=disable_ipv6,
-        resources=None,
+        resource_requests=None,
+        resource_limits=None,
     )
 
 

@@ -40,7 +40,6 @@ from opensandbox_server.config import (
     EGRESS_MODE_DNS,
     EGRESS_MODE_DNS_NFT,
     EgressConfig,
-    EgressResources,
     GatewayConfig,
     GatewayRouteModeConfig,
     IngressConfig,
@@ -328,11 +327,10 @@ class TestKubernetesSandboxServiceCreate:
             "OPENSANDBOX_EGRESS_LOG_LEVEL": "debug",
             "SANDBOX_ENV": "value",
         }
-        resources = EgressResources(requests={"cpu": "25m"})
         k8s_service.app_config.egress = EgressConfig(
             image="opensandbox/egress:v1.1.7",
             disable_ipv6=False,
-            resources=resources,
+            requests={"cpu": "25m"},
         )
         k8s_service.workload_provider.create_workload.return_value = {
             "name": "test-id", "uid": "uid-1"
@@ -356,7 +354,8 @@ class TestKubernetesSandboxServiceCreate:
         assert egress_settings.image == "opensandbox/egress:v1.1.7"
         assert egress_settings.mode == EGRESS_MODE_DNS
         assert egress_settings.disable_ipv6 is False
-        assert egress_settings.resources is resources
+        assert egress_settings.resource_requests == {"cpu": "25m"}
+        assert egress_settings.resource_limits is None
         assert egress_settings.env == {"OPENSANDBOX_EGRESS_LOG_LEVEL": "debug"}
         assert kwargs["env"] == {"SANDBOX_ENV": "value"}
         assert "network_policy" not in kwargs

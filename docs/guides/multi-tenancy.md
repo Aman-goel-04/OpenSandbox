@@ -193,7 +193,8 @@ The `Container` defaults apply to every container that omits the corresponding r
 Add Kubernetes resource settings to the server's `[egress]` configuration:
 
 ```toml
-[egress.resources]
+[egress]
+image = "opensandbox/egress:v1.1.7"
 requests = { cpu = "25m", memory = "64Mi" }
 limits = { cpu = "250m", memory = "256Mi" }
 ```

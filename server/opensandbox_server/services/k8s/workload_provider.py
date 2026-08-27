@@ -22,7 +22,6 @@ from datetime import datetime
 from typing import Dict, List, Any, Optional
 
 from opensandbox_server.api.schema import Endpoint, ImageSpec, NetworkPolicy, PlatformSpec, Volume
-from opensandbox_server.config import EgressResources
 
 
 @dataclass(frozen=True)
@@ -36,7 +35,8 @@ class EgressWorkloadSettings:
     credential_proxy_enabled: bool
     env: Dict[str, Optional[str]]
     disable_ipv6: bool
-    resources: Optional[EgressResources]
+    resource_requests: Optional[Dict[str, str]]
+    resource_limits: Optional[Dict[str, str]]
 
 
 class WorkloadProvider(ABC):

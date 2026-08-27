@@ -129,10 +129,13 @@ def apply_egress_to_spec(
             "mountPath": OPENSANDBOX_RUNTIME_MOUNT_PATH,
         }
     ]
-    if egress_settings.resources:
-        resources = egress_settings.resources.model_dump(exclude_none=True)
-        if resources:
-            sidecar["resources"] = resources
+    resources = {}
+    if egress_settings.resource_requests:
+        resources["requests"] = egress_settings.resource_requests
+    if egress_settings.resource_limits:
+        resources["limits"] = egress_settings.resource_limits
+    if resources:
+        sidecar["resources"] = resources
     if egress_settings.auth_token:
         sidecar["readinessProbe"]["httpGet"]["httpHeaders"] = [
             {

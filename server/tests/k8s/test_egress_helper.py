@@ -21,7 +21,6 @@ from opensandbox_server.api.schema import NetworkPolicy, NetworkRule
 from opensandbox_server.config import (
     EGRESS_MODE_DNS,
     EGRESS_MODE_DNS_NFT,
-    EgressResources,
 )
 from opensandbox_server.services.constants import (
     EGRESS_MODE_ENV,
@@ -51,7 +50,8 @@ def _egress_settings(
     credential_proxy_enabled: bool = False,
     env: Optional[dict[str, Optional[str]]] = None,
     disable_ipv6: bool = True,
-    resources: Optional[EgressResources] = None,
+    resource_requests: Optional[dict[str, str]] = None,
+    resource_limits: Optional[dict[str, str]] = None,
 ) -> EgressWorkloadSettings:
     return EgressWorkloadSettings(
         network_policy=network_policy,
@@ -61,7 +61,8 @@ def _egress_settings(
         credential_proxy_enabled=credential_proxy_enabled,
         env=env or {},
         disable_ipv6=disable_ipv6,
-        resources=resources,
+        resource_requests=resource_requests,
+        resource_limits=resource_limits,
     )
 
 
@@ -72,7 +73,8 @@ def _egress_container(
     egress_auth_token: Optional[str] = None,
     egress_mode: str = EGRESS_MODE_DNS,
     credential_proxy_enabled: bool = False,
-    egress_resources: Optional[EgressResources] = None,
+    resource_requests: Optional[dict[str, str]] = None,
+    resource_limits: Optional[dict[str, str]] = None,
 ) -> dict:
     """Sidecar dict produced by ``apply_egress_to_spec``."""
     containers: list = []
@@ -84,7 +86,8 @@ def _egress_container(
             auth_token=egress_auth_token,
             mode=egress_mode,
             credential_proxy_enabled=credential_proxy_enabled,
-            resources=egress_resources,
+            resource_requests=resource_requests,
+            resource_limits=resource_limits,
         ),
     )
     return containers[0]
@@ -109,15 +112,14 @@ class TestEgressSidecarViaApply:
         assert container["image"] == egress_image
         assert "env" in container
         assert "securityContext" in container
+        assert "resources" not in container
 
     def test_includes_configured_resource_requests_and_limits(self):
         container = _egress_container(
             "opensandbox/egress:v1.1.7",
             NetworkPolicy(defaultAction="deny", egress=[]),
-            egress_resources=EgressResources(
-                requests={"cpu": "25m", "memory": "64Mi"},
-                limits={"cpu": "250m", "memory": "256Mi"},
-            ),
+            resource_requests={"cpu": "25m", "memory": "64Mi"},
+            resource_limits={"cpu": "250m", "memory": "256Mi"},
         )
 
         assert container["resources"] == {
@@ -126,23 +128,28 @@ class TestEgressSidecarViaApply:
         }
 
     @pytest.mark.parametrize(
-        ("resources", "expected"),
+        ("resource_requests", "resource_limits", "expected"),
         [
             (
-                EgressResources(requests={"cpu": "25m"}),
+                {"cpu": "25m"},
+                None,
                 {"requests": {"cpu": "25m"}},
             ),
             (
-                EgressResources(limits={"memory": "256Mi"}),
+                None,
+                {"memory": "256Mi"},
                 {"limits": {"memory": "256Mi"}},
             ),
         ],
     )
-    def test_includes_requests_and_limits_independently(self, resources, expected):
+    def test_includes_requests_and_limits_independently(
+        self, resource_requests, resource_limits, expected
+    ):
         container = _egress_container(
             "opensandbox/egress:v1.1.7",
             NetworkPolicy(defaultAction="deny", egress=[]),
-            egress_resources=resources,
+            resource_requests=resource_requests,
+            resource_limits=resource_limits,
         )
 
         assert container["resources"] == expected

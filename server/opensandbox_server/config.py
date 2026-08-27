@@ -727,55 +727,6 @@ class ExecdInitResources(BaseModel):
     )
 
 
-class EgressResources(BaseModel):
-    """Validated Kubernetes resource requests and limits for the egress sidecar."""
-
-    limits: Optional[Dict[str, str]] = Field(
-        default=None,
-        description='Resource limits, e.g. {cpu = "100m", memory = "128Mi"}.',
-    )
-    requests: Optional[Dict[str, str]] = Field(
-        default=None,
-        description='Resource requests, e.g. {cpu = "50m", memory = "64Mi"}.',
-    )
-
-    @field_validator("limits", "requests")
-    @classmethod
-    def validate_quantities(
-        cls, resources: Optional[Dict[str, str]]
-    ) -> Optional[Dict[str, str]]:
-        if not resources:
-            return None
-
-        for resource_name, quantity in resources.items():
-            if not _is_valid_kubernetes_container_resource_name(resource_name):
-                raise ValueError(f"invalid Kubernetes container resource name: {resource_name!r}")
-            try:
-                parsed = parse_quantity(quantity)
-            except (TypeError, ValueError):
-                parsed = None
-            if (
-                not _KUBERNETES_QUANTITY_RE.fullmatch(quantity)
-                or parsed is None
-                or not parsed.is_finite()
-                or parsed < 0
-            ):
-                raise ValueError(f"invalid Kubernetes resource quantity for {resource_name!r}: {quantity!r}")
-
-        return resources
-
-    @model_validator(mode="after")
-    def validate_requests_do_not_exceed_limits(self) -> EgressResources:
-        requests = self.requests or {}
-        limits = self.limits or {}
-        for resource_name in requests.keys() & limits.keys():
-            request = requests[resource_name]
-            limit = limits[resource_name]
-            if parse_quantity(request) > parse_quantity(limit):
-                raise ValueError(f"resource request for {resource_name!r} ({request!r}) must not exceed limit ({limit!r})")
-        return self
-
-
 class AgentSandboxRuntimeConfig(BaseModel):
     """Agent-sandbox runtime configuration."""
 
@@ -853,10 +804,55 @@ class EgressConfig(BaseModel):
             "to become ready in Docker runtime."
         ),
     )
-    resources: Optional[EgressResources] = Field(
+    requests: Optional[Dict[str, str]] = Field(
         default=None,
-        description="Kubernetes resource requests/limits for the egress sidecar. If unset, no resource constraints are applied.",
+        description=(
+            "Kubernetes resource requests for the egress sidecar. Can be set independently of limits."
+        ),
     )
+    limits: Optional[Dict[str, str]] = Field(
+        default=None,
+        description=(
+            "Kubernetes resource limits for the egress sidecar. Can be set independently of requests. "
+            "If both are unset, the resources block is omitted (namespace LimitRange defaults may apply)."
+        ),
+    )
+
+    @field_validator("requests", "limits")
+    @classmethod
+    def validate_quantities(
+        cls, resources: Optional[Dict[str, str]]
+    ) -> Optional[Dict[str, str]]:
+        if not resources:
+            return None
+
+        for resource_name, quantity in resources.items():
+            if not _is_valid_kubernetes_container_resource_name(resource_name):
+                raise ValueError(f"invalid Kubernetes container resource name: {resource_name!r}")
+            try:
+                parsed = parse_quantity(quantity)
+            except (TypeError, ValueError):
+                parsed = None
+            if (
+                not _KUBERNETES_QUANTITY_RE.fullmatch(quantity)
+                or parsed is None
+                or not parsed.is_finite()
+                or parsed < 0
+            ):
+                raise ValueError(f"invalid Kubernetes resource quantity for {resource_name!r}: {quantity!r}")
+
+        return resources
+
+    @model_validator(mode="after")
+    def validate_requests_do_not_exceed_limits(self) -> EgressConfig:
+        requests = self.requests or {}
+        limits = self.limits or {}
+        for resource_name in requests.keys() & limits.keys():
+            request = requests[resource_name]
+            limit = limits[resource_name]
+            if parse_quantity(request) > parse_quantity(limit):
+                raise ValueError(f"resource request for {resource_name!r} ({request!r}) must not exceed limit ({limit!r})")
+        return self
 
 
 class RuntimeConfig(BaseModel):
@@ -1305,7 +1301,6 @@ __all__ = [
     "StorageConfig",
     "StoreConfig",
     "KubernetesRuntimeConfig",
-    "EgressResources",
     "EgressConfig",
     "EGRESS_MODE_DNS",
     "EGRESS_MODE_DNS_NFT",

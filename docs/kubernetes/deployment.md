@@ -122,10 +122,11 @@ The server container and its `ClusterIP` Service use port `80`. Keep `[server].p
 
 When a create request includes `networkPolicy`, the lifecycle server adds an egress sidecar to each non-pooled sandbox Pod. Namespace `LimitRange` defaults apply to this container when it does not declare resources, which can reserve substantially more capacity than basic DNS/nft enforcement needs.
 
-Add an optional resource block to the `[egress]` section of `configToml`:
+Add optional resource settings to the `[egress]` section of `configToml`:
 
 ```toml
-[egress.resources]
+[egress]
+image = "opensandbox/egress:v1.1.7"
 requests = { cpu = "25m", memory = "64Mi" }
 limits = { cpu = "250m", memory = "256Mi" }
 ```
