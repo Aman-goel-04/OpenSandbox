@@ -14,7 +14,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Iterator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import os
 from threading import Barrier
 
@@ -184,3 +184,35 @@ def test_postgresql_close_releases_pool(postgresql_dsn: str) -> None:
     repo.close()
 
     assert repo._pool.closed is True
+
+
+def test_postgresql_row_timestamps_are_normalized_to_utc() -> None:
+    local_timezone = timezone(timedelta(hours=8))
+    local_time = datetime(2026, 1, 2, 8, 0, tzinfo=local_timezone)
+
+    record = PostgreSQLSnapshotRepository._row_to_record(
+        {
+            "id": "snap-timezone",
+            "source_sandbox_id": "sbx-001",
+            "namespace": None,
+            "name": None,
+            "description": None,
+            "restore_config": {"image": None},
+            "state": SnapshotState.CREATING.value,
+            "reason": None,
+            "message": None,
+            "last_transition_at": local_time,
+            "created_at": local_time,
+            "updated_at": local_time,
+        }
+    )
+
+    expected = datetime(2026, 1, 2, 0, 0, tzinfo=timezone.utc)
+    last_transition_at = record.status.last_transition_at
+    assert last_transition_at is not None
+    assert last_transition_at == expected
+    assert last_transition_at.tzinfo is timezone.utc
+    assert record.created_at == expected
+    assert record.created_at.tzinfo is timezone.utc
+    assert record.updated_at == expected
+    assert record.updated_at.tzinfo is timezone.utc

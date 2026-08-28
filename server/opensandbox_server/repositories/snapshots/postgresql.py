@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, overload
 
 from psycopg import sql
 from psycopg.rows import dict_row
@@ -295,6 +295,14 @@ class PostgreSQLSnapshotRepository:
         }
 
     @staticmethod
+    @overload
+    def _normalize_datetime(value: None) -> None: ...
+
+    @staticmethod
+    @overload
+    def _normalize_datetime(value: datetime) -> datetime: ...
+
+    @staticmethod
     def _normalize_datetime(value: datetime | None) -> datetime | None:
         if value is None:
             return None
@@ -316,10 +324,12 @@ class PostgreSQLSnapshotRepository:
                 state=SnapshotState(row["state"]),
                 reason=row["reason"],
                 message=row["message"],
-                last_transition_at=row["last_transition_at"],
+                last_transition_at=PostgreSQLSnapshotRepository._normalize_datetime(
+                    row["last_transition_at"]
+                ),
             ),
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
+            created_at=PostgreSQLSnapshotRepository._normalize_datetime(row["created_at"]),
+            updated_at=PostgreSQLSnapshotRepository._normalize_datetime(row["updated_at"]),
         )
 
 
