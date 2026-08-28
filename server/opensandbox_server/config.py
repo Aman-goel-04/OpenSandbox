@@ -29,6 +29,7 @@ import re
 from pathlib import Path
 from typing import Any, ClassVar, Dict, Literal, Optional
 
+from kubernetes.utils.quantity import parse_quantity
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 try:  # Python 3.11+
@@ -52,6 +53,18 @@ SECURE_ACCESS_ACTIVE_KEY_ENV_VAR = "OPENSANDBOX_SECURE_ACCESS_ACTIVE_KEY"
 _HOSTNAME_RE = re.compile(r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?:\.(?!-)[A-Za-z0-9-]{1,63})*$")
 _WILDCARD_DOMAIN_RE = re.compile(r"^\*\.(?!-)[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63})+$")
 _IPV4_WITH_PORT_RE = re.compile(r"^(?P<ip>(?:\d{1,3}\.){3}\d{1,3})(?::(?P<port>\d{1,5}))?$")
+# ``parse_quantity`` is intentionally permissive (for example, it accepts NaN and the unsupported decimal suffix K), so guard it with Kubernetes' grammar.
+_KUBERNETES_QUANTITY_RE = re.compile(
+    r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)"
+    r"(?:(?:[eE][+-]?\d+)|(?:[numkMGTPE]|[KMGTPE]i)?)$"
+)
+_KUBERNETES_STANDARD_CONTAINER_RESOURCES = frozenset(
+    {"cpu", "memory", "ephemeral-storage"}
+)
+_KUBERNETES_DNS_LABEL_RE = re.compile(r"^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$")
+_KUBERNETES_QUALIFIED_NAME_RE = re.compile(
+    r"^[A-Za-z0-9](?:[-A-Za-z0-9_.]*[A-Za-z0-9])?$"
+)
 
 INGRESS_MODE_DIRECT = "direct"
 INGRESS_MODE_GATEWAY = "gateway"
@@ -61,6 +74,38 @@ GATEWAY_ROUTE_MODE_URI = "uri"
 
 EGRESS_MODE_DNS = "dns"
 EGRESS_MODE_DNS_NFT = "dns+nft"
+
+
+def _is_valid_kubernetes_container_resource_name(name: str) -> bool:
+    if name in _KUBERNETES_STANDARD_CONTAINER_RESOURCES:
+        return True
+
+    if name.startswith("hugepages-"):
+        page_size = name.removeprefix("hugepages-")
+        try:
+            parsed = parse_quantity(page_size)
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            _KUBERNETES_QUANTITY_RE.fullmatch(page_size)
+            and parsed.is_finite()
+            and parsed > 0
+        )
+
+    if name.startswith("requests."):
+        return False
+
+    prefix, separator, resource = name.partition("/")
+    return bool(
+        separator
+        and len(prefix) <= 253
+        and all(
+            0 < len(label) <= 63 and _KUBERNETES_DNS_LABEL_RE.fullmatch(label)
+            for label in prefix.split(".")
+        )
+        and 0 < len(resource) <= 63
+        and _KUBERNETES_QUALIFIED_NAME_RE.fullmatch(resource)
+    )
 
 
 def _is_valid_ip(host: str) -> bool:
@@ -561,6 +606,22 @@ class ServerConfig(BaseModel):
     )
 
 
+class ProxyConfig(BaseModel):
+    """Configuration for the sandbox reverse-proxy routes."""
+
+    resolve_internal: bool = Field(
+        default=True,
+        description=(
+            "When True (default), the proxy targets the sandbox's internal "
+            "container IP. When False, the proxy targets the server-local "
+            "host-mapped port, which is required when the server process "
+            "cannot route to Docker bridge network container IPs (for example "
+            "a launchd or systemd user session on macOS). Backward compatible: "
+            "the default preserves the historical behavior."
+        ),
+    )
+
+
 class KubernetesRuntimeConfig(BaseModel):
     """Kubernetes-specific runtime configuration."""
 
@@ -638,6 +699,14 @@ class KubernetesRuntimeConfig(BaseModel):
         default=60,
         ge=1,
         description="Timeout in seconds to wait for a sandbox to become ready (IP assigned) after creation.",
+    )
+    pool_acquisition_timeout_seconds: int = Field(
+        default=30,
+        ge=1,
+        description=(
+            "Maximum cumulative time in seconds to wait while Pool capacity "
+            "prevents sandbox allocation. The overall sandbox create timeout still applies."
+        ),
     )
     sandbox_create_poll_interval_seconds: float = Field(
         default=1.0,
@@ -759,6 +828,55 @@ class EgressConfig(BaseModel):
             "to become ready in Docker runtime."
         ),
     )
+    requests: Optional[Dict[str, str]] = Field(
+        default=None,
+        description=(
+            "Kubernetes resource requests for the egress sidecar. Can be set independently of limits."
+        ),
+    )
+    limits: Optional[Dict[str, str]] = Field(
+        default=None,
+        description=(
+            "Kubernetes resource limits for the egress sidecar. Can be set independently of requests. "
+            "If both are unset, the resources block is omitted (namespace LimitRange defaults may apply)."
+        ),
+    )
+
+    @field_validator("requests", "limits")
+    @classmethod
+    def validate_quantities(
+        cls, resources: Optional[Dict[str, str]]
+    ) -> Optional[Dict[str, str]]:
+        if not resources:
+            return None
+
+        for resource_name, quantity in resources.items():
+            if not _is_valid_kubernetes_container_resource_name(resource_name):
+                raise ValueError(f"invalid Kubernetes container resource name: {resource_name!r}")
+            try:
+                parsed = parse_quantity(quantity)
+            except (TypeError, ValueError):
+                parsed = None
+            if (
+                not _KUBERNETES_QUANTITY_RE.fullmatch(quantity)
+                or parsed is None
+                or not parsed.is_finite()
+                or parsed < 0
+            ):
+                raise ValueError(f"invalid Kubernetes resource quantity for {resource_name!r}: {quantity!r}")
+
+        return resources
+
+    @model_validator(mode="after")
+    def validate_requests_do_not_exceed_limits(self) -> EgressConfig:
+        requests = self.requests or {}
+        limits = self.limits or {}
+        for resource_name in requests.keys() & limits.keys():
+            request = requests[resource_name]
+            limit = limits[resource_name]
+            if parse_quantity(request) > parse_quantity(limit):
+                raise ValueError(f"resource request for {resource_name!r} ({request!r}) must not exceed limit ({limit!r})")
+        return self
 
 
 class RuntimeConfig(BaseModel):
@@ -1005,6 +1123,10 @@ class AppConfig(BaseModel):
     """Root application configuration model."""
 
     server: ServerConfig = Field(default_factory=ServerConfig)
+    proxy: ProxyConfig = Field(
+        default_factory=ProxyConfig,
+        description="Configuration for the sandbox reverse-proxy routes.",
+    )
     log: LogConfig = Field(
         default_factory=LogConfig,
         description="Logging configuration (level, file output, rotation).",

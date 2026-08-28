@@ -155,6 +155,17 @@ export interface paths {
                 400: components["responses"]["BadRequest"];
                 401: components["responses"]["Unauthorized"];
                 409: components["responses"]["Conflict"];
+                /** @description Pool capacity remained unavailable before the acquisition timeout */
+                429: {
+                    headers: {
+                        "X-Request-ID": components["headers"]["XRequestId"];
+                        "Retry-After": components["headers"]["RetryAfter"];
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
                 500: components["responses"]["InternalServerError"];
             };
         };
@@ -1075,7 +1086,7 @@ export interface components {
         LifecycleHook: {
             /** @description Command and arguments to execute. */
             command: string[];
-            /** @description Maximum execution time in seconds, up to 300. The server defaults to 60 when omitted. */
+            /** @description Maximum execution time in seconds, up to 3 hours (10800 seconds) for `preStart`. The server defaults to 60 when omitted. */
             timeoutSeconds?: number;
         };
         /** @description A named lifecycle command scheduled inside the sandbox by execd. */
